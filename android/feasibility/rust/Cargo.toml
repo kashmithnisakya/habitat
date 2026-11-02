@@ -1,0 +1,20 @@
+# Throwaway library for the Android feasibility test. Not part of the main workspace.
+[package]
+name = "habitat-feasibility"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasmtime = { version = "=50.0.1", default-features = false, features = ["cranelift", "runtime", "wat", "std"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[workspace]
