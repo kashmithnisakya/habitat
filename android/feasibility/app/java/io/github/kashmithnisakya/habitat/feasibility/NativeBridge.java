@@ -7,5 +7,5 @@ final class NativeBridge {
 
     private NativeBridge() {}
 
-    static native int addInWasm(int a, int b);
+    static native String runChecks();
 }

@@ -13,22 +13,37 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        String message;
+        String report;
         try {
-            int result = NativeBridge.addInWasm(40, 2);
-            message = result == 42
-                    ? "PASS: Wasmtime returned 40 + 2 = " + result
-                    : "FAIL: Wasmtime returned " + result;
+            report = NativeBridge.runChecks() + "\n" + checkAndroidRuntime();
         } catch (Throwable error) {
-            message = "FAIL: " + error;
+            report = "FAIL: " + error;
         }
 
-        Log.i(TAG, message);
+        for (String line : report.split("\n")) {
+            Log.i(TAG, line);
+        }
+
         TextView view = new TextView(this);
-        view.setText(message);
-        view.setTextSize(20);
+        view.setText(report);
+        view.setTextSize(14);
         // Centered because content draws behind the title bar on API 35 and later.
         view.setGravity(Gravity.CENTER);
         setContentView(view);
+    }
+
+    /** Checks that Java null checks and garbage collection still work after Wasmtime has run. */
+    private static String checkAndroidRuntime() {
+        String missing = null;
+        for (int i = 0; i < 100_000; i++) {
+            try {
+                missing.length();
+                return "FAIL AndroidRuntime: null check didn't throw";
+            } catch (NullPointerException expected) {
+                // Expected on every loop.
+            }
+        }
+        System.gc();
+        return "PASS AndroidRuntime: null checks and garbage collection still work";
     }
 }

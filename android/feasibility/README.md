@@ -1,6 +1,8 @@
 # Android feasibility test
 
-This throwaway app checks whether Wasmtime can be embedded in an Android app ([issue #1](https://github.com/kashmithnisakya/habitat/issues/1)). It compiles a small WebAssembly `add` function on the phone with Cranelift, runs it and shows the result.
+This throwaway app checks whether Wasmtime can be embedded in an Android app ([#1](https://github.com/kashmithnisakya/habitat/issues/1)) and run a WebAssembly component under normal app restrictions ([#2](https://github.com/kashmithnisakya/habitat/issues/2)).
+
+The [test component](rust/guest.wat) imports one host function and exports `run`, which calls it. The app runs the component in four modes. In each one, it confirms that the host function is called, that an out-of-bounds memory read traps without crashing the app, and that the engine still works afterwards.
 
 It isn't the real Habitat app.
 
@@ -10,13 +12,32 @@ It isn't the real Habitat app.
 |---|---|
 | Library tests on macOS (arm64) | Pass |
 | Cross-compile for `aarch64-linux-android` | Pass, with no patches |
-| Library size | 7.6 MB |
-| APK size | 7.6 MB |
+| Library size | 9.8 MB |
+| APK size | 9.8 MB |
 | 16 KB page alignment | Pass, checked with `zipalign -c -P 16` |
-| Runs on an arm64 emulator (Android 16, API 36, 4 KB pages) | Pass, returned `42` with Cranelift |
+| Runs on an arm64 emulator (Android 16, API 36, 4 KB pages) | Pass in all modes below |
 | Loads and runs on a real arm64 phone | **Not tested yet** |
 
-The emulator result is an early check, not a replacement for the phone test. It doesn't cover real phone hardware or manufacturer changes to Android, and it used 4 KB memory pages, so 16 KB pages haven't been tested at runtime.
+### Modes on the emulator
+
+| Mode | Where the code is compiled | Host call and trap | Android blocked it? |
+|---|---|---|---|
+| `CraneliftOnDevice` | On the device, to machine code | Pass | No |
+| `CraneliftPrecompiled` | At build time, to machine code | Pass | No |
+| `PulleyOnDevice` | On the device, to Pulley bytecode | Pass | No |
+| `PulleyPrecompiled` | At build time, to Pulley bytecode | Pass | No |
+
+The app was a non-debuggable build installed normally, and SELinux was enforcing. Logs from two runs showed no SELinux denials, crashes or native library errors. Java null checks and garbage collection still worked after Wasmtime had run.
+
+### Limits of these results
+
+- **It's an emulator:** this doesn't cover real phone hardware or manufacturer changes to Android, and it used 4 KB memory pages, so 16 KB pages haven't been tested at runtime.
+- **Timings aren't measurements:** the app prints them, but they vary widely between runs. Real numbers belong to [#3](https://github.com/kashmithnisakya/habitat/issues/3).
+- **Pulley isn't proven without a compiler:** the library still includes Cranelift, because the on-device modes need it. A library with only the Pulley interpreter hasn't been built.
+- **The Java runtime check is limited:** it can't confirm that the null checks went through the Android runtime's signal handler.
+- **The guest is minimal:** it's a hand-written component, not a real agent, and it uses no WASI or strings.
+
+Precompiled code must only be loaded from a trusted source, because Wasmtime doesn't validate it. The real project will need signing or similar protection if it ships precompiled agents.
 
 ## Tested versions
 
@@ -34,7 +55,8 @@ The emulator result is an early check, not a replacement for the phone test. It 
 
 No Wasmtime patches were needed. The build uses these settings:
 
-- **No default Wasmtime features:** it enables only `cranelift`, `runtime`, `wat` and `std`.
+- **No default Wasmtime features:** it enables only `component-model`, `cranelift`, `pulley`, `runtime`, `std` and `wat`.
+- **Precompiling at build time:** `rust/build.rs` compiles the component for the target CPU and for Pulley. This has only been tested on an Apple Silicon host.
 - **16 KB memory pages:** the library links with `max-page-size=16384`, and the APK is aligned with `zipalign -P 16`.
 - **No Gradle:** `build.sh` calls the Android tools directly, which keeps this test small.
 - **One debug key:** the throwaway signing key is kept at `~/.android/habitat-feasibility-debug.keystore`, because Android rejects updates signed with a different key.
@@ -108,10 +130,20 @@ Turn on USB debugging on an arm64 Android phone and connect it, then run:
 "$HOME/Library/Android/sdk/platform-tools/adb" logcat -d -s HabitatFeasibility
 ```
 
-The phone's screen and the log should both say:
+The phone's screen and the log should both show five lines that start with `PASS`, and no lines that start with `FAIL`:
 
 ```text
-PASS: Wasmtime returned 40 + 2 = 42
+PASS CraneliftOnDevice: run(20)=41, host called, trap caught, load 4737 us, run 73 us
+PASS CraneliftPrecompiled: run(20)=41, host called, trap caught, load 4625 us, run 55 us
+PASS PulleyOnDevice: run(20)=41, host called, trap caught, load 4240 us, run 65 us
+PASS PulleyPrecompiled: run(20)=41, host called, trap caught, load 3222 us, run 14 us
+PASS AndroidRuntime: null checks and garbage collection still work
+```
+
+Also check for blocked operations:
+
+```bash
+"$HOME/Library/Android/sdk/platform-tools/adb" logcat -d | grep -E 'avc: *denied|FATAL EXCEPTION|Fatal signal|UnsatisfiedLink'
 ```
 
 ## Run on an emulator
