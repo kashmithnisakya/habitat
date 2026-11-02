@@ -1,10 +1,10 @@
 # Security policy
 
-AgentHome is in early development and is **not yet secure**. Don't rely on it to protect anything.
+Habitat is in early development and is **not yet secure**. Don't rely on it to protect anything.
 
 ## Reporting a problem
 
-Please don't open a public issue for a security problem. Report it privately through [GitHub's private vulnerability reporting](https://github.com/kashmithnisakya/agenthome/security/advisories/new).
+Please don't open a public issue for a security problem. Report it privately through [GitHub's private vulnerability reporting](https://github.com/kashmithnisakya/habitat/security/advisories/new).
 
 Include what you found, the steps to reproduce it and the impact you expect.
 

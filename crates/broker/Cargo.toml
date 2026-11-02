@@ -1,6 +1,6 @@
 [package]
-name = "agenthome-broker"
-description = "Policy engine, secrets vault, gateway and audit log for AgentHome"
+name = "habitat-broker"
+description = "Policy engine, secrets vault, gateway and audit log for Habitat"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

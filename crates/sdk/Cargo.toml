@@ -1,6 +1,6 @@
 [package]
-name = "agenthome-sdk"
-description = "Rust library for building AgentHome agents"
+name = "habitat-sdk"
+description = "Rust library for building Habitat agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

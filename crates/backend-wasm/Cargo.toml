@@ -1,6 +1,6 @@
 [package]
-name = "agenthome-backend-wasm"
-description = "Wasmtime backend for running AgentHome agents"
+name = "habitat-backend-wasm"
+description = "Wasmtime backend for running Habitat agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

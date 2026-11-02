@@ -1,6 +1,6 @@
 # Roadmap
 
-Work is tracked in the [roadmap issue](https://github.com/kashmithnisakya/agenthome/issues/41) and grouped into [milestones](https://github.com/kashmithnisakya/agenthome/milestones).
+Work is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41) and grouped into [milestones](https://github.com/kashmithnisakya/habitat/milestones).
 
 | Milestone | Goal |
 |---|---|

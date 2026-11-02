@@ -1,4 +1,4 @@
-# Contributing to AgentHome
+# Contributing to Habitat
 
 Thanks for your interest. The project is at an early stage, so feedback on the design is especially useful.
 
@@ -29,6 +29,8 @@ cargo test --workspace
 ## Pull requests
 
 - Link the issue your change addresses.
+- Don't add AI tools as co-authors on commits.
+- If you use an AI coding agent, point it to [AGENTS.md](AGENTS.md).
 - Keep each pull request focused on one change.
 - Add tests for new behaviour.
 - Add an attack test for every security fix.

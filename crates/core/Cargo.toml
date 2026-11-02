@@ -1,6 +1,6 @@
 [package]
-name = "agenthome-core"
-description = "Supervisor, home store and shared types for AgentHome"
+name = "habitat-core"
+description = "Supervisor, home store and shared types for Habitat"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

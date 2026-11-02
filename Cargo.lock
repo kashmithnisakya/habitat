@@ -3,21 +3,21 @@
 version = 4
 
 [[package]]
-name = "agenthome-backend-wasm"
+name = "habitat-backend-wasm"
 version = "0.0.0"
 
 [[package]]
-name = "agenthome-broker"
+name = "habitat-broker"
 version = "0.0.0"
 
 [[package]]
-name = "agenthome-cli"
+name = "habitat-cli"
 version = "0.0.0"
 
 [[package]]
-name = "agenthome-core"
+name = "habitat-core"
 version = "0.0.0"
 
 [[package]]
-name = "agenthome-sdk"
+name = "habitat-sdk"
 version = "0.0.0"

@@ -1,6 +1,6 @@
 [package]
-name = "agenthome-cli"
-description = "Command line for AgentHome"
+name = "habitat-cli"
+description = "Command line for Habitat"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,5 +8,5 @@ repository.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "agenthome"
+name = "habitat"
 path = "src/main.rs"

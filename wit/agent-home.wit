@@ -1,5 +1,5 @@
 // Draft agent API. It will change once it runs on real devices.
-package agenthome:host@0.1.0;
+package habitat:host@0.1.0;
 
 interface types {
     variant home-error {

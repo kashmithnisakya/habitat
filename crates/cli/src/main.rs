@@ -1,6 +1,6 @@
-//! Command line for AgentHome.
+//! Command line for Habitat.
 
 fn main() {
-    eprintln!("agenthome is not implemented yet. See the project roadmap.");
+    eprintln!("habitat is not implemented yet. See the project roadmap.");
     std::process::exit(1);
 }

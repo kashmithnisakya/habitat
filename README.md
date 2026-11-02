@@ -1,15 +1,15 @@
-# AgentHome
+# Habitat
 
 **A secure home for AI agents on computers and phones.**
 
-AgentHome gives an agent its own persistent space to live in. The agent keeps its files, memory and tools there, but it can't touch your settings, personal data or other apps unless you allow it.
+Habitat gives an agent its own persistent space to live in. The agent keeps its files, memory and tools there, but it can't touch your settings, personal data or other apps unless you allow it.
 
 > [!WARNING]
 > **Early development: nothing works yet, and this is not secure.** The repository currently holds the design and project skeleton. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) exist and an outside security review has taken place.
 
 ## Why
 
-Agent sandboxes are well served on servers and desktops, but they don't focus on phones. Agents that run on phones today often rely on broad device permissions rather than an isolated space. AgentHome aims to provide one security model and one agent package across both.
+Agent sandboxes are well served on servers and desktops, but they don't focus on phones. Agents that run on phones today often rely on broad device permissions rather than an isolated space. Habitat aims to provide one security model and one agent package across both.
 
 ## How it will work
 
@@ -50,7 +50,7 @@ Planned guarantees:
 | Attack tests | Not started |
 | Android app | Not started |
 
-Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/agenthome/issues/41). The next step is the Android feasibility test, starting with [#1](https://github.com/kashmithnisakya/agenthome/issues/1).
+Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41). The next step is the Android feasibility test, starting with [#1](https://github.com/kashmithnisakya/habitat/issues/1).
 
 ## Documentation
 
@@ -91,7 +91,7 @@ cargo test --workspace
 
 ## Contributing
 
-Feedback on the design is the most useful contribution right now. See [CONTRIBUTING.md](CONTRIBUTING.md), and please report security problems as described in [SECURITY.md](SECURITY.md) instead of opening a public issue.
+Feedback on the design is the most useful contribution right now. See [CONTRIBUTING.md](CONTRIBUTING.md) for people and [AGENTS.md](AGENTS.md) for AI coding agents, and please report security problems as described in [SECURITY.md](SECURITY.md) instead of opening a public issue.
 
 ## License
 
