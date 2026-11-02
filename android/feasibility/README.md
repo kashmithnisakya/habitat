@@ -105,7 +105,7 @@ The [draft feasibility report](../../docs/feasibility-android.md) recommends com
 | `PulleyPrecompiled` | 4,018 KB | 1.2 ms (0.6–2.1) | 2.9 MB | 1,393 ms |
 
 - **It works, and Android blocked nothing:** there were no SELinux denials or crashes in any of the 180 runs.
-- **Later starts match build-time precompiling:** memory and CPU time are about the same. Load times are similar too, and the gap between the Cranelift modes is small enough to be noise.
+- **Later starts match build-time precompiling:** memory and CPU time are about the same. Load times are close too, but they shift between runs: `CraneliftPrecompiled` had a median of 5.7 ms here, against 2.8 ms and 3.7 ms in the two earlier runs.
 - **The cost is one slow first start:** on this emulator, that's about 0.8 s and 74–80 MB, and it needs 4–5 MB of storage per agent.
 - **Bad files are rejected in two cases:** a file saved for the other engine, and a file cut in half, both fail to load. The app runs this check on the device, and it's the `BadSavedFiles` line in its report.
 
