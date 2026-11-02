@@ -11,7 +11,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 jni = "=0.22.4"
-wasmtime = { version = "=50.0.1", default-features = false, features = ["component-model", "cranelift", "pulley", "runtime", "std", "wat"] }
+libc = "0.2"
+wasmtime = { version = "=50.0.1", default-features = false, features = ["component-model", "cranelift", "pulley", "runtime", "std"] }
 
 [build-dependencies]
 wasmtime = { version = "=50.0.1", default-features = false, features = ["component-model", "cranelift", "pulley", "runtime", "std"] }

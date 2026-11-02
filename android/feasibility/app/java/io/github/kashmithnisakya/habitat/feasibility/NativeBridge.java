@@ -7,5 +7,10 @@ final class NativeBridge {
 
     private NativeBridge() {}
 
-    static native String runChecks();
+    /** Loads the library, through the static block above. */
+    static void load() {}
+
+    static native String runChecks(String dir);
+
+    static native String measure(String dir, String mode, String guest, long appMs);
 }
