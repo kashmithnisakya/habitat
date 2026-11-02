@@ -45,12 +45,12 @@ Planned guarantees:
 | Stage | Status |
 |---|---|
 | Design | Drafted, and open to feedback |
-| Android feasibility test | Not started |
+| Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
 | Mac core, broker and secrets | Not started |
 | Attack tests | Not started |
 | Android app | Not started |
 
-Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41). The next step is the Android feasibility test, starting with [#1](https://github.com/kashmithnisakya/habitat/issues/1).
+Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41). The next step is to run the Android feasibility test on a real phone. See the [draft feasibility report](docs/feasibility-android.md).
 
 ## Documentation
 
@@ -59,6 +59,7 @@ Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/ha
 - [Permission model](docs/permissions.md)
 - [Roadmap](docs/roadmap.md)
 - [Design decisions](docs/decisions/README.md)
+- [Android feasibility report (draft)](docs/feasibility-android.md)
 - [Agent API draft](wit/agent-home.wit)
 
 ## Repository layout
