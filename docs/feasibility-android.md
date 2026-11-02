@@ -56,7 +56,17 @@ The [feasibility README](../android/feasibility/README.md#measurements) has the 
 
 Agent packages are untrusted, so loading precompiled code from them would break our [security rules](../AGENTS.md#security-rules). A package could carry anything, and Wasmtime only checks WebAssembly when it compiles it. Precompiled packages are only an option if a builder we trust compiles and signs them, which would add infrastructure we don't otherwise need.
 
-This recommendation hasn't been fully tested. The emulator tests compiled agents on the device, and separately loaded a compiled file that the app had written to private storage. That file was compiled at build time, so compiling, saving and reloading in one flow still needs its own test.
+**This flow works on the emulator.** Compiling, saving and reloading in a new process passed in all 180 measured runs, with no SELinux denials or crashes. For the 2.7 MB test agent:
+
+| Step | Cranelift | Pulley |
+|---|---:|---:|
+| First start: compile, save and load | 815 ms, 79.9 MB | 856 ms, 74.1 MB |
+| Later starts: load the saved file | 2.7 ms, 6.6 MB | 1.1 ms, 3.0 MB |
+| Saved file | 5.0 MB | 4.0 MB |
+
+Later starts cost about the same as loading code compiled at build time. The [feasibility README](../android/feasibility/README.md#compile-once) has the full comparison.
+
+**Saved code needs protecting.** Wasmtime rejected a file saved for the other engine and a file that was cut short, but it doesn't check the code inside a saved file, so a changed byte wouldn't be detected. The design relies on nothing else being able to write to the app's private storage. The real app also needs to recompile after an upgrade, which wasn't tested, and to decide when compiling happens, because the first start is the most memory-hungry step and could be a problem on low-end phones.
 
 **Pulley stays the fallback.** Android doesn't need it if Cranelift works on phones, but iPhone is expected to, so we should keep it working. A library with only the Pulley interpreter hasn't been built yet.
 
@@ -79,7 +89,7 @@ These were checked on 2 November 2026. They can change, and this is our reading 
 ## Before this report is final
 
 - [ ] Run [#1](https://github.com/kashmithnisakya/habitat/issues/1) and [#2](https://github.com/kashmithnisakya/habitat/issues/2) on a real arm64 phone.
-- [ ] Test compiling, saving and reloading an agent on the device.
+- [ ] Test compiling, saving and reloading an agent on a real phone. This passes on the emulator, and the app's checks and `measure.sh` already include it.
 - [ ] Repeat [#3](https://github.com/kashmithnisakya/habitat/issues/3) on a recent phone and, if possible, an older one, including battery use.
 - [ ] Run on a device or emulator with 16 KB memory pages.
 - [ ] Update this report with those results, and state the final decision.

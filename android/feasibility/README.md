@@ -2,7 +2,7 @@
 
 This throwaway app checks whether Wasmtime can be embedded in an Android app ([#1](https://github.com/kashmithnisakya/habitat/issues/1)), whether it can run a WebAssembly component under normal app restrictions ([#2](https://github.com/kashmithnisakya/habitat/issues/2)), and what that costs in time and memory ([#3](https://github.com/kashmithnisakya/habitat/issues/3)).
 
-The [test component](rust/guest.wat) imports host functions and exports `run`, which calls one of them. The app runs the component in four modes. In each one, it confirms that the host function is called, that an out-of-bounds memory read traps without crashing the app, and that the engine still works afterwards.
+The [test component](rust/guest.wat) imports host functions and exports `run`, which calls one of them. The app runs the component in eight modes. In each one, it confirms that the host function is called, that an out-of-bounds memory read traps without crashing the app, and that the engine still works afterwards.
 
 It isn't the real Habitat app.
 
@@ -26,6 +26,10 @@ It isn't the real Habitat app.
 | `CraneliftPrecompiled` | At build time, to machine code | Pass | No |
 | `PulleyOnDevice` | On the device, to Pulley bytecode | Pass | No |
 | `PulleyPrecompiled` | At build time, to Pulley bytecode | Pass | No |
+| `CraneliftCompileFirst` | On the device, to machine code, then saved and loaded from the file | Pass | No |
+| `CraneliftCompileAgain` | Not compiled. Loads the file saved by an earlier process | Pass | No |
+| `PulleyCompileFirst` | On the device, to Pulley bytecode, then saved and loaded from the file | Pass | No |
+| `PulleyCompileAgain` | Not compiled. Loads the file saved by an earlier process | Pass | No |
 
 The app was a non-debuggable build installed normally, and SELinux was enforcing. Logs from the check runs showed no SELinux denials, crashes or native library errors. That includes loading precompiled machine code from a file in the app's private storage. Java null checks and garbage collection still worked after Wasmtime had run.
 
@@ -87,6 +91,26 @@ The app itself took 57–108 ms to start before any agent code ran, and used 113
 
 An earlier run of the same test gave similar results, with on-device cold starts for the large agent within 3% and CPU times within 4%. Cold starts for small agents varied more, by up to about 2 ms. Its data isn't committed, because it used a broader SELinux denial count. That run counted 2 denials, both logged against Google Photos, and the final run counted none for this app.
 
+### Compile once
+
+The [draft feasibility report](../../docs/feasibility-android.md) recommends compiling each agent once on the device and saving the result. This test runs that flow: one process compiles, saves and loads the agent, and the next process only loads the saved file. These figures are for the large agent, from a separate run of 15 repeats, with precompiled modes alongside for comparison ([raw data](results/emulator-arm64-api36-compile-once.csv)):
+
+| Mode | Saved or loaded file | Agent start (range) | Memory added | CPU workload, CPU time |
+|---|---:|---:|---:|---:|
+| `CraneliftCompileFirst` | 4,979 KB | 815 ms (751–983) | 79.9 MB | 210 ms |
+| `CraneliftCompileAgain` | 4,979 KB | 2.7 ms (1.2–4.3) | 6.6 MB | 232 ms |
+| `CraneliftPrecompiled` | 4,979 KB | 5.7 ms (4.2–7.9) | 6.8 MB | 229 ms |
+| `PulleyCompileFirst` | 4,018 KB | 856 ms (779–1,617) | 74.1 MB | 1,357 ms |
+| `PulleyCompileAgain` | 4,018 KB | 1.1 ms (0.5–2.2) | 3.0 MB | 1,402 ms |
+| `PulleyPrecompiled` | 4,018 KB | 1.2 ms (0.6–2.1) | 2.9 MB | 1,393 ms |
+
+- **It works, and Android blocked nothing:** there were no SELinux denials or crashes in any of the 180 runs.
+- **Later starts match build-time precompiling:** memory and CPU time are about the same. Load times are close too, but they shift between runs: `CraneliftPrecompiled` had a median of 5.7 ms here, against 2.8 ms and 3.7 ms in the two earlier runs.
+- **The cost is one slow first start:** on this emulator, that's about 0.8 s and 74–80 MB, and it needs 4–5 MB of storage per agent.
+- **Bad files are rejected in two cases:** a file saved for the other engine, and a file cut in half, both fail to load. The app runs this check on the device, and it's the `BadSavedFiles` line in its report.
+
+This doesn't cover every bad file. Wasmtime doesn't check the code inside a saved file, so changing a byte of it wouldn't be detected, and the design relies on nothing else being able to write to private storage. Upgrading the app or Wasmtime also wasn't tested. This test gives each build its own file names, so a new build would compile again.
+
 ### Limits of these measurements
 
 - **Emulator speed doesn't predict phone speed:** the emulator runs on a fast Mac and has no thermal limits, so a phone's numbers could be much worse. The ratios may also change.
@@ -107,7 +131,13 @@ With one device connected and a built APK, from the repository root:
 android/feasibility/measure.sh android/feasibility/results/my-device.csv 15
 ```
 
-The output file must not already exist. Keep the device otherwise idle and its screen on, and avoid heavy work on the computer if you're using an emulator. A full run takes about 12 minutes on the emulator, and may take longer on a phone.
+The output file must not already exist. Keep the device otherwise idle and its screen on, and avoid heavy work on the computer if you're using an emulator. By default, this runs all eight modes, which should take about 25 minutes on the emulator and may take longer on a phone.
+
+To run only some modes, set `MODES`, and keep each `CompileAgain` mode after its `CompileFirst` mode:
+
+```bash
+MODES="CraneliftCompileFirst CraneliftCompileAgain" android/feasibility/measure.sh android/feasibility/results/my-device.csv 15
+```
 
 To print the table again from a results file:
 
@@ -227,13 +257,18 @@ Turn on USB debugging on an arm64 Android phone and connect it, then run:
 "$HOME/Library/Android/sdk/platform-tools/adb" logcat -d -s HabitatFeasibility
 ```
 
-The phone's screen and the log should both show five lines that start with `PASS`, and no lines that start with `FAIL`:
+The phone's screen and the log should both show ten lines that start with `PASS`, and no lines that start with `FAIL`:
 
 ```text
-PASS CraneliftOnDevice: run(20)=41, host called, trap caught, load 31257 us, run 139 us
-PASS CraneliftPrecompiled: run(20)=41, host called, trap caught, load 363 us, run 30 us
-PASS PulleyOnDevice: run(20)=41, host called, trap caught, load 14988 us, run 95 us
-PASS PulleyPrecompiled: run(20)=41, host called, trap caught, load 59 us, run 9 us
+PASS CraneliftOnDevice: run(20)=41, host called, trap caught, load 88184 us, run 219 us
+PASS CraneliftPrecompiled: run(20)=41, host called, trap caught, load 236 us, run 44 us
+PASS PulleyOnDevice: run(20)=41, host called, trap caught, load 3488 us, run 109 us
+PASS PulleyPrecompiled: run(20)=41, host called, trap caught, load 123 us, run 1414 us
+PASS CraneliftCompileFirst: run(20)=41, host called, trap caught, load 50219 us, run 38 us
+PASS CraneliftCompileAgain: run(20)=41, host called, trap caught, load 60 us, run 7 us
+PASS PulleyCompileFirst: run(20)=41, host called, trap caught, load 1209 us, run 23 us
+PASS PulleyCompileAgain: run(20)=41, host called, trap caught, load 22 us, run 11 us
+PASS BadSavedFiles: other engine's file and cut-short file rejected
 PASS AndroidRuntime: null checks and garbage collection still work
 ```
 

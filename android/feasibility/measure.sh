@@ -7,7 +7,8 @@
 set -euo pipefail
 
 APP="io.github.kashmithnisakya.habitat.feasibility"
-MODES="CraneliftOnDevice CraneliftPrecompiled PulleyOnDevice PulleyPrecompiled"
+# Set MODES to measure only some of them. Keep each CompileAgain mode after its CompileFirst mode.
+MODES="${MODES:-CraneliftOnDevice CraneliftPrecompiled PulleyOnDevice PulleyPrecompiled CraneliftCompileFirst CraneliftCompileAgain PulleyCompileFirst PulleyCompileAgain}"
 GUESTS="Hello Large"
 HEADER="mode,guest,file_kb,app_ms,cold_us,warm_us,base_kb,peak_kb,cpu_elapsed_us,cpu_time_us,wait_elapsed_us,wait_time_us,denials"
 TIMEOUT_SECONDS=300
