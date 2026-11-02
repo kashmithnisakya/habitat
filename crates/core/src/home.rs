@@ -329,8 +329,10 @@ fn file_cost(metadata: &Metadata) -> Result<u64, HomeError> {
     Ok(metadata.len().saturating_add(ENTRY_COST))
 }
 
+/// Saves a directory's entries to disk. On Linux and Android, `Dir` holds a handle that can't be
+/// synced, so this opens the directory again for reading.
 fn sync_dir(dir: &Dir) -> Result<(), HomeError> {
-    dir.try_clone()?.into_std_file().sync_all()?;
+    dir.open(".")?.sync_all()?;
     Ok(())
 }
 
@@ -697,6 +699,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "Android's security policy stops this test from creating a named pipe"
+    )]
     fn named_pipes_are_denied_without_hanging() {
         let fixture = Fixture::new();
         let pipe = fixture.home_path().join("pipe");
