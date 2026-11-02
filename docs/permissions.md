@@ -23,6 +23,7 @@ version = "0.1.0"
 [limits]
 memory_mb = 256
 run_seconds = 120
+disk_mb = 100
 model_budget_tokens = 50000
 
 [requests]
@@ -31,7 +32,37 @@ models = ["default"]
 files = "ask"
 ```
 
-The exact format is defined in the manifest issue on the [roadmap](roadmap.md). See the [example manifest](../examples/research-helper/agent.toml).
+The manifest is untrusted, so it's validated strictly. A manifest is rejected if it has an unknown field, a repeated field or a value outside the rules below, or if it's larger than 64 KB. See the [example manifest](../examples/research-helper/agent.toml).
+
+### `[agent]` (required)
+
+| Field | Required | Rules |
+|---|---|---|
+| `name` | Yes | Up to 64 lowercase letters, digits and single hyphens. Starts with a letter, and doesn't end with a hyphen |
+| `version` | Yes | A [semantic version](https://semver.org), such as `0.1.0` |
+
+### `[limits]` (required)
+
+The host can enforce lower limits than these, so an agent can't raise its limits above the host's maximum.
+
+| Field | Required | Allowed values | Meaning |
+|---|---|---|---|
+| `memory_mb` | Yes | 1 to 4,096 | Memory for one run |
+| `run_seconds` | Yes | 1 to 3,600 | Time for one run |
+| `disk_mb` | Yes | 1 to 10,240 | Disk space for the agent's home |
+| `model_budget_tokens` | No, defaults to 0 | 0 to 100,000,000 | AI model tokens for one run. Must be above 0 if `models` is requested |
+
+### `[requests]` (optional)
+
+These list what an agent may ask for, and they don't grant anything. If a field is left out, the agent can't ask for that thing.
+
+| Field | Default | Rules |
+|---|---|---|
+| `network` | `[]` | Up to 64 different host names, such as `api.github.com` |
+| `models` | `[]` | Up to 16 different model names of up to 64 characters. They use lowercase letters, digits, `-`, `.` and `_`, and start with a letter or digit |
+| `files` | `"none"` | `"none"` or `"ask"` |
+
+Network hosts must be lowercase and contain a dot. Schemes, ports, paths and wildcards are rejected. So are `localhost` and IP addresses, because an agent has no reason to ask for the user's own device or local network by address. Internationalized names must use their `xn--` form, so that lookalike characters can't appear in an approval prompt.
 
 ## What needs approval
 

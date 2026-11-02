@@ -1,4 +1,4 @@
-# Draft manifest. The format may change. Declaring a request here doesn't grant it.
+# The format may change. Declaring a request here doesn't grant it.
 
 [agent]
 name = "research-helper"
@@ -7,6 +7,7 @@ version = "0.1.0"
 [limits]
 memory_mb = 256
 run_seconds = 120
+disk_mb = 100
 model_budget_tokens = 50000
 
 [requests]
