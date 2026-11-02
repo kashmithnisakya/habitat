@@ -1,0 +1,1021 @@
+//! Each agent's storage on disk, and the home store that gives an agent its own files.
+//!
+//! Paths from an agent are untrusted. They're checked here, and then every file operation walks
+//! down from an open directory, one name at a time, without following symlinks. Swapping a
+//! directory for a symlink during an operation therefore can't lead outside the home.
+
+use std::fs::DirBuilder;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, Metadata, OpenOptions, OpenOptionsExt};
+
+use crate::manifest::is_agent_name;
+
+const AGENTS_DIR: &str = "agents";
+const PACKAGE_DIR: &str = "package";
+const HOME_DIR: &str = "home";
+/// Outside the home, so an agent can never see a partly written file.
+const TEMP_DIR: &str = "tmp";
+const GRANTS_FILE: &str = "grants.db";
+const AUDIT_FILE: &str = "audit.db";
+
+const MAX_PATH_BYTES: usize = 1024;
+const MAX_NAME_BYTES: usize = 255;
+const MAX_PATH_DEPTH: usize = 32;
+/// Counted for every file and directory, so that empty files can't fill the disk.
+const ENTRY_COST: u64 = 4096;
+
+/// Why a home operation failed. Messages never include host paths, so they're safe to show to
+/// the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HomeError {
+    /// The agent's name or path breaks the rules. The path may not even have been used.
+    InvalidPath(&'static str),
+    /// Nothing exists at this path.
+    NotFound,
+    /// The path leads to something the home store refuses to touch, such as a symlink.
+    Denied,
+    /// The path leads to a directory or passes through a file.
+    NotAFile,
+    /// This would take the home over its disk limit.
+    DiskLimit { needed: u64, limit: u64 },
+    /// The host's file system failed.
+    Io(io::ErrorKind),
+}
+
+impl std::fmt::Display for HomeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPath(reason) => write!(f, "invalid path: {reason}"),
+            Self::NotFound => write!(f, "file not found"),
+            Self::Denied => write!(f, "access denied"),
+            Self::NotAFile => write!(f, "not a file"),
+            Self::DiskLimit { needed, limit } => {
+                write!(f, "disk limit exceeded: needs {needed} bytes of {limit}")
+            }
+            Self::Io(kind) => write!(f, "file system error: {kind}"),
+        }
+    }
+}
+
+impl std::error::Error for HomeError {}
+
+impl From<io::Error> for HomeError {
+    fn from(error: io::Error) -> Self {
+        match (error.kind(), error.raw_os_error()) {
+            (io::ErrorKind::NotFound, _) => Self::NotFound,
+            (io::ErrorKind::PermissionDenied, _) => Self::Denied,
+            (_, Some(libc::ELOOP)) => Self::Denied,
+            (io::ErrorKind::NotADirectory | io::ErrorKind::IsADirectory, _) => Self::NotAFile,
+            (kind, _) => Self::Io(kind),
+        }
+    }
+}
+
+/// One agent's folder. Only `home/` is ever visible to the agent.
+#[derive(Debug)]
+pub struct AgentStorage {
+    path: PathBuf,
+}
+
+impl AgentStorage {
+    /// Opens an agent's folder under `root`, creating it if needed. `root` is chosen by the host
+    /// and is trusted. Only the current user can open the folder.
+    pub fn open(root: &Path, agent_name: &str) -> Result<Self, HomeError> {
+        if !is_agent_name(agent_name) {
+            return Err(HomeError::InvalidPath("not a valid agent name"));
+        }
+        let path = root.join(AGENTS_DIR).join(agent_name);
+        let mut builder = DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        for dir in [PACKAGE_DIR, HOME_DIR, TEMP_DIR] {
+            builder.create(path.join(dir))?;
+        }
+        Ok(Self { path })
+    }
+
+    /// Opens the agent's home, with the given limit on the space it can use.
+    pub fn home(&self, disk_limit: u64) -> Result<Home, HomeError> {
+        let open = |name| Dir::open_ambient_dir(self.path.join(name), ambient_authority());
+        Home::new(open(HOME_DIR)?, open(TEMP_DIR)?, disk_limit)
+    }
+
+    /// The read-only agent code and manifest.
+    pub fn package_path(&self) -> PathBuf {
+        self.path.join(PACKAGE_DIR)
+    }
+
+    /// The agent's permissions, which only the core can write to.
+    pub fn grants_path(&self) -> PathBuf {
+        self.path.join(GRANTS_FILE)
+    }
+
+    /// The agent's tamper-evident log, which only the core can write to.
+    pub fn audit_path(&self) -> PathBuf {
+        self.path.join(AUDIT_FILE)
+    }
+}
+
+/// An agent's files. Agents can only name things inside the home.
+///
+/// Only one `Home` should be open for an agent at a time, because each keeps its own count of the
+/// space used. The supervisor is responsible for that.
+#[derive(Debug)]
+pub struct Home {
+    root: Dir,
+    temp: Dir,
+    disk_limit: u64,
+    used: u64,
+    next_temp: u64,
+}
+
+impl Home {
+    fn new(root: Dir, temp: Dir, disk_limit: u64) -> Result<Self, HomeError> {
+        // Anything here was left by a crash, and was never part of the agent's files.
+        for entry in temp.entries()? {
+            temp.remove_file(entry?.file_name())?;
+        }
+        let used = count_used(&root)?;
+        Ok(Self {
+            root,
+            temp,
+            disk_limit,
+            used,
+            next_temp: 0,
+        })
+    }
+
+    /// The space the home is using, including a fixed amount for each file and directory.
+    pub fn used_bytes(&self) -> u64 {
+        self.used
+    }
+
+    /// Reads a whole file.
+    pub fn read(&self, path: &str) -> Result<Vec<u8>, HomeError> {
+        let (parents, name) = parse_path(path)?;
+        let dir = self.open_parents(&parents)?;
+
+        // Non-blocking, so that opening a named pipe can't hang the host.
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .custom_flags(libc::O_NONBLOCK);
+        let mut file = dir.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            return Err(HomeError::NotAFile);
+        }
+        if !metadata.is_file() {
+            return Err(HomeError::Denied);
+        }
+        if metadata.len() > self.disk_limit {
+            return Err(HomeError::DiskLimit {
+                needed: metadata.len(),
+                limit: self.disk_limit,
+            });
+        }
+
+        // Bounded, in case something outside Habitat makes the file grow during this read.
+        let mut data = Vec::with_capacity(metadata.len() as usize);
+        Read::take(&mut file, self.disk_limit.saturating_add(1)).read_to_end(&mut data)?;
+        if data.len() as u64 > self.disk_limit {
+            return Err(HomeError::DiskLimit {
+                needed: data.len() as u64,
+                limit: self.disk_limit,
+            });
+        }
+        Ok(data)
+    }
+
+    /// Replaces a whole file, creating it and its parent directories if needed. If the host
+    /// crashes, the file holds either its old contents or its new contents, never a mix.
+    pub fn write(&mut self, path: &str, data: &[u8]) -> Result<(), HomeError> {
+        let (parents, name) = parse_path(path)?;
+
+        let mut dir = self.root.try_clone()?;
+        let mut existing_parents = 0;
+        for parent in &parents {
+            match open_child(&dir, parent) {
+                Ok(next) => dir = next,
+                Err(HomeError::NotFound) => break,
+                Err(error) => return Err(error),
+            }
+            existing_parents += 1;
+        }
+        let missing_parents = &parents[existing_parents..];
+
+        let old_cost = if missing_parents.is_empty() {
+            match dir.symlink_metadata(name) {
+                Ok(metadata) => file_cost(&metadata)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            0
+        };
+        let new_cost = data.len() as u64 + ENTRY_COST + missing_parents.len() as u64 * ENTRY_COST;
+        let needed = (self.used - old_cost.min(self.used)).saturating_add(new_cost);
+        if needed > self.disk_limit {
+            return Err(HomeError::DiskLimit {
+                needed,
+                limit: self.disk_limit,
+            });
+        }
+
+        let temp_name = self.next_temp.to_string();
+        self.next_temp += 1;
+        let result = self.write_and_move(&temp_name, data, dir, missing_parents, name);
+        if result.is_err() {
+            // The temporary file may already have moved, so a failure here doesn't matter.
+            let _ = self.temp.remove_file(&temp_name);
+            // Some parent directories may exist now, so count again rather than guess.
+            self.used = count_used(&self.root)?;
+            return result;
+        }
+        self.used = needed;
+        Ok(())
+    }
+
+    fn write_and_move(
+        &self,
+        temp_name: &str,
+        data: &[u8],
+        mut dir: Dir,
+        missing_parents: &[&str],
+        name: &str,
+    ) -> Result<(), HomeError> {
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = self.temp.open_with(temp_name, &options)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+
+        for parent in missing_parents {
+            dir.create_dir(parent)?;
+            sync_dir(&dir)?;
+            dir = open_child(&dir, parent)?;
+        }
+        self.temp.rename(temp_name, &dir, name)?;
+        sync_dir(&dir)?;
+        Ok(())
+    }
+
+    /// Removes a file, and any parent directories that it leaves empty.
+    pub fn remove(&mut self, path: &str) -> Result<(), HomeError> {
+        let (parents, name) = parse_path(path)?;
+
+        let mut dirs = vec![self.root.try_clone()?];
+        for parent in &parents {
+            let next = open_child(&dirs[dirs.len() - 1], parent)?;
+            dirs.push(next);
+        }
+        let dir = dirs.pop().ok_or(HomeError::Io(io::ErrorKind::Other))?;
+        let cost = file_cost(&dir.symlink_metadata(name)?)?;
+        dir.remove_file(name)?;
+        sync_dir(&dir)?;
+        self.used = self.used.saturating_sub(cost);
+
+        for (parent_dir, parent_name) in dirs.iter().zip(&parents).rev() {
+            // Stops at the first directory that still has something in it.
+            if parent_dir.remove_dir(parent_name).is_err() {
+                break;
+            }
+            sync_dir(parent_dir)?;
+            self.used = self.used.saturating_sub(ENTRY_COST);
+        }
+        Ok(())
+    }
+
+    fn open_parents(&self, parents: &[&str]) -> Result<Dir, HomeError> {
+        let mut dir = self.root.try_clone()?;
+        for parent in parents {
+            dir = open_child(&dir, parent)?;
+        }
+        Ok(dir)
+    }
+}
+
+/// Opens a directory inside `dir`, one level down, without following a symlink.
+fn open_child(dir: &Dir, name: &str) -> Result<Dir, HomeError> {
+    dir.open_dir_nofollow(name).map_err(|error| {
+        let is_file = dir
+            .symlink_metadata(name)
+            .is_ok_and(|metadata| metadata.is_file());
+        match HomeError::from(error) {
+            // Refusing a symlink or special file here looks the same as passing through a file.
+            HomeError::NotAFile if !is_file => HomeError::Denied,
+            other => other,
+        }
+    })
+}
+
+/// What an existing file counts for, or an error if the path isn't a regular file.
+fn file_cost(metadata: &Metadata) -> Result<u64, HomeError> {
+    if metadata.is_dir() {
+        return Err(HomeError::NotAFile);
+    }
+    if !metadata.is_file() {
+        return Err(HomeError::Denied);
+    }
+    Ok(metadata.len().saturating_add(ENTRY_COST))
+}
+
+/// Saves a directory's entries to disk. On Linux and Android, `Dir` holds a handle that can't be
+/// synced, so this opens the directory again for reading.
+fn sync_dir(dir: &Dir) -> Result<(), HomeError> {
+    dir.open(".")?.sync_all()?;
+    Ok(())
+}
+
+/// Adds up the space used by a home, without following symlinks.
+fn count_used(root: &Dir) -> Result<u64, HomeError> {
+    let mut used: u64 = 0;
+    let mut pending = vec![root.try_clone()?];
+    while let Some(dir) = pending.pop() {
+        for entry in dir.entries()? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            used = used.saturating_add(ENTRY_COST);
+            if file_type.is_dir() {
+                pending.push(dir.open_dir_nofollow(entry.file_name())?);
+            } else if file_type.is_file() {
+                used = used.saturating_add(entry.metadata()?.len());
+            }
+        }
+    }
+    Ok(used)
+}
+
+/// Splits an agent's path into its parent directories and file name.
+fn parse_path(path: &str) -> Result<(Vec<&str>, &str), HomeError> {
+    if path.is_empty() {
+        return Err(HomeError::InvalidPath("path is empty"));
+    }
+    if path.len() > MAX_PATH_BYTES {
+        return Err(HomeError::InvalidPath("path is too long"));
+    }
+    let mut parts: Vec<&str> = path.split('/').collect();
+    if parts.len() > MAX_PATH_DEPTH {
+        return Err(HomeError::InvalidPath("path is too deep"));
+    }
+    for part in &parts {
+        check_path_part(part)?;
+    }
+    let name = parts.pop().ok_or(HomeError::InvalidPath("path is empty"))?;
+    Ok((parts, name))
+}
+
+/// Allows letters and digits from any language, and a few common symbols. This rules out control
+/// characters, invisible characters, right-to-left overrides, and lookalikes of `/` and `.`,
+/// some of which file systems have ignored or changed in the past.
+fn check_path_part(part: &str) -> Result<(), HomeError> {
+    if part.is_empty() {
+        return Err(HomeError::InvalidPath(
+            "path must be relative, with no empty parts",
+        ));
+    }
+    if part.len() > MAX_NAME_BYTES {
+        return Err(HomeError::InvalidPath("a name in the path is too long"));
+    }
+    if part.ends_with('.') || part.starts_with(' ') || part.ends_with(' ') {
+        return Err(HomeError::InvalidPath(
+            "a name can't end with '.', which also rules out '.' and '..', or start or end with a space",
+        ));
+    }
+    let allowed =
+        |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ' | '+' | '=' | '@' | ',');
+    if !part.chars().all(allowed) {
+        return Err(HomeError::InvalidPath(
+            "path contains a character that isn't allowed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::process::{Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use std::{env, fs, thread};
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    const LIMIT: u64 = 1024 * 1024;
+    const CRASH_DIR_VAR: &str = "HABITAT_TEST_CRASH_DIR";
+
+    struct Fixture {
+        root: TempDir,
+        storage: AgentStorage,
+        /// A folder outside the agent's storage, which must never be reached.
+        outside: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = TempDir::new().unwrap();
+            let storage = AgentStorage::open(root.path(), "test-agent").unwrap();
+            let outside = root.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("secret"), "outside secret").unwrap();
+            Self {
+                root,
+                storage,
+                outside,
+            }
+        }
+
+        fn home(&self) -> Home {
+            self.storage.home(LIMIT).unwrap()
+        }
+
+        fn home_path(&self) -> PathBuf {
+            self.storage.path.join(HOME_DIR)
+        }
+
+        fn temp_path(&self) -> PathBuf {
+            self.storage.path.join(TEMP_DIR)
+        }
+    }
+
+    #[test]
+    fn write_then_read() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("notes/2026/today.txt", b"hello").unwrap();
+        assert_eq!(home.read("notes/2026/today.txt").unwrap(), b"hello");
+        home.write("notes/2026/today.txt", b"changed").unwrap();
+        assert_eq!(home.read("notes/2026/today.txt").unwrap(), b"changed");
+    }
+
+    #[test]
+    fn files_survive_reopening() {
+        let fixture = Fixture::new();
+        fixture.home().write("state.json", b"{}").unwrap();
+        assert_eq!(fixture.home().read("state.json").unwrap(), b"{}");
+    }
+
+    #[test]
+    fn empty_files_work() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("empty", b"").unwrap();
+        assert_eq!(home.read("empty").unwrap(), b"");
+    }
+
+    #[test]
+    fn missing_files_are_not_found() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        assert_eq!(home.read("missing"), Err(HomeError::NotFound));
+        assert_eq!(home.read("missing/file"), Err(HomeError::NotFound));
+        assert_eq!(home.remove("missing"), Err(HomeError::NotFound));
+    }
+
+    #[test]
+    fn bad_paths_are_rejected() {
+        let long_name = "a".repeat(MAX_NAME_BYTES + 1);
+        let long_path = vec!["a".repeat(100); 11].join("/");
+        let deep_path = vec!["a"; MAX_PATH_DEPTH + 1].join("/");
+        for path in [
+            "",
+            "/",
+            "/etc/passwd",
+            "//etc/passwd",
+            "..",
+            "../secret",
+            "a/../../secret",
+            "a/..",
+            ".",
+            "./a",
+            "a/.",
+            "...",
+            "a//b",
+            "a/",
+            "a\\b",
+            "..\\secret",
+            "C:\\secret",
+            "a:b",
+            "a\0b",
+            "a\nb",
+            "a\tb",
+            "~/secret",
+            "$HOME/secret",
+            "a*",
+            "a.",
+            " a",
+            "a ",
+            &long_name,
+            &long_path,
+            &deep_path,
+        ] {
+            let fixture = Fixture::new();
+            let mut home = fixture.home();
+            assert!(
+                matches!(home.read(path), Err(HomeError::InvalidPath(_))),
+                "read {path:?}"
+            );
+            assert!(
+                matches!(home.write(path, b"x"), Err(HomeError::InvalidPath(_))),
+                "write {path:?}"
+            );
+            assert!(
+                matches!(home.remove(path), Err(HomeError::InvalidPath(_))),
+                "remove {path:?}"
+            );
+            assert_eq!(fs::read_dir(fixture.home_path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn tricky_unicode_is_rejected() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        for path in [
+            "a\u{0301}",          // A combining accent, which file systems may normalize.
+            "\u{202e}txt.exe",    // A right-to-left override.
+            "a\u{200d}b",         // A zero-width joiner.
+            ".\u{200c}.",         // Some file systems have ignored this, leaving "..".
+            "\u{feff}a",          // A byte order mark.
+            "\u{ff0e}\u{ff0e}/a", // Full-width dots.
+            "\u{2024}\u{2024}/a", // One dot leaders.
+            "a\u{2215}b",         // A division slash.
+            "a\u{ff0f}b",         // A full-width slash.
+            "a\u{ad}b",           // A soft hyphen.
+            "\u{1f600}",          // Not harmful, but not a letter or digit.
+        ] {
+            assert!(
+                matches!(home.write(path, b"x"), Err(HomeError::InvalidPath(_))),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_names_are_allowed() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        let longest = "a".repeat(MAX_NAME_BYTES);
+        for path in [
+            "a",
+            ".config/settings.toml",
+            "file.tar.gz",
+            "my notes.txt",
+            "a-b_c+d=e@f,g",
+            "caf\u{e9}.txt",
+            "\u{65e5}\u{672c}\u{8a9e}/\u{30e1}\u{30e2}.txt",
+            "\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}.txt",
+            &longest,
+        ] {
+            home.write(path, b"x")
+                .unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            assert_eq!(home.read(path).unwrap(), b"x");
+        }
+        let deepest = vec!["deep"; MAX_PATH_DEPTH].join("/");
+        home.write(&deepest, b"x").unwrap();
+    }
+
+    #[test]
+    fn symlinks_to_files_are_denied() {
+        let fixture = Fixture::new();
+        let link = fixture.home_path().join("link");
+        symlink(fixture.outside.join("secret"), &link).unwrap();
+
+        let mut home = fixture.home();
+        assert_eq!(home.read("link"), Err(HomeError::Denied));
+        assert_eq!(home.write("link", b"overwritten"), Err(HomeError::Denied));
+        assert_eq!(home.remove("link"), Err(HomeError::Denied));
+        assert_eq!(
+            fs::read_to_string(fixture.outside.join("secret")).unwrap(),
+            "outside secret"
+        );
+    }
+
+    #[test]
+    fn symlinked_directories_are_denied() {
+        let fixture = Fixture::new();
+        symlink(&fixture.outside, fixture.home_path().join("link")).unwrap();
+
+        let mut home = fixture.home();
+        assert_eq!(home.read("link/secret"), Err(HomeError::Denied));
+        assert_eq!(home.write("link/new", b"x"), Err(HomeError::Denied));
+        assert_eq!(home.remove("link/secret"), Err(HomeError::Denied));
+        assert!(!fixture.outside.join("new").exists());
+        assert!(fixture.outside.join("secret").exists());
+    }
+
+    #[test]
+    fn relative_symlinks_and_symlinks_inside_the_home_are_denied() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("real", b"x").unwrap();
+        symlink("real", fixture.home_path().join("inside")).unwrap();
+        symlink("../grants.db", fixture.home_path().join("up")).unwrap();
+        symlink("up", fixture.home_path().join("chain")).unwrap();
+        fs::write(fixture.storage.grants_path(), "grants").unwrap();
+
+        for path in ["inside", "up", "chain"] {
+            assert_eq!(home.read(path), Err(HomeError::Denied), "{path}");
+            assert_eq!(home.write(path, b"y"), Err(HomeError::Denied), "{path}");
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.storage.grants_path()).unwrap(),
+            "grants"
+        );
+    }
+
+    #[test]
+    fn symlinked_directories_inside_the_home_are_denied() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("real/file", b"x").unwrap();
+        symlink("real", fixture.home_path().join("link")).unwrap();
+
+        assert_eq!(home.read("link/file"), Err(HomeError::Denied));
+        assert_eq!(home.write("link/new", b"y"), Err(HomeError::Denied));
+        assert_eq!(home.remove("link/file"), Err(HomeError::Denied));
+        assert_eq!(home.read("real/file").unwrap(), b"x");
+        assert_eq!(home.read("real/new"), Err(HomeError::NotFound));
+    }
+
+    #[test]
+    fn swapping_a_directory_for_a_symlink_never_leaves_the_home() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("swap/file", b"inside").unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swap = fixture.home_path().join("swap");
+        let parked = fixture.home_path().join("parked");
+        let link = fixture.home_path().join("link");
+        symlink(&fixture.outside, &link).unwrap();
+        fs::write(fixture.outside.join("file"), "outside secret").unwrap();
+
+        // Repeatedly replaces the directory with a symlink that leads outside the home. Writes can
+        // recreate the directory at any moment, so a failed rename here is expected.
+        let swapper = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = fs::rename(&swap, &parked);
+                    let _ = fs::rename(&link, &swap);
+                    let _ = fs::rename(&swap, &link);
+                    let _ = fs::rename(&parked, &swap);
+                }
+            })
+        };
+
+        for round in 0..2000 {
+            if let Ok(data) = home.read("swap/file") {
+                assert_ne!(data, b"outside secret", "read outside on round {round}");
+            }
+            let _ = home.write("swap/planted", b"x");
+            let _ = home.remove("swap/secret");
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+
+        assert!(!fixture.outside.join("planted").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.outside.join("secret")).unwrap(),
+            "outside secret"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "Android's security policy stops this test from creating a named pipe"
+    )]
+    fn named_pipes_are_denied_without_hanging() {
+        let fixture = Fixture::new();
+        let pipe = fixture.home_path().join("pipe");
+        let c_path = CString::new(pipe.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a valid C string that lives for the whole call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let mut home = fixture.home();
+        assert_eq!(home.write("pipe", b"x"), Err(HomeError::Denied));
+        assert_eq!(home.remove("pipe"), Err(HomeError::Denied));
+
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(home.read("pipe")).unwrap());
+        let result = receiver.recv_timeout(Duration::from_secs(10));
+        assert_eq!(result, Ok(Err(HomeError::Denied)));
+    }
+
+    #[test]
+    fn directories_and_files_are_not_mixed_up() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("dir/file", b"x").unwrap();
+        assert_eq!(home.read("dir"), Err(HomeError::NotAFile));
+        assert_eq!(home.write("dir", b"y"), Err(HomeError::NotAFile));
+        assert_eq!(home.remove("dir"), Err(HomeError::NotAFile));
+        assert_eq!(home.read("dir/file/under"), Err(HomeError::NotAFile));
+        assert_eq!(home.write("dir/file/under", b"y"), Err(HomeError::NotAFile));
+        assert_eq!(home.read("dir/file").unwrap(), b"x");
+    }
+
+    #[test]
+    fn other_storage_is_outside_the_home() {
+        let fixture = Fixture::new();
+        fs::write(fixture.storage.grants_path(), "grants").unwrap();
+        fs::write(fixture.storage.audit_path(), "audit").unwrap();
+        fs::write(fixture.storage.package_path().join("agent.toml"), "x").unwrap();
+
+        let mut home = fixture.home();
+        for path in [
+            "grants.db",
+            "audit.db",
+            "package/agent.toml",
+            "tmp/0",
+            "../grants.db",
+            "../audit.db",
+            "../package/agent.toml",
+            "../tmp/0",
+        ] {
+            assert!(home.read(path).is_err(), "{path}");
+        }
+        home.write("grants.db", b"mine").unwrap();
+        home.write("package/agent.toml", b"mine").unwrap();
+        assert_eq!(
+            fs::read_to_string(fixture.storage.grants_path()).unwrap(),
+            "grants"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.storage.package_path().join("agent.toml")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn bad_agent_names_are_rejected() {
+        let root = TempDir::new().unwrap();
+        for name in ["", "..", "../other", "a/b", "/etc", "Agent", "a\0b"] {
+            assert!(
+                matches!(
+                    AgentStorage::open(root.path(), name),
+                    Err(HomeError::InvalidPath(_))
+                ),
+                "{name:?}"
+            );
+        }
+        assert!(!root.path().join(AGENTS_DIR).exists());
+    }
+
+    #[test]
+    fn agents_cannot_see_each_other() {
+        let root = TempDir::new().unwrap();
+        let mut first = AgentStorage::open(root.path(), "first")
+            .unwrap()
+            .home(LIMIT)
+            .unwrap();
+        let second = AgentStorage::open(root.path(), "second")
+            .unwrap()
+            .home(LIMIT)
+            .unwrap();
+        first.write("file", b"first").unwrap();
+        assert_eq!(second.read("file"), Err(HomeError::NotFound));
+        assert!(matches!(
+            second.read("../../first/home/file"),
+            Err(HomeError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn only_the_current_user_can_open_storage() {
+        let fixture = Fixture::new();
+        let mode = fs::metadata(&fixture.storage.path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn errors_do_not_include_host_paths() {
+        let fixture = Fixture::new();
+        symlink(&fixture.outside, fixture.home_path().join("link")).unwrap();
+        let mut home = fixture.home();
+        let root = fixture.root.path().to_string_lossy().into_owned();
+        for error in [
+            home.read("missing").unwrap_err(),
+            home.read("link/secret").unwrap_err(),
+            home.read("../x").unwrap_err(),
+            home.write(&"a".repeat(MAX_PATH_BYTES + 1), b"x")
+                .unwrap_err(),
+            home.write("big", &vec![0; LIMIT as usize + 1]).unwrap_err(),
+        ] {
+            let text = format!("{error} {error:?}");
+            assert!(!text.contains(&root), "{text}");
+        }
+    }
+
+    #[test]
+    fn writes_stop_at_the_disk_limit() {
+        let fixture = Fixture::new();
+        let limit = 3 * ENTRY_COST;
+        let mut home = fixture.storage.home(limit).unwrap();
+        let exact = (limit - ENTRY_COST) as usize;
+        home.write("file", &vec![1; exact]).unwrap();
+        assert_eq!(home.used_bytes(), limit);
+
+        assert!(matches!(
+            home.write("other", b""),
+            Err(HomeError::DiskLimit { .. })
+        ));
+        assert!(matches!(
+            home.write("file", &vec![2; exact + 1]),
+            Err(HomeError::DiskLimit { .. })
+        ));
+        assert_eq!(home.read("file").unwrap(), vec![1; exact]);
+        assert!(!fixture.home_path().join("other").exists());
+        assert_eq!(fs::read_dir(fixture.temp_path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn overwriting_and_removing_give_space_back() {
+        let fixture = Fixture::new();
+        let limit = 3 * ENTRY_COST;
+        let mut home = fixture.storage.home(limit).unwrap();
+        let exact = (limit - ENTRY_COST) as usize;
+        home.write("file", &vec![1; exact]).unwrap();
+
+        home.write("file", &vec![2; exact]).unwrap();
+        home.write("file", b"small").unwrap();
+        assert_eq!(home.used_bytes(), ENTRY_COST + 5);
+
+        home.remove("file").unwrap();
+        assert_eq!(home.used_bytes(), 0);
+        home.write("new", &vec![3; exact]).unwrap();
+    }
+
+    #[test]
+    fn empty_files_and_directories_use_up_the_limit() {
+        let fixture = Fixture::new();
+        let mut home = fixture.storage.home(10 * ENTRY_COST).unwrap();
+        let mut created = 0;
+        while home.write(&format!("f{created}"), b"").is_ok() {
+            created += 1;
+            assert!(created <= 10);
+        }
+        assert_eq!(created, 10);
+
+        let mut home = Fixture::new().storage.home(2 * ENTRY_COST).unwrap();
+        assert!(matches!(
+            home.write("a/b/file", b""),
+            Err(HomeError::DiskLimit { .. })
+        ));
+        assert_eq!(home.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_failed_write_creates_no_directories() {
+        let fixture = Fixture::new();
+        let mut home = fixture.storage.home(ENTRY_COST).unwrap();
+        assert!(home.write("a/b/file", b"x").is_err());
+        assert!(!fixture.home_path().join("a").exists());
+    }
+
+    #[test]
+    fn removing_a_file_removes_empty_parents_only() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("a/b/one", b"1").unwrap();
+        home.write("a/two", b"2").unwrap();
+        home.remove("a/b/one").unwrap();
+        assert!(!fixture.home_path().join("a/b").exists());
+        assert_eq!(home.read("a/two").unwrap(), b"2");
+        home.remove("a/two").unwrap();
+        assert!(!fixture.home_path().join("a").exists());
+        assert!(fixture.home_path().exists());
+        assert_eq!(home.used_bytes(), 0);
+    }
+
+    #[test]
+    fn reopening_counts_the_same_space() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("a/b/one", &[1; 100]).unwrap();
+        home.write("a/two", &[2; 200]).unwrap();
+        home.write("three", &[3; 300]).unwrap();
+        home.write("three", &[3; 30]).unwrap();
+        home.remove("a/two").unwrap();
+        assert_eq!(fixture.home().used_bytes(), home.used_bytes());
+    }
+
+    #[test]
+    fn symlinks_are_not_followed_when_counting_space() {
+        let fixture = Fixture::new();
+        fs::write(fixture.outside.join("huge"), vec![0; LIMIT as usize * 2]).unwrap();
+        symlink(&fixture.outside, fixture.home_path().join("dir")).unwrap();
+        symlink(
+            fixture.outside.join("huge"),
+            fixture.home_path().join("file"),
+        )
+        .unwrap();
+        assert_eq!(fixture.home().used_bytes(), 2 * ENTRY_COST);
+
+        fs::write(fixture.home_path().join("real"), [0; 100]).unwrap();
+        symlink("real", fixture.home_path().join("inside")).unwrap();
+        assert_eq!(fixture.home().used_bytes(), 4 * ENTRY_COST + 100);
+    }
+
+    #[test]
+    fn oversized_files_are_not_read_into_memory() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.home_path().join("big"),
+            vec![0; 2 * ENTRY_COST as usize],
+        )
+        .unwrap();
+        let home = fixture.storage.home(ENTRY_COST).unwrap();
+        assert!(matches!(home.read("big"), Err(HomeError::DiskLimit { .. })));
+    }
+
+    #[test]
+    fn leftover_temporary_files_are_removed_on_open() {
+        let fixture = Fixture::new();
+        fs::write(fixture.temp_path().join("0"), "partial").unwrap();
+        let mut home = fixture.home();
+        assert_eq!(home.used_bytes(), 0);
+        assert_eq!(fs::read_dir(fixture.temp_path()).unwrap().count(), 0);
+        home.write("file", b"x").unwrap();
+    }
+
+    /// The contents written in turn by the crash test. Every byte matches, and each size is
+    /// different, so a partial or mixed file can always be spotted.
+    fn crash_contents(round: usize) -> Vec<u8> {
+        let (byte, size) = [(1, 300_000), (2, 200_000), (3, 100_000)][round % 3];
+        vec![byte; size]
+    }
+
+    #[test]
+    #[ignore = "run by killing_a_write_leaves_the_old_or_new_file"]
+    fn crash_test_writer() {
+        let dir = env::var(CRASH_DIR_VAR).expect("only for the crash test");
+        let mut home = AgentStorage::open(Path::new(&dir), "crash")
+            .unwrap()
+            .home(LIMIT)
+            .unwrap();
+        let mut round = 0;
+        loop {
+            home.write("file", &crash_contents(round)).unwrap();
+            round += 1;
+        }
+    }
+
+    #[test]
+    fn killing_a_write_leaves_the_old_or_new_file() {
+        let root = TempDir::new().unwrap();
+        let storage = AgentStorage::open(root.path(), "crash").unwrap();
+        let valid: Vec<Vec<u8>> = (0..3).map(crash_contents).collect();
+        let file = storage.path.join(HOME_DIR).join("file");
+
+        for round in 0..15 {
+            let mut child = Command::new(env::current_exe().unwrap())
+                .args(["--exact", "home::tests::crash_test_writer", "--ignored"])
+                .env(CRASH_DIR_VAR, root.path())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            // Waits for a write to land, then lets it run for a varied time before killing it.
+            while round == 0 && !file.exists() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread::sleep(Duration::from_millis(20 + round * 7));
+            child.kill().unwrap();
+            child.wait().unwrap();
+
+            let home = storage.home(LIMIT).unwrap();
+            let data = home.read("file").unwrap();
+            assert!(
+                valid.contains(&data),
+                "partial file of {} bytes",
+                data.len()
+            );
+            assert_eq!(home.used_bytes(), data.len() as u64 + ENTRY_COST);
+            assert_eq!(
+                fs::read_dir(storage.path.join(TEMP_DIR)).unwrap().count(),
+                0
+            );
+        }
+    }
+}

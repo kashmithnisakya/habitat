@@ -83,6 +83,7 @@ This fits phones, which can pause or stop apps at any time. If a run crashes or 
 agents/<agent-id>/
 ├── package/        # Read-only agent code and manifest
 ├── home/           # Agent's files
+├── tmp/            # Files being written, which are moved into home/ when complete
 ├── grants.db       # Permissions, only the core can write to this
 └── audit.db        # Tamper-evident log, only the core can write to this
 ```
