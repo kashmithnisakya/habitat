@@ -254,15 +254,19 @@ fn position(text: &str, offset: usize) -> (usize, usize) {
     (line, offset.min(text.len()) - line_start + 1)
 }
 
-fn check_name(name: &str) -> Result<(), ManifestError> {
-    let valid = name.len() <= MAX_NAME_CHARS
+/// Whether a name is valid for an agent. These names are safe to use as a single path component.
+pub(crate) fn is_agent_name(name: &str) -> bool {
+    name.len() <= MAX_NAME_CHARS
         && name.starts_with(|c: char| c.is_ascii_lowercase())
         && !name.ends_with('-')
         && !name.contains("--")
         && name
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if valid {
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn check_name(name: &str) -> Result<(), ManifestError> {
+    if is_agent_name(name) {
         Ok(())
     } else {
         Err(invalid(
