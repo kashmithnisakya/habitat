@@ -50,7 +50,7 @@ Planned guarantees:
 | Attack tests | Not started |
 | Android app | Not started |
 
-Progress is tracked in the [roadmap](docs/roadmap.md) and [GitHub issues](https://github.com/kashmithnisakya/agenthome/issues).
+Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/agenthome/issues/41). The next step is the Android feasibility test, starting with [#1](https://github.com/kashmithnisakya/agenthome/issues/1).
 
 ## Documentation
 
