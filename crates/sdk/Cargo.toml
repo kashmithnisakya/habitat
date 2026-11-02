@@ -1,0 +1,8 @@
+[package]
+name = "agenthome-sdk"
+description = "Rust library for building AgentHome agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true

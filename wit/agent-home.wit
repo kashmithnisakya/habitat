@@ -1,0 +1,85 @@
+// Draft agent API. It will change once it runs on real devices.
+package agenthome:host@0.1.0;
+
+interface types {
+    variant home-error {
+        denied(string),
+        not-found,
+        limit-exceeded(string),
+        invalid-request(string),
+        internal(string),
+    }
+
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record http-request {
+        method: string,
+        url: string,
+        headers: list<header>,
+        body: option<list<u8>>,
+    }
+
+    record http-response {
+        status: u16,
+        headers: list<header>,
+        body: list<u8>,
+    }
+
+    record model-request {
+        model: string,
+        prompt: string,
+        max-tokens: u32,
+    }
+
+    record model-response {
+        text: string,
+        input-tokens: u32,
+        output-tokens: u32,
+    }
+
+    variant access-target {
+        network-host(string),
+        user-file(string),
+        model(string),
+    }
+
+    enum grant-lifetime {
+        once,
+        this-run,
+        until-revoked,
+    }
+
+    record grant {
+        target: access-target,
+        lifetime: grant-lifetime,
+    }
+
+    variant event {
+        user-message(string),
+        scheduled(string),
+    }
+}
+
+interface agent-home {
+    use types.{home-error, http-request, http-response, model-request, model-response, access-target, grant};
+
+    // Inside the agent's home: always allowed, within the disk limit.
+    read-file: func(path: string) -> result<list<u8>, home-error>;
+    write-file: func(path: string, data: list<u8>) -> result<_, home-error>;
+
+    // Outside the home: checked by the broker.
+    model-complete: func(request: model-request) -> result<model-response, home-error>;
+    http-fetch: func(request: http-request) -> result<http-response, home-error>;
+    request-access: func(target: access-target, reason: string) -> result<grant, home-error>;
+}
+
+world agent {
+    use types.{event, home-error};
+
+    import agent-home;
+
+    export handle-event: func(event: event) -> result<_, home-error>;
+}

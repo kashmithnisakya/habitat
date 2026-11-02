@@ -1,0 +1,12 @@
+[package]
+name = "agenthome-cli"
+description = "Command line for AgentHome"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "agenthome"
+path = "src/main.rs"

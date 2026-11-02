@@ -1,0 +1,8 @@
+[package]
+name = "agenthome-broker"
+description = "Policy engine, secrets vault, gateway and audit log for AgentHome"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true

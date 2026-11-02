@@ -1,0 +1,16 @@
+/target/
+*.wasm
+*.cwasm
+
+# Android
+android/.gradle/
+android/build/
+android/local.properties
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local secrets
+.env
