@@ -140,6 +140,28 @@ fn a_host_that_stops_working_is_caught() {
 }
 
 #[test]
+fn a_host_that_cant_save_is_caught() {
+    let arena = Arena::new();
+    // The run still ends properly, as the agent only hears that saving this failed.
+    std::fs::create_dir(arena.home().join("still-works.txt")).unwrap();
+    found(arena.check_host_still_works(), "couldn't save");
+}
+
+#[test]
+fn an_agent_using_its_own_home_isnt_a_breach() {
+    // Otherwise, every attack test that lets an agent save something would have to allow for it.
+    let arena = Arena::new();
+    let before = arena.snapshot();
+    let report = arena.attack("write mine.txt hello");
+    assert_eq!(
+        std::fs::read_to_string(arena.home().join("mine.txt")).unwrap(),
+        "hello",
+        "{report:?}"
+    );
+    no_breach(arena.check_unchanged(&before));
+}
+
+#[test]
 fn the_real_host_gives_the_hostile_agent_nothing_to_begin_with() {
     let arena = Arena::new();
     let before = arena.snapshot();
