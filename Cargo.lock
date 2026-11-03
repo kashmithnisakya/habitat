@@ -598,6 +598,12 @@ version = "0.0.0"
 [[package]]
 name = "habitat-cli"
 version = "0.0.0"
+dependencies = [
+ "habitat-backend-wasm",
+ "habitat-core",
+ "tempfile",
+ "wit-component 0.263.0",
+]
 
 [[package]]
 name = "habitat-core"
@@ -617,6 +623,13 @@ dependencies = [
 
 [[package]]
 name = "habitat-file-agent"
+version = "0.0.0"
+dependencies = [
+ "habitat-sdk",
+]
+
+[[package]]
+name = "habitat-hello-agent"
 version = "0.0.0"
 dependencies = [
  "habitat-sdk",

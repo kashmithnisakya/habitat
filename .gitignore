@@ -1,6 +1,7 @@
 target/
 *.wasm
 *.cwasm
+*.habitat
 
 # Android
 android/.gradle/

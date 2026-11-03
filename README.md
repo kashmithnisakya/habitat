@@ -5,7 +5,7 @@
 Habitat gives an agent its own persistent space to live in. The agent keeps its files, memory and tools there, but it can't touch your settings, personal data or other apps unless you allow it.
 
 > [!WARNING]
-> **Early development: nothing works yet, and this is not secure.** The repository currently holds the design and project skeleton. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) exist and an outside security review has taken place.
+> **Early development: most of this doesn't work yet, and this is not secure.** An agent can run and use its own files, but the broker, secrets and approvals don't exist yet. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) exist and an outside security review has taken place.
 
 ## Why
 
@@ -47,7 +47,7 @@ Planned guarantees:
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
 | iPhone and Flutter feasibility test | Not started |
-| Mac core, broker and secrets | In progress: an agent can run through Wasmtime and use files in its home, within time and memory limits |
+| Mac core, broker and secrets | In progress: from the command line, an agent can be installed and run, use files in its home and reply, within time and memory limits. The broker and secrets don't exist yet |
 | Attack tests | Not started |
 | Phone app (Flutter) | Not started |
 
@@ -96,6 +96,28 @@ cargo build --workspace
 ```bash
 cargo test --workspace
 ```
+
+## Try it
+
+This builds the example agent, packs it, installs it and sends it a message. Agents are stored in `~/.habitat`, or in `$HABITAT_DATA` if you set it.
+
+```bash
+cargo build -p habitat-hello-agent --release --target wasm32-unknown-unknown
+```
+
+```bash
+cargo run -p habitat-cli -- pack examples/hello-agent/agent.toml target/wasm32-unknown-unknown/release/habitat_hello_agent.wasm hello.habitat
+```
+
+```bash
+cargo run -p habitat-cli -- install hello.habitat
+```
+
+```bash
+cargo run -p habitat-cli -- run hello-agent good morning
+```
+
+Run `cargo run -p habitat-cli -- help` to see the other commands.
 
 ## Contributing
 
