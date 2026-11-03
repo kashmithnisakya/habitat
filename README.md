@@ -38,7 +38,7 @@ Planned guarantees:
 - **Approvals the agent can't fake:** the trusted core draws every permission prompt.
 - **Secrets stay outside:** API keys never enter the agent's space.
 - **A full record:** every action, approval and denial goes into a tamper-evident log.
-- **Same package everywhere:** one agent package runs on Mac and Android.
+- **Same package everywhere:** one agent package runs on macOS, Windows, Linux and Android, and on iPhone and iPad if that [proves possible](docs/decisions/0007-supported-platforms.md).
 
 ## Project status
 
@@ -48,7 +48,9 @@ Planned guarantees:
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
 | Mac core, broker and secrets | In progress: you can install and run an agent from the command line, and it can use files in its home, within time and memory limits. There's no broker yet, so it can't reach anything else |
 | Attack tests | Not started |
+| Windows | Not started: the code only builds on macOS and Linux today ([#56](https://github.com/kashmithnisakya/habitat/issues/56)) |
 | Android app | Not started |
+| iPhone and iPad | Not started: [we need to check that it's possible](https://github.com/kashmithnisakya/habitat/issues/40) |
 
 Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41). The next step is to run the Android feasibility test on a real phone. See the [draft feasibility report](docs/feasibility-android.md).
 

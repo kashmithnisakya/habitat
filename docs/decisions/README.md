@@ -10,5 +10,6 @@ These records explain why major decisions were made. To change one, add a new re
 | [0004](0004-webassembly-only-packages.md) | Ship only WebAssembly in packages, as a strict tar file | Proposed |
 | [0005](0005-pull-based-streaming.md) | Stream data by having agents pull it | Proposed |
 | [0006](0006-limit-compile-cost.md) | Limit what compiling can cost by reading the code first | Proposed |
+| [0007](0007-supported-platforms.md) | Support macOS, Windows, Linux, Android and iPhone | Proposed |
 
 All of these stay **Proposed** until the Android feasibility test is complete.
