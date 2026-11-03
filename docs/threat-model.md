@@ -1,6 +1,6 @@
 # Threat model
 
-This is a draft. These are design goals, and nothing here is enforced until it is implemented and covered by the [attack tests](../tests/attacks/README.md).
+This says what Habitat defends against, and where that's tested. **No outside review has happened yet**, so this is what we've claimed and tested ourselves. See [the review package](security-review.md) for what's in scope and what's known to be weak.
 
 ## What we protect
 
@@ -18,19 +18,19 @@ The trusted parts are the Rust core, the shell and the operating system.
 
 ## Attacks in scope
 
-| Attack | Planned defence |
+| Attack | Defence |
 |---|---|
-| Reading files outside the agent's home | WebAssembly isolation, and a home store that rejects path traversal and symlink escapes |
+| Reading files outside the agent's home | WebAssembly isolation, and a home store that refuses traversal, links and names that mean something else on another system. Tested in [`files.rs`](../tests/attacks/tests/files.rs) |
 | Stealing API keys | Keys stay in the [OS keystore](../crates/broker/src/vault.rs) and are only used by the core. Nothing in the agent API can return one, and each can only be sent to hosts it's bound to. Their type can't be printed, so they can't reach a log or error by accident |
-| Unapproved network access | No raw sockets, and every request goes through the broker |
-| Sending private data to an allowed destination | New destinations need fresh approval after private data is read; this reduces the risk but doesn't remove it |
-| Faking an approval prompt | The core draws prompts, and the agent's reason is labelled as its own claim |
-| Wearing the user down with prompts | Rate limits on repeated requests |
-| Exhausting CPU, memory, disk or model budget | Limits per run and per agent |
+| Unapproved network access | No raw sockets, and every request goes through the broker, which checks each redirect, and only connects to public addresses. Tested in [`network.rs`](../tests/attacks/tests/network.rs) |
+| Sending private data to an allowed destination | After a run reads a user's file, anywhere it wants to reach needs fresh approval. This reduces the risk but doesn't remove it, as explained below |
+| Faking an approval prompt | The core supplies the wording, and the agent's reason is cleaned and labelled as its own claim. Tested in [`approvals.rs`](../tests/attacks/tests/approvals.rs) |
+| Wearing the user down with prompts | 5 prompts per run, and something refused isn't asked about again in that run |
+| Exhausting CPU, memory, disk or model budget | Limits per run and per agent, and on what the host accepts. Tested in [`resources.rs`](../tests/attacks/tests/resources.rs) |
 | Making the compiler use up CPU or memory, with a package that's cheap to send | [Limits checked before compiling](compile-costs.md), a time limit, and one compile at a time. Memory isn't enforced once compiling has started |
-| Changing grants or logs | Stored outside the agent's home, and the log is hash-chained |
+| Changing grants or logs | Stored outside the agent's home, and the log is hash-chained, which `habitat log --verify` checks |
 | Hiding what a run did by crashing or being stopped, or filling the disk with records | A run is recorded before it starts, and records are outside the agent's home. They hold a limited amount of the agent's text, and only the latest 1,000 are kept |
-| Attacking the broker with malformed input | Safe Rust, strict validation and fuzzing |
+| Attacking the broker with malformed input | Safe Rust, strict validation and [fuzzing](../fuzz/README.md) |
 | Hostile agent packages | A [strict package format](packages.md) with size limits and no paths taken from the archive, and packages contain only WebAssembly |
 
 ## Out of scope
