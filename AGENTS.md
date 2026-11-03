@@ -54,6 +54,8 @@ To validate changes to the agent API:
 wasm-tools component wit wit/
 ```
 
+If you change the phone app, also run the checks in [app/README.md](app/README.md).
+
 ## Security rules
 
 - Treat agents as untrusted, including their manifests, packages and everything they send to the host.

@@ -26,6 +26,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+If you change the phone app, also run the checks in [app/README.md](app/README.md).
+
 ## Pull requests
 
 - Link the issue your change addresses.

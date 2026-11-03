@@ -49,7 +49,7 @@ Planned guarantees:
 | iPhone and Flutter feasibility test | Not started |
 | Mac core, broker and secrets | In progress: from the command line, an agent can be installed and run, use files in its home and reply, within time and memory limits. The broker and secrets don't exist yet |
 | Attack tests | Not started |
-| Phone app (Flutter) | Not started |
+| Phone app (Flutter) | In progress: the [Android app](app/README.md) builds, but hasn't been run on a device yet. iPhone isn't connected to the core |
 
 Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41). The next step is to run the Android feasibility test on a real phone. See the [draft feasibility report](docs/feasibility-android.md).
 
@@ -96,6 +96,8 @@ cargo build --workspace
 ```bash
 cargo test --workspace
 ```
+
+The phone app is built separately. See [app/README.md](app/README.md).
 
 ## Try it
 
