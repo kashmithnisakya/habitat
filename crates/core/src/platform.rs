@@ -13,7 +13,7 @@ use cap_std::fs::{Dir, OpenOptions as DirOpenOptions};
 /// Creates a folder and any parents it needs. Only the current user can open a folder made by
 /// [`create_private_dir`] or [`create_private_dirs`], and anything created inside it after that.
 #[cfg(unix)]
-pub(crate) fn create_private_dirs(path: &Path) -> io::Result<()> {
+pub fn create_private_dirs(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
     fs::DirBuilder::new()
@@ -31,7 +31,7 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(crate) fn create_private_dirs(path: &Path) -> io::Result<()> {
+pub fn create_private_dirs(path: &Path) -> io::Result<()> {
     let existed = path.is_dir();
     fs::create_dir_all(path)?;
     if existed {
@@ -128,7 +128,7 @@ pub(crate) fn is_link_refused(error: &io::Error) -> bool {
 }
 
 /// Creates a file that's new, with its contents saved to disk. A read-only file can only be read.
-pub(crate) fn write_new_file(path: &Path, data: &[u8], read_only: bool) -> io::Result<()> {
+pub fn write_new_file(path: &Path, data: &[u8], read_only: bool) -> io::Result<()> {
     use std::io::Write;
 
     let mut options = OpenOptions::new();

@@ -67,6 +67,7 @@ impl Guest for Agent {
                 api::send_message(message).map_err(|error| error.to_string())
             }
             "fetch" => fetch(first, rest),
+            "ask-model-text" => ask_model_text(first, rest),
             "pick-file" => pick_file(first, rest),
             "fetch-and-hold" => fetch_and_hold(first),
             "ask-model" => {
@@ -143,6 +144,35 @@ fn fetch_and_hold(count: &str) -> Result<(), String> {
     })
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+/// Asks a model something, and checks the answer.
+fn ask_model_text(model: &str, expected: &str) -> Result<(), String> {
+    use habitat_sdk::bindings::habitat::host::types::{ModelMessage, ModelRequest, ModelRole};
+
+    let answer = api::model_complete(&ModelRequest {
+        model: model.to_string(),
+        messages: vec![ModelMessage {
+            role: ModelRole::User,
+            text: "hello".to_string(),
+        }],
+        max_tokens: 100,
+    })
+    .map_err(|error| error.to_string())?;
+    if answer.usage().is_some() {
+        return Err("it has usage before the end".to_string());
+    }
+    let mut text = String::new();
+    while let Some(piece) = answer.next().map_err(|error| error.to_string())? {
+        text.push_str(&piece);
+    }
+    if text != expected {
+        return Err(format!("got {text}"));
+    }
+    match answer.usage() {
+        Some(usage) if usage.input_tokens == 3 && usage.output_tokens == 5 => Ok(()),
+        other => Err(format!("usage was {other:?}")),
+    }
 }
 
 /// Fetches a URL, reads all of it a little at a time, and checks how much there was, with the

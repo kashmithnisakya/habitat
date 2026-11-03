@@ -1,13 +1,15 @@
 //! The host's side of the agent API.
 //!
-//! Everything here takes untrusted input from the agent. Calls that need the broker are denied
-//! until the broker exists.
+//! Everything here takes untrusted input from the agent. Anything that leaves the agent's home goes
+//! to the broker, and nothing here decides what's allowed.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use habitat_core::backend::{
-    AccessRefused, FetchError, FetchMethod, FetchRequest, Lifetime, ReadAnywhere, RunBroker, Target,
+    AccessRefused, FetchError, FetchMethod, FetchRequest, Lifetime, ModelAnswer,
+    ModelMessage as CoreModelMessage, ModelRequest as CoreModelRequest, ModelRole as CoreModelRole,
+    ReadAnywhere, RunBroker, Target,
 };
 use habitat_core::home::{EntryKind as HomeEntryKind, Home, HomeError as StoreError};
 use wasmtime::component::{Resource, ResourceTable};
@@ -17,7 +19,7 @@ use crate::bindings::habitat::host::agent_home;
 use crate::bindings::habitat::host::types::{
     self, AccessTarget, DirEntry, EntryKind, Grant, GrantLifetime, Header, HomeError,
     HostByteStream, HostModelStream, HostUserFile, HttpMethod, HttpRequest, HttpResponse, LogLevel,
-    ModelRequest, ModelStream, TokenUsage,
+    ModelRequest, ModelRole, TokenUsage,
 };
 
 /// The most that one read returns. Agents read larger files in pieces.
@@ -26,6 +28,8 @@ const MAX_READ_BYTES: u32 = 1024 * 1024;
 const MAX_OPEN_BODIES: usize = 16;
 /// How many files the user can choose in one run. It's limited by prompts too.
 const MAX_OPEN_USER_FILES: usize = 16;
+/// How many model answers one run can have open at once.
+const MAX_OPEN_ANSWERS: usize = 4;
 /// The most random bytes that one call returns.
 const MAX_RANDOM_BYTES: u32 = 1024;
 
@@ -105,6 +109,9 @@ pub struct OpenUserFile {
     file: Box<dyn ReadAnywhere>,
 }
 
+/// A model's answer that an agent is reading.
+pub struct OpenAnswer(Box<dyn ModelAnswer + Send>);
+
 /// What one run of an agent can reach.
 pub(crate) struct HostState {
     home: Home,
@@ -113,6 +120,7 @@ pub(crate) struct HostState {
     table: ResourceTable,
     open_bodies: usize,
     open_user_files: usize,
+    open_answers: usize,
 }
 
 impl HostState {
@@ -123,6 +131,7 @@ impl HostState {
             table: ResourceTable::new(),
             open_bodies: 0,
             open_user_files: 0,
+            open_answers: 0,
             limiter: Limiter {
                 limit: memory_bytes,
                 used: 0,
@@ -173,10 +182,6 @@ fn from_fetch(error: FetchError) -> HomeError {
         FetchError::Unavailable(why) => HomeError::Unavailable(why),
         FetchError::Internal => HomeError::Internal,
     }
-}
-
-fn needs_broker<T>() -> Result<T, HomeError> {
-    Err(HomeError::Denied("this isn't available yet".to_string()))
 }
 
 impl agent_home::Host for HostState {
@@ -237,11 +242,35 @@ impl agent_home::Host for HostState {
 
     fn log(&mut self, _level: LogLevel, _message: String) {}
 
-    fn model_complete(
-        &mut self,
-        _request: ModelRequest,
-    ) -> Result<Resource<ModelStream>, HomeError> {
-        needs_broker()
+    fn model_complete(&mut self, request: ModelRequest) -> Result<Resource<OpenAnswer>, HomeError> {
+        if self.open_answers >= MAX_OPEN_ANSWERS {
+            return Err(HomeError::LimitExceeded(format!(
+                "the limit is {MAX_OPEN_ANSWERS} model answers at once"
+            )));
+        }
+        let answer = self
+            .broker
+            .model_complete(CoreModelRequest {
+                model: request.model,
+                messages: request
+                    .messages
+                    .into_iter()
+                    .map(|message| CoreModelMessage {
+                        role: match message.role {
+                            ModelRole::System => CoreModelRole::System,
+                            ModelRole::User => CoreModelRole::User,
+                            ModelRole::Assistant => CoreModelRole::Assistant,
+                        },
+                        text: message.text,
+                    })
+                    .collect(),
+                max_tokens: request.max_tokens,
+            })
+            .map_err(from_fetch)?;
+        self.open_answers += 1;
+        self.table
+            .push(OpenAnswer(answer))
+            .map_err(|_| HomeError::Internal)
     }
 
     fn http_fetch(&mut self, request: HttpRequest) -> Result<HttpResponse, HomeError> {
@@ -361,18 +390,27 @@ impl HostByteStream for HostState {
     }
 }
 
-// Nothing can create this resource yet, so an agent can never hold one to call these with.
-
 impl HostModelStream for HostState {
-    fn next(&mut self, _stream: Resource<ModelStream>) -> Result<Option<String>, HomeError> {
-        needs_broker()
+    fn next(&mut self, stream: Resource<OpenAnswer>) -> Result<Option<String>, HomeError> {
+        let answer = self
+            .table
+            .get_mut(&stream)
+            .map_err(|_| HomeError::Internal)?;
+        answer.0.next().map_err(from_fetch)
     }
 
-    fn usage(&mut self, _stream: Resource<ModelStream>) -> Option<TokenUsage> {
-        None
+    fn usage(&mut self, stream: Resource<OpenAnswer>) -> Option<TokenUsage> {
+        let usage = self.table.get(&stream).ok()?.0.usage()?;
+        Some(TokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        })
     }
 
-    fn drop(&mut self, _stream: Resource<ModelStream>) -> Result<()> {
+    fn drop(&mut self, stream: Resource<OpenAnswer>) -> Result<()> {
+        // Closing it cancels whatever's left of the answer.
+        self.table.delete(stream)?;
+        self.open_answers = self.open_answers.saturating_sub(1);
         Ok(())
     }
 }

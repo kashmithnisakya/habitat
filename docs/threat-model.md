@@ -21,7 +21,7 @@ The trusted parts are the Rust core, the shell and the operating system.
 | Attack | Planned defence |
 |---|---|
 | Reading files outside the agent's home | WebAssembly isolation, and a home store that rejects path traversal and symlink escapes |
-| Stealing API keys | Keys stay in the OS keystore and are only used by the core |
+| Stealing API keys | Keys stay in the [OS keystore](../crates/broker/src/vault.rs) and are only used by the core. Nothing in the agent API can return one, and each can only be sent to hosts it's bound to. Their type can't be printed, so they can't reach a log or error by accident |
 | Unapproved network access | No raw sockets, and every request goes through the broker |
 | Sending private data to an allowed destination | New destinations need fresh approval after private data is read; this reduces the risk but doesn't remove it |
 | Faking an approval prompt | The core draws prompts, and the agent's reason is labelled as its own claim |

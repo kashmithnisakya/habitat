@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::sync::mpsc::{self, Receiver};
@@ -17,6 +17,7 @@ use habitat_broker::audit;
 use habitat_broker::broker::Broker;
 use habitat_broker::grants::{list_saved, revoke_saved};
 use habitat_broker::policy::Target;
+use habitat_broker::vault::{NewSecret, OsKeystore, SecretValue, Vault, VaultError};
 use habitat_core::backend::{Event, HostLimits, Lifetime, RunOutcome};
 use habitat_core::home::{AgentStorage, HomeError};
 use habitat_core::manifest::MAX_MANIFEST_BYTES;
@@ -101,6 +102,9 @@ enum Command {
         #[arg(long, value_name = "NAME", group = "target")]
         model: Option<String>,
     },
+    /// Adds, lists and removes secrets such as API keys, which agents can never read
+    #[command(subcommand)]
+    Secret(SecretCommand),
     /// Shows everything an agent has asked for outside its home, after checking the log
     Log {
         /// The agent's name
@@ -116,6 +120,32 @@ enum Command {
         /// Doesn't ask for confirmation
         #[arg(short, long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Adds a secret to the system's keystore. Its value is asked for, and never goes on the
+    /// command line, where other programs could see it
+    Add {
+        /// A name for the secret
+        name: String,
+        /// A host that it can be sent to, which can be given more than once
+        #[arg(long = "host", value_name = "HOST", required = true)]
+        hosts: Vec<String>,
+        /// The header to send it in: authorization, x-api-key or api-key
+        #[arg(long, value_name = "NAME", default_value = "authorization")]
+        header: String,
+        /// What goes before the value in the header
+        #[arg(long, value_name = "TEXT", default_value = "")]
+        prefix: String,
+    },
+    /// Lists the secrets, without their values
+    List,
+    /// Removes a secret
+    Remove {
+        /// The secret's name
+        name: String,
     },
 }
 
@@ -176,8 +206,8 @@ fn run_command(cli: Cli) -> Result<(), Failure> {
         None => default_root().map_err(Failure::general)?,
     };
     let backend = WasmBackend::new().map_err(|error| Failure::general(error.to_string()))?;
-    let supervisor =
-        Supervisor::new(&root, backend, HostLimits::default()).with_broker(Broker::new(Terminal));
+    let supervisor = Supervisor::new(&root, backend, HostLimits::default())
+        .with_broker(Broker::new(Terminal).with_vault(Vault::new(&root, OsKeystore)));
     match cli.command {
         Command::Pack { .. } => unreachable!("handled above"),
         Command::Install { package } => install(&supervisor, &package),
@@ -198,6 +228,7 @@ fn run_command(cli: Cli) -> Result<(), Failure> {
             revoke(&root, &agent, &target)
         }
         Command::Log { agent, verify } => log(&root, &agent, verify),
+        Command::Secret(command) => secret(&root, command),
         Command::Remove { agent, yes } => remove(&supervisor, &agent, yes),
     }
 }
@@ -506,6 +537,73 @@ fn revoke(root: &Path, agent: &str, target: &Target) -> Result<(), Failure> {
         )));
     }
     say("Revoked. This takes effect on the agent's next request.");
+    Ok(())
+}
+
+/// Reads a secret's value without showing it. Piped input is read as it is, with one line ending
+/// taken off. A hidden prompt needs a terminal.
+fn read_secret_value() -> Result<SecretValue, Failure> {
+    let failed = |error: io::Error| Failure::general(format!("couldn't read it: {}", error.kind()));
+    let mut line = if io::stdin().is_terminal() {
+        rpassword::prompt_password("Value (it won't be shown): ").map_err(failed)?
+    } else {
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line).map_err(failed)?;
+        line
+    };
+    if line.ends_with('\n') {
+        line.pop();
+    }
+    if line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(SecretValue::new(line.into_bytes()))
+}
+
+fn secret(root: &Path, command: SecretCommand) -> Result<(), Failure> {
+    let vault = Vault::new(root, OsKeystore);
+    let failed = |error: VaultError| Failure::general(error.to_string());
+    match command {
+        SecretCommand::Add {
+            name,
+            hosts,
+            header,
+            prefix,
+        } => {
+            let value = read_secret_value()?;
+            vault
+                .add(NewSecret {
+                    name: &name,
+                    hosts: &hosts,
+                    header: &header,
+                    prefix: &prefix,
+                    value,
+                })
+                .map_err(failed)?;
+            say(format_args!(
+                "Added {name}. It can only be sent to: {}",
+                hosts.join(", ")
+            ));
+        }
+        SecretCommand::List => {
+            let secrets = vault.list().map_err(failed)?;
+            if secrets.is_empty() {
+                say("There are no secrets.");
+            }
+            for secret in secrets {
+                say(format_args!(
+                    "{}  {}  to {}",
+                    secret.name,
+                    secret.header,
+                    secret.hosts.join(", ")
+                ));
+            }
+        }
+        SecretCommand::Remove { name } => {
+            vault.remove(&name).map_err(failed)?;
+            say(format_args!("Removed {name}."));
+        }
+    }
     Ok(())
 }
 

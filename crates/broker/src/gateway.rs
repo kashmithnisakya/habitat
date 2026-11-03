@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use habitat_core::backend::{FetchMethod, FetchRequest};
 use habitat_core::manifest::is_host_name;
+
+use crate::vault::SecretHeader;
 use ureq::Agent;
 use ureq::http::{self, Uri};
 use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
@@ -285,21 +287,24 @@ pub struct Incoming {
 
 /// Something that can make one HTTPS request, with no redirects. Tests swap in a fake one.
 pub trait Network: Send + Sync {
+    /// `secrets` are headers that the core is adding, which are kept apart from the request, so that
+    /// printing a request can't print them.
     fn send(
         &self,
         url: &CheckedUrl,
         request: &FetchRequest,
+        secrets: &[SecretHeader],
         wait: Duration,
     ) -> Result<Incoming, NetworkError>;
 }
 
 /// Stops reading at a limit, with an error, so that a response can't be mistaken for a whole one.
-pub struct LimitedBody {
-    pub inner: Box<dyn Read + Send>,
+pub struct LimitedBody<R = Box<dyn Read + Send>> {
+    pub inner: R,
     pub left: u64,
 }
 
-impl Read for LimitedBody {
+impl<R: Read> Read for LimitedBody<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         // One more than the limit, to tell a body of exactly the limit from one that's over it.
         let most = (buffer.len() as u64).min(self.left.saturating_add(1)) as usize;
@@ -404,6 +409,7 @@ impl Network for RealNetwork {
         &self,
         url: &CheckedUrl,
         request: &FetchRequest,
+        secrets: &[SecretHeader],
         wait: Duration,
     ) -> Result<Incoming, NetworkError> {
         let method = match request.method {
@@ -417,6 +423,13 @@ impl Network for RealNetwork {
         let mut builder = http::Request::builder().method(method).uri(url.to_string());
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
+        }
+        for secret in secrets {
+            let mut value = http::HeaderValue::from_bytes(secret.value.expose())
+                .map_err(|_| NetworkError::Failed)?;
+            // This stops `http` from showing it, if anything ever prints the request.
+            value.set_sensitive(true);
+            builder = builder.header(&secret.name, value);
         }
         let empty = Vec::new();
         let outgoing = builder
@@ -809,6 +822,7 @@ mod tests {
         network.send(
             &url("https://rebinding.example/"),
             &get(&[]),
+            &[],
             Duration::from_secs(5),
         )
     }
