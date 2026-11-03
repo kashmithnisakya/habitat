@@ -62,6 +62,21 @@ Example of a network request:
 
 The agent never receives a socket, an API key or direct access to the host's file system.
 
+The [gateway](../crates/broker/src/gateway.rs) makes these requests, with rules of its own:
+
+- **Only HTTPS, to the default port.** A URL has to be exactly `https://host[:443][/path][?query]`, with a host that follows the manifest's rules. Anything else is refused rather than corrected, and a proxy from the environment is never used.
+- **Every hop is checked.** The gateway follows redirects itself, up to 5, and applies the policy to each one. A redirect to something that isn't allowed goes no further, and one to another host loses any headers that could be credentials.
+- **Only public addresses.** A name is looked up once, and the connection goes to exactly what was checked, so it can't change its answer in between. If any of a name's addresses are private, link-local or otherwise reserved, none are used.
+- **Limits.** A request body can be 16 MB, and a response body 64 MB, which ends in an error so that it can't be mistaken for the whole thing. Each hop stops at the end of the run's time, or after 2 minutes.
+- **Headers.** An agent can't set the ones that decide where a request goes, such as `Host`. It never sees `Set-Cookie`, or anything else on a [short list](../crates/broker/src/gateway.rs) that could hold a credential.
+- **Logging.** Each hop's host, method and status go in the [audit log](#storage). The path and query don't, as they can hold private data.
+
+These have some limits:
+
+- **The gateway uses `webpki-roots`, not the system's certificates.** It trusts a fixed list built into Habitat, so a certificate that an organisation has installed isn't trusted, and the list only changes when Habitat does.
+- **A slow download can outlast the run's time limit a little.** Time is only checked between reads, and each is stopped by the same deadline.
+- **An approved host can still be sent anything.** The data-leak rule ([#20](https://github.com/kashmithnisakya/habitat/issues/20)) only reduces this.
+
 ## Agent API
 
 Agents can import only the API in [`wit/agent-home.wit`](../wit/agent-home.wit). It deliberately leaves out raw WASI sockets and HTTP, so there is no route around the broker.
