@@ -29,6 +29,7 @@ The trusted parts are the Rust core, the shell and the operating system.
 | Exhausting CPU, memory, disk or model budget | Limits per run and per agent |
 | Changing grants or logs | Stored outside the agent's home, and the log is hash-chained |
 | Attacking the broker with malformed input | Safe Rust, strict validation and fuzzing |
+| Hostile agent packages | A [strict package format](packages.md) with size limits and no paths taken from the archive, and packages contain only WebAssembly |
 
 ## Out of scope
 

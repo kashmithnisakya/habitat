@@ -13,6 +13,8 @@ cap-std = "4.0.3"
 libc = "0.2.191"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
+tar = { version = "0.4.46", default-features = false }
 toml = "1.1.8"
 
 [dev-dependencies]

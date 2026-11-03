@@ -22,6 +22,7 @@ const HOME_DIR: &str = "home";
 const TEMP_DIR: &str = "tmp";
 const GRANTS_FILE: &str = "grants.db";
 const AUDIT_FILE: &str = "audit.db";
+const PACKAGE_HASH_FILE: &str = "package.sha256";
 
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_NAME_BYTES: usize = 255;
@@ -79,6 +80,7 @@ impl From<io::Error> for HomeError {
 /// One agent's folder. Only `home/` is ever visible to the agent.
 #[derive(Debug)]
 pub struct AgentStorage {
+    name: String,
     path: PathBuf,
 }
 
@@ -95,7 +97,15 @@ impl AgentStorage {
         for dir in [PACKAGE_DIR, HOME_DIR, TEMP_DIR] {
             builder.create(path.join(dir))?;
         }
-        Ok(Self { path })
+        Ok(Self {
+            name: agent_name.to_string(),
+            path,
+        })
+    }
+
+    /// The name of the agent this folder belongs to.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Opens the agent's home, with the given limit on the space it can use.
@@ -107,6 +117,12 @@ impl AgentStorage {
     /// The read-only agent code and manifest.
     pub fn package_path(&self) -> PathBuf {
         self.path.join(PACKAGE_DIR)
+    }
+
+    /// The record of the installed package's hash, which only the core can write to. It's kept
+    /// outside the package folder, so that a change to the package can't also change the record.
+    pub fn package_hash_path(&self) -> PathBuf {
+        self.path.join(PACKAGE_HASH_FILE)
     }
 
     /// The agent's permissions, which only the core can write to.
