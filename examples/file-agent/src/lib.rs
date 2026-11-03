@@ -40,6 +40,15 @@ impl Guest for Agent {
                     other => Err(format!("still remembers {other}")),
                 }
             }
+            "allocate" => allocate(first),
+            "allocate-forever" => allocate_forever(),
+            "try-allocate-too-much" => try_allocate_too_much(),
+            "loop-forever" => loop {
+                std::hint::black_box(0);
+            },
+            "call-host-forever" => loop {
+                std::hint::black_box(api::now_ms());
+            },
             "fail" => Err(rest.to_string()),
             "panic" => panic!("told to"),
             other => Err(format!("unknown command: {other}")),
@@ -48,6 +57,31 @@ impl Guest for Agent {
 }
 
 static mut MEMORY: u32 = 0;
+
+/// Allocates and touches this many MB, and frees them again.
+fn allocate(megabytes: &str) -> Result<(), String> {
+    let megabytes: usize = megabytes.parse().map_err(|_| "bad size".to_string())?;
+    let data = vec![1_u8; megabytes * 1024 * 1024];
+    std::hint::black_box(&data);
+    Ok(())
+}
+
+fn allocate_forever() -> Result<(), String> {
+    let mut all = Vec::new();
+    loop {
+        all.push(vec![1_u8; 1024 * 1024]);
+        std::hint::black_box(&all);
+    }
+}
+
+/// An agent can notice that it's out of memory, and carry on.
+fn try_allocate_too_much() -> Result<(), String> {
+    let mut data: Vec<u8> = Vec::new();
+    match data.try_reserve_exact(1024 * 1024 * 1024) {
+        Ok(()) => Err("got more memory than the limit".to_string()),
+        Err(_) => Ok(()),
+    }
+}
 
 fn read_all(path: &str) -> Result<Vec<u8>, HomeError> {
     let mut data = Vec::new();

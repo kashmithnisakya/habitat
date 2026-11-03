@@ -46,7 +46,7 @@ Planned guarantees:
 |---|---|
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
-| Mac core, broker and secrets | In progress: an agent can run through Wasmtime and use files in its home, with no limits on CPU or memory yet |
+| Mac core, broker and secrets | In progress: an agent can run through Wasmtime and use files in its home, within time and memory limits |
 | Attack tests | Not started |
 | Android app | Not started |
 

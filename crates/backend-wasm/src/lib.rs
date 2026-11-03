@@ -1,15 +1,19 @@
 //! Wasmtime backend for running Habitat agents.
 //!
-//! Agents are untrusted, and they can only reach what's linked here, which is the agent API. No
-//! limits are enforced on them yet, so a hostile agent can still use up CPU and memory.
+//! Agents are untrusted, and they can only reach what's linked here, which is the agent API. Each
+//! run is limited in how much time and memory it can use.
 
 mod host;
 
-use habitat_core::backend::{Backend, Event, LoadError, LoadedAgent, RunOutcome};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use habitat_core::backend::{Backend, Event, LoadError, LoadedAgent, RunLimits, RunOutcome};
 use habitat_core::home::Home;
 use habitat_core::package::Package;
 use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, Store, Trap};
+use wasmtime::{Config, Engine, Store, Trap, UpdateDeadline};
 
 use crate::bindings::{Agent, AgentPre};
 use crate::host::HostState;
@@ -25,6 +29,9 @@ pub mod bindings {
 // The API's interfaces. Agents can't import anything else, whatever version it claims to be.
 const ALLOWED_IMPORTS: [&str; 2] = ["habitat:host/agent-home@", "habitat:host/types@"];
 
+/// How often a running agent stops to check the time, and so how late it can be stopped.
+const TICK: Duration = Duration::from_millis(50);
+
 /// Runs agents as WebAssembly components with Wasmtime.
 pub struct WasmBackend {
     engine: Engine,
@@ -33,7 +40,9 @@ pub struct WasmBackend {
 
 impl WasmBackend {
     pub fn new() -> Result<Self, LoadError> {
-        let engine = Engine::new(&Config::new()).map_err(internal)?;
+        let mut config = Config::new();
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).map_err(internal)?;
         let mut linker = Linker::new(&engine);
         Agent::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |state| state)
             .map_err(internal)?;
@@ -79,11 +88,47 @@ struct WasmAgent {
     agent: AgentPre<HostState>,
 }
 
+/// Makes running agents check the time, for as long as this exists. It only runs during a run, so
+/// that an idle host, such as a phone, doesn't keep waking up.
+struct Ticker {
+    _stop: Sender<()>,
+}
+
+impl Ticker {
+    fn start(engine: Engine) -> std::io::Result<Self> {
+        let (stop, stopped) = mpsc::channel::<()>();
+        thread::Builder::new()
+            .name("habitat-ticker".to_string())
+            .spawn(move || {
+                while stopped.recv_timeout(TICK) == Err(RecvTimeoutError::Timeout) {
+                    engine.increment_epoch();
+                }
+            })?;
+        Ok(Self { _stop: stop })
+    }
+}
+
 impl LoadedAgent for WasmAgent {
-    fn run(&self, event: &Event, home: Home) -> RunOutcome {
+    fn run(&self, event: &Event, home: Home, limits: &RunLimits) -> RunOutcome {
         // A new store each time, so that nothing in memory carries over between runs, even after
         // a crash.
-        let mut store = Store::new(&self.engine, HostState::new(home));
+        let mut store = Store::new(&self.engine, HostState::new(home, limits.memory_bytes));
+        store.limiter(HostState::limiter);
+
+        // Other runs can make the same engine tick, so each tick only means it's time to check.
+        let deadline = Instant::now() + limits.run_time;
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(move |_| {
+            if Instant::now() >= deadline {
+                Err(Trap::Interrupt.into())
+            } else {
+                Ok(UpdateDeadline::Continue(1))
+            }
+        });
+        let Ok(_ticker) = Ticker::start(self.engine.clone()) else {
+            return RunOutcome::Internal("the run couldn't be timed".to_string());
+        };
+
         let result = self
             .agent
             .instantiate(&mut store)
@@ -91,11 +136,22 @@ impl LoadedAgent for WasmAgent {
         match result {
             Ok(Ok(())) => RunOutcome::Completed,
             Ok(Err(message)) => RunOutcome::failed(&message),
-            // Only the kind of trap is reported. A full error can include names from the agent.
-            Err(error) => match error.downcast_ref::<Trap>() {
-                Some(trap) => RunOutcome::Crashed(trap.to_string()),
-                None => RunOutcome::Internal("the run couldn't be completed".to_string()),
-            },
+            Err(error) => {
+                let trap = error.downcast_ref::<Trap>();
+                if trap == Some(&Trap::Interrupt) {
+                    RunOutcome::TimeLimit
+                } else if store.data().hit_memory_limit() {
+                    RunOutcome::MemoryLimit
+                } else {
+                    // Only the kind of trap is reported. A full error can include names from the
+                    // agent. Anything else that fails here is also down to the agent, such as
+                    // creating too many instances or returning a value that makes no sense.
+                    RunOutcome::Crashed(trap.map_or_else(
+                        || "the agent didn't follow the rules for components".to_string(),
+                        Trap::to_string,
+                    ))
+                }
+            }
         }
     }
 }
