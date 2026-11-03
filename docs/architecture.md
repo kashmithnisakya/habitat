@@ -6,7 +6,7 @@ This is a design document. None of it is implemented yet, and it will change as 
 
 The first version must:
 
-- Run the same agent package on Mac and Android.
+- Run the same agent package on macOS, Windows, Linux and Android, and on iPhone and iPad if that [proves possible](decisions/0007-supported-platforms.md).
 - Keep the agent's files and memory between runs.
 - Block access to anything outside its home unless permission is granted.
 - Keep API keys out of the agent's reach.
@@ -145,9 +145,10 @@ These limits have gaps:
 
 | Platform | Approach | Limitation |
 |---|---|---|
-| Mac and Linux | Wasmtime | First targets for development |
+| macOS and Linux | Wasmtime | First targets for development. Apple silicon and Arm Linux are Tier 2 in Wasmtime |
+| Windows (next) | Wasmtime | The code only builds on Unix today, and needs its safety measures replacing, not just porting ([#56](https://github.com/kashmithnisakya/habitat/issues/56)). Windows on Arm is Tier 3 |
 | Android | Wasmtime | [Tier 3](https://docs.wasmtime.dev/stability-tiers.html) in Wasmtime, which it describes as not production ready |
-| iPhone (later) | Wasmtime's [Pulley interpreter](https://docs.wasmtime.dev/examples-pulley.html) | Android's Tier 3 caveat also applies, and Pulley is roughly 10x slower than native code |
+| iPhone and iPad (later) | Wasmtime's [Pulley interpreter](https://docs.wasmtime.dev/examples-pulley.html) | Android's Tier 3 caveat also applies, and Pulley is roughly 10x slower than native code |
 | Desktop microVM (later) | Second backend, possibly [libkrun](https://github.com/libkrun/libkrun) | The broker API has to work outside WebAssembly too |
 
 ## Biggest risks
