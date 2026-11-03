@@ -13,8 +13,9 @@ use habitat_backend_wasm::WasmBackend;
 use habitat_backend_wasm::code_shape::CodeShape;
 use habitat_backend_wasm::compile_limits::CompileLimits;
 use habitat_core::backend::{
-    Backend, DenyEverything, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome,
-    StopSignal,
+    AccessRefused, Backend, DenyEverything, Event, FetchError, FetchRequest, FetchResponse,
+    HostLimits, Lifetime, LoadError, LoadedAgent, RunBroker, RunLimits, RunOutcome, StopSignal,
+    Target,
 };
 use habitat_core::home::{AgentStorage, Home};
 use habitat_core::package::Package;
@@ -830,4 +831,100 @@ fn a_manifest_cant_raise_its_limits_above_the_hosts() {
         };
         assert!(message.contains("disk limit"), "{message}");
     });
+}
+
+/// Answers every fetch with a body of this size, and otherwise refuses in the given way.
+struct FakeFetcher {
+    body_size: usize,
+    refuses_with: Option<FetchError>,
+}
+
+impl RunBroker for FakeFetcher {
+    fn request_access(&mut self, _: &Target, _: &str) -> Result<Lifetime, AccessRefused> {
+        Err(AccessRefused::Internal)
+    }
+
+    fn http_fetch(&mut self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        if let Some(error) = self.refuses_with.take() {
+            return Err(error);
+        }
+        assert_eq!(request.url, "https://a.example/");
+        Ok(FetchResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Box::new(std::io::Cursor::new(vec![7; self.body_size])),
+        })
+    }
+}
+
+fn run_with_fetcher(message: &str, fetcher: FakeFetcher) -> RunOutcome {
+    let fixture = Fixture::file_agent();
+    fixture.agent.run(
+        &Event::UserMessage(message.to_string()),
+        fixture.home(),
+        &roomy_limits(),
+        &StopSignal::default(),
+        Box::new(fetcher),
+    )
+}
+
+#[test]
+fn an_agent_reads_a_response_in_pieces_to_the_end() {
+    for size in [0, 1, 999, 1000, 1001, 2_500_000] {
+        let outcome = run_with_fetcher(
+            &format!("fetch https://a.example/ 200:{size}"),
+            FakeFetcher {
+                body_size: size,
+                refuses_with: None,
+            },
+        );
+        assert_eq!(outcome, RunOutcome::Completed, "{size}");
+    }
+}
+
+#[test]
+fn an_agent_gets_the_reason_a_fetch_was_refused() {
+    for (refusal, expected) in [
+        (FetchError::NotGranted, "NotGranted"),
+        (FetchError::Denied("no way".to_string()), "Denied"),
+        (
+            FetchError::InvalidRequest("bad".to_string()),
+            "InvalidRequest",
+        ),
+        (
+            FetchError::LimitExceeded("much".to_string()),
+            "LimitExceeded",
+        ),
+        (FetchError::TimedOut, "TimedOut"),
+        (FetchError::Unavailable("down".to_string()), "Unavailable"),
+        (FetchError::Internal, "Internal"),
+    ] {
+        let outcome = run_with_fetcher(
+            "fetch https://a.example/ 200:0",
+            FakeFetcher {
+                body_size: 0,
+                refuses_with: Some(refusal),
+            },
+        );
+        let RunOutcome::Failed(message) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
+#[test]
+fn a_run_can_only_hold_so_many_responses_open() {
+    let fetcher = || FakeFetcher {
+        body_size: 0,
+        refuses_with: None,
+    };
+    assert_eq!(
+        run_with_fetcher("fetch-and-hold 16", fetcher()),
+        RunOutcome::Completed
+    );
+    let RunOutcome::Failed(message) = run_with_fetcher("fetch-and-hold 17", fetcher()) else {
+        panic!("this should have failed");
+    };
+    assert!(message.contains("LimitExceeded"), "{message}");
 }

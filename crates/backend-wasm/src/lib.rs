@@ -30,6 +30,9 @@ pub mod bindings {
     wasmtime::component::bindgen!({
         path: "../../wit",
         world: "agent",
+        with: {
+            "habitat:host/types.byte-stream": crate::host::OpenBody,
+        },
     });
 }
 

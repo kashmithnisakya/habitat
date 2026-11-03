@@ -6,5 +6,6 @@
 pub mod approval;
 pub mod audit;
 pub mod broker;
+pub mod gateway;
 pub mod grants;
 pub mod policy;
