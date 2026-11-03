@@ -3,12 +3,13 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use habitat_core::backend::{
     AccessRefused, BrokerFactory, FetchError, FetchMethod, FetchRequest, FetchResponse, Lifetime,
-    PickedFile, RunBroker, RunLimits, Target,
+    ModelAnswer, ModelRequest, PickedFile, RunBroker, RunLimits, Target,
 };
 use habitat_core::home::AgentStorage;
 use habitat_core::manifest::{Manifest, printable};
@@ -24,12 +25,15 @@ use crate::gateway::{
     redirected,
 };
 use crate::grants::RunGrants;
+use crate::model::{self, RunShared};
 use crate::policy::{Action, Context, Decision, DenyReason, LeakCheck, decide};
+use crate::vault::Vault;
 
 /// Makes a broker for each run, which asks the user through the given shell.
 pub struct Broker {
     approver: Arc<dyn Approver>,
     network: Arc<dyn Network>,
+    vault: Option<Vault>,
 }
 
 impl Broker {
@@ -45,7 +49,14 @@ impl Broker {
         Self {
             approver: Arc::new(approver),
             network: Arc::new(network),
+            vault: None,
         }
+    }
+
+    /// Lets this use the secrets in a vault for what the core itself sends.
+    pub fn with_vault(mut self, vault: Vault) -> Self {
+        self.vault = Some(vault);
+        self
     }
 }
 
@@ -109,7 +120,11 @@ impl BrokerFactory for Broker {
         run_id: RunId,
     ) -> Box<dyn RunBroker + Send> {
         Box::new(ForRun {
-            audit: AuditLog::open(storage, run_id),
+            shared: RunShared {
+                audit: Arc::new(Mutex::new(AuditLog::open(storage, run_id))),
+                tokens_left: Arc::new(AtomicU64::new(manifest.limits().model_budget_tokens)),
+            },
+            vault: self.vault.clone(),
             manifest: manifest.clone(),
             grants: RunGrants::new(storage.clone()),
             approver: Arc::clone(&self.approver),
@@ -118,7 +133,6 @@ impl BrokerFactory for Broker {
             reached: HashSet::new(),
             messages_sent: 0,
             limit: PromptLimit::default(),
-            tokens_left: manifest.limits().model_budget_tokens,
             deadline: Instant::now() + limits.run_time,
         })
     }
@@ -126,7 +140,8 @@ impl BrokerFactory for Broker {
 
 /// The broker for one run. Nothing here outlives the run, except a grant until revoked.
 struct ForRun {
-    audit: Result<AuditLog, AuditError>,
+    shared: RunShared,
+    vault: Option<Vault>,
     manifest: Manifest,
     grants: RunGrants,
     approver: Arc<dyn Approver>,
@@ -137,7 +152,6 @@ struct ForRun {
     reached: HashSet<Target>,
     messages_sent: u32,
     limit: PromptLimit,
-    tokens_left: u64,
     /// When the run's time is up. A call can't be interrupted, so it has to stop by itself.
     deadline: Instant,
 }
@@ -152,7 +166,12 @@ fn refused(reason: DenyReason) -> AccessRefused {
 impl ForRun {
     /// Records something. If it can't be recorded, nothing else gets to happen.
     fn log(&mut self, event: AuditEvent) -> Result<(), AccessRefused> {
-        let audit = self.audit.as_mut().map_err(|_| AccessRefused::Internal)?;
+        let mut audit = self
+            .shared
+            .audit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let audit = audit.as_mut().map_err(|_| AccessRefused::Internal)?;
         match audit.append(&event) {
             Ok(()) => Ok(()),
             Err(AuditError::TooManyEntries) => Err(AccessRefused::LimitExceeded(
@@ -213,6 +232,44 @@ impl RunBroker for ForRun {
             AuditEvent::UserFileRefused
         })?;
         result
+    }
+
+    fn model_complete(
+        &mut self,
+        request: ModelRequest,
+    ) -> Result<Box<dyn ModelAnswer + Send>, FetchError> {
+        let target = Target::Model(request.model.clone());
+        self.log_for_fetch(AuditEvent::Requested {
+            target: target.clone(),
+        })?;
+        let refused = match self.decide(&Action::Reach(target.clone())) {
+            Decision::Allow => None,
+            Decision::Ask => Some(FetchError::NotGranted),
+            Decision::Deny(DenyReason::OverBudget) => Some(FetchError::LimitExceeded(
+                DenyReason::OverBudget.to_string(),
+            )),
+            Decision::Deny(reason) => Some(FetchError::Denied(reason.to_string())),
+        };
+        if let Some(refused) = refused {
+            self.log_for_fetch(AuditEvent::Refused { target })?;
+            return Err(refused);
+        }
+        self.grants.used(&target);
+        let wait = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default()
+            .min(MAX_HOP_TIME);
+        if wait.is_zero() {
+            return Err(FetchError::TimedOut);
+        }
+        model::start(
+            self.network.as_ref(),
+            self.vault.as_ref(),
+            &request,
+            self.shared.clone(),
+            wait,
+        )
     }
 
     fn http_fetch(&mut self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
@@ -310,7 +367,7 @@ impl ForRun {
             return Err(FetchError::TimedOut);
         }
         let method = method_name(request.method).to_string();
-        let result = self.network.send(url, request, wait);
+        let result = self.network.send(url, request, &[], wait);
         self.log_for_fetch(AuditEvent::Fetched {
             target,
             method,
@@ -331,7 +388,7 @@ impl ForRun {
         let context = Context {
             manifest: &self.manifest,
             grants: &self.grants,
-            tokens_left: self.tokens_left,
+            tokens_left: self.shared.tokens_left.load(Ordering::SeqCst),
             leak_check: if self.private_read {
                 LeakCheck::PrivateRead {
                     reached: &self.reached,
@@ -409,7 +466,6 @@ mod tests {
     use std::fs;
     use std::io::Read;
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use tempfile::TempDir;
@@ -417,6 +473,10 @@ mod tests {
     use super::*;
     use crate::approval::{MAX_PROMPTS_PER_RUN, NobodyThere};
     use crate::audit::{MAX_ENTRIES_PER_RUN, verify};
+    use crate::model::SECRET_NAME;
+    use crate::vault::tests::{FakeStore, SECRET};
+    use crate::vault::{NewSecret, SecretHeader, SecretValue};
+    use habitat_core::backend::{ModelMessage, ModelRole, TokenUsage};
 
     const MANIFEST: &str = r#"
         [agent]
@@ -445,6 +505,7 @@ mod tests {
         /// Answers with a body of this many bytes, without holding it all in memory.
         huge_body: Option<u64>,
         sent: Arc<Mutex<Vec<(String, FetchRequest)>>>,
+        secrets_sent: Arc<Mutex<Vec<(String, String, String)>>>,
         fails_with: Option<NetworkError>,
     }
 
@@ -476,12 +537,20 @@ mod tests {
             &self,
             url: &CheckedUrl,
             request: &FetchRequest,
+            secrets: &[SecretHeader],
             _wait: Duration,
         ) -> Result<Incoming, NetworkError> {
             self.sent
                 .lock()
                 .unwrap()
                 .push((url.to_string(), request.clone()));
+            for secret in secrets {
+                self.secrets_sent.lock().unwrap().push((
+                    url.to_string(),
+                    secret.name_for_tests().to_string(),
+                    String::from_utf8(secret.value_for_tests().to_vec()).unwrap(),
+                ));
+            }
             if let Some(error) = self.fails_with {
                 return Err(error);
             }
@@ -796,7 +865,11 @@ mod tests {
         let mut audit = AuditLog::open(&fixture.storage, run_id).unwrap();
         audit.skip_ahead(MAX_ENTRIES_PER_RUN - 1);
         let mut broker = ForRun {
-            audit: Ok(audit),
+            shared: RunShared {
+                audit: Arc::new(Mutex::new(Ok(audit))),
+                tokens_left: Arc::new(AtomicU64::new(0)),
+            },
+            vault: None,
             manifest: manifest.clone(),
             grants: RunGrants::new(fixture.storage.clone()),
             approver: Arc::new(Scripted::new(Answer::Allow(Lifetime::UntilRevoked))),
@@ -805,7 +878,6 @@ mod tests {
             reached: HashSet::new(),
             messages_sent: 0,
             limit: PromptLimit::default(),
-            tokens_left: 0,
             deadline: Instant::now() + Duration::from_secs(60),
         };
         // This takes the last entry to record the request, and the next to say that's the limit.
@@ -1539,6 +1611,447 @@ mod tests {
         let mut broker = fixture.run(approver.clone());
         assert_eq!(broker.send_message("hello"), Err(AccessRefused::Internal));
         assert!(approver.shown.lock().unwrap().is_empty());
+    }
+
+    const MODEL_ANSWER: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n\
+event: ping\ndata: {\"type\":\"ping\"}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hidden\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    const PROVIDER: &str = "https://api.anthropic.com/v1/messages";
+
+    fn ask(max_tokens: u32) -> ModelRequest {
+        ModelRequest {
+            model: "default".to_string(),
+            messages: vec![
+                ModelMessage {
+                    role: ModelRole::System,
+                    text: "Be brief.".to_string(),
+                },
+                ModelMessage {
+                    role: ModelRole::User,
+                    text: "PRIVATE-QUESTION".to_string(),
+                },
+            ],
+            max_tokens,
+        }
+    }
+
+    struct ModelSetup {
+        fixture: Fixture,
+        _root: TempDir,
+        broker: Box<dyn RunBroker + Send>,
+        store: FakeStore,
+    }
+
+    /// A run with a key in its vault, and its model approved.
+    fn model_setup(network: FakeNetwork, budget: u64, with_key: bool) -> ModelSetup {
+        let fixture = Fixture::new();
+        let root = TempDir::new().unwrap();
+        let store = FakeStore::default();
+        let vault = Vault::new(root.path(), store.clone());
+        if with_key {
+            vault
+                .add(NewSecret {
+                    name: SECRET_NAME,
+                    hosts: &["api.anthropic.com".to_string()],
+                    header: "x-api-key",
+                    prefix: "",
+                    value: SecretValue::new(SECRET.as_bytes().to_vec()),
+                })
+                .unwrap();
+        }
+        let manifest = Manifest::parse(&format!(
+            "[agent]\nname = \"tester\"\nversion = \"1.0.0\"\n\n[limits]\nmemory_mb = 8\nrun_seconds = 60\ndisk_mb = 1\nmodel_budget_tokens = {budget}\n\n[requests]\nmodels = [\"default\"]\nnetwork = [\"a.example\"]\n"
+        ))
+        .unwrap();
+        let limits = RunLimits {
+            memory_bytes: 1,
+            run_time: Duration::from_secs(60),
+            disk_bytes: 1,
+        };
+        let mut broker =
+            Broker::with_network(Scripted::new(Answer::Allow(Lifetime::ThisRun)), network)
+                .with_vault(vault)
+                .for_run(
+                    &fixture.storage,
+                    &manifest,
+                    &limits,
+                    RunId::parse(&"1".repeat(32)).unwrap(),
+                );
+        broker
+            .request_access(&Target::Model("default".to_string()), "please")
+            .unwrap();
+        ModelSetup {
+            fixture,
+            _root: root,
+            broker,
+            store,
+        }
+    }
+
+    fn read_answer(answer: &mut Box<dyn ModelAnswer + Send>) -> String {
+        let mut text = String::new();
+        while let Some(piece) = answer.next().unwrap() {
+            text.push_str(&piece);
+        }
+        text
+    }
+
+    #[test]
+    fn an_agent_gets_an_answer_without_ever_holding_the_key() {
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        let mut setup = model_setup(network.clone(), 1000, true);
+        let mut answer = setup.broker.model_complete(ask(100)).ok().unwrap();
+        assert_eq!(answer.usage(), None, "not until the end");
+        assert_eq!(read_answer(&mut answer), "Hello there");
+        assert_eq!(
+            answer.usage(),
+            Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 7,
+            })
+        );
+
+        // The core added the key, in its own header, for that one host.
+        assert_eq!(
+            *network.secrets_sent.lock().unwrap(),
+            [(
+                PROVIDER.to_string(),
+                "x-api-key".to_string(),
+                SECRET.to_string()
+            )]
+        );
+        // And it isn't in what the request itself holds, nor in the log.
+        let sent = network.sent.lock().unwrap();
+        let request = format!("{:?}", sent[0].1);
+        assert!(!request.contains(SECRET), "{request}");
+        let body = String::from_utf8(sent[0].1.body.clone().unwrap()).unwrap();
+        assert!(!body.contains(SECRET));
+        drop(answer);
+        let log = fs::read_to_string(setup.fixture.storage.audit_path()).unwrap();
+        assert!(!log.contains(SECRET), "{log}");
+        assert!(setup.store.values.lock().unwrap().contains_key(SECRET_NAME));
+    }
+
+    #[test]
+    fn the_request_is_what_the_api_expects() {
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        let mut setup = model_setup(network.clone(), 1000, true);
+        let _ = setup.broker.model_complete(ask(100)).ok().unwrap();
+        let sent = network.sent.lock().unwrap();
+        let request = &sent[0].1;
+        assert_eq!(request.method, FetchMethod::Post);
+        let header = |name: &str| {
+            request
+                .headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("anthropic-version"), Some("2026-10-21"));
+        assert_eq!(
+            header("anthropic-beta"),
+            Some("server-side-fallback-2026-07-01")
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["model"], "claude-opus-5-5");
+        assert_eq!(body["max_tokens"], 100);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["system"], "Be brief.");
+        assert_eq!(body["fallbacks"], "default");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "PRIVATE-QUESTION");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_budget_limits_each_request_and_stops_new_ones() {
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        // The answer uses 17 tokens, of 20.
+        let mut setup = model_setup(network.clone(), 20, true);
+        let mut answer = setup.broker.model_complete(ask(1000)).ok().unwrap();
+        read_answer(&mut answer);
+        // It's capped at what's left, whatever it asked for.
+        {
+            let sent = network.sent.lock().unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(sent[0].1.body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["max_tokens"], 20);
+        }
+        let mut second = setup.broker.model_complete(ask(1000)).ok().unwrap();
+        {
+            let sent = network.sent.lock().unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(sent[1].1.body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["max_tokens"], 3);
+        }
+        read_answer(&mut second);
+        // Now it's used more than it had, and nothing more goes out.
+        let calls = network.urls_sent().len();
+        assert!(matches!(
+            setup.broker.model_complete(ask(1)),
+            Err(FetchError::LimitExceeded(_))
+        ));
+        assert_eq!(network.urls_sent().len(), calls);
+    }
+
+    #[test]
+    fn an_answer_thats_given_up_on_still_counts_and_is_logged() {
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        let mut setup = model_setup(network, 1000, true);
+        let mut answer = setup.broker.model_complete(ask(100)).ok().unwrap();
+        assert_eq!(answer.next().unwrap().as_deref(), Some("Hello"));
+        drop(answer);
+        let events = fetch_events(&setup.fixture);
+        assert!(
+            events.contains(&AuditEvent::ModelUsed {
+                model: "default".to_string(),
+                input_tokens: 10,
+                output_tokens: 1,
+            }),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_models_use_is_logged_without_what_was_said() {
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        let mut setup = model_setup(network, 1000, true);
+        let mut answer = setup.broker.model_complete(ask(100)).ok().unwrap();
+        read_answer(&mut answer);
+        let events = fetch_events(&setup.fixture);
+        assert!(events.contains(&AuditEvent::ModelUsed {
+            model: "default".to_string(),
+            input_tokens: 10,
+            output_tokens: 7,
+        }));
+        let log = fs::read_to_string(setup.fixture.storage.audit_path()).unwrap();
+        for private in ["PRIVATE-QUESTION", "Be brief", "Hello"] {
+            assert!(!log.contains(private), "{log}");
+        }
+    }
+
+    #[test]
+    fn without_a_key_it_says_so_and_sends_nothing() {
+        let network = FakeNetwork::default();
+        let mut setup = model_setup(network.clone(), 1000, false);
+        let Err(FetchError::Unavailable(why)) = setup.broker.model_complete(ask(10)) else {
+            panic!("this should have said there's no key");
+        };
+        assert!(why.contains("API key"), "{why}");
+        assert!(network.urls_sent().is_empty());
+    }
+
+    #[test]
+    fn an_unapproved_or_undeclared_model_sends_nothing() {
+        let network = FakeNetwork::default();
+        let fixture = Fixture::new();
+        let mut broker = Broker::with_network(Scripted::new(Answer::Deny), network.clone())
+            .for_run(
+                &fixture.storage,
+                &Manifest::parse(MANIFEST).unwrap(),
+                &RunLimits {
+                    memory_bytes: 1,
+                    run_time: Duration::from_secs(60),
+                    disk_bytes: 1,
+                },
+                RunId::parse(&"1".repeat(32)).unwrap(),
+            );
+        assert_eq!(
+            broker.model_complete(ask(10)).err(),
+            Some(FetchError::NotGranted)
+        );
+        let mut other = ask(10);
+        other.model = "other".to_string();
+        assert!(matches!(
+            broker.model_complete(other),
+            Err(FetchError::Denied(_))
+        ));
+        assert!(network.urls_sent().is_empty());
+    }
+
+    #[test]
+    fn a_model_that_isnt_the_providers_is_refused() {
+        let network = FakeNetwork::default();
+        let root = TempDir::new().unwrap();
+        let shared = RunShared {
+            audit: Arc::new(Mutex::new(Err(AuditError::TooManyEntries))),
+            tokens_left: Arc::new(AtomicU64::new(100)),
+        };
+        let mut request = ask(10);
+        request.model = "gpt-5".to_string();
+        let vault = Vault::new(root.path(), FakeStore::default());
+        assert!(matches!(
+            model::start(
+                &network,
+                Some(&vault),
+                &request,
+                shared,
+                Duration::from_secs(1)
+            ),
+            Err(FetchError::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn provider_errors_become_clear_errors_and_hold_nothing_from_the_provider() {
+        let echo = format!("{{\"error\":\"bad key {SECRET}\"}}");
+        for (status, expected) in [
+            (400, "InvalidRequest"),
+            (401, "Denied"),
+            (403, "Denied"),
+            (404, "InvalidRequest"),
+            (429, "Unavailable"),
+            (500, "Unavailable"),
+            (529, "Unavailable"),
+        ] {
+            let network = FakeNetwork::default().page(PROVIDER, status, &[], echo.as_bytes());
+            let mut setup = model_setup(network, 1000, true);
+            let error = setup.broker.model_complete(ask(10)).err().unwrap();
+            let text = format!("{error:?}");
+            assert!(text.contains(expected), "{status}: {text}");
+            assert!(!text.contains(SECRET), "{status}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_redirect_from_the_provider_isnt_followed_with_the_key() {
+        let network = FakeNetwork::default().page(
+            PROVIDER,
+            302,
+            &[("Location", "https://evil.example/")],
+            b"",
+        );
+        let mut setup = model_setup(network.clone(), 1000, true);
+        assert!(setup.broker.model_complete(ask(10)).is_err());
+        assert_eq!(network.urls_sent(), [PROVIDER]);
+    }
+
+    #[test]
+    fn a_streams_problems_reach_the_agent() {
+        let start =
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n";
+        for (rest, expected) in [
+            ("", "Unavailable"),
+            ("data: not json\n\n", "Unavailable"),
+            (
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n",
+                "Unavailable",
+            ),
+            (
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "Denied",
+            ),
+        ] {
+            let body = format!("{start}{rest}");
+            let network = FakeNetwork::default().page(PROVIDER, 200, &[], body.as_bytes());
+            let mut setup = model_setup(network, 1000, true);
+            let mut answer = setup.broker.model_complete(ask(10)).ok().unwrap();
+            let error = answer.next().unwrap_err();
+            assert!(format!("{error:?}").contains(expected), "{rest}: {error:?}");
+            // It stays finished after that.
+            assert_eq!(answer.next().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn a_stream_with_a_huge_line_is_cut_off() {
+        let network = FakeNetwork {
+            huge_body: Some(10 * 1024 * 1024),
+            ..FakeNetwork::default()
+        };
+        let mut setup = model_setup(network, 1000, true);
+        let mut answer = setup.broker.model_complete(ask(10)).ok().unwrap();
+        assert!(matches!(answer.next(), Err(FetchError::LimitExceeded(_))));
+    }
+
+    #[test]
+    fn requests_that_are_too_large_or_empty_are_refused() {
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        let mut setup = model_setup(network.clone(), 1000, true);
+        let user = |text: String| ModelMessage {
+            role: ModelRole::User,
+            text,
+        };
+        for request in [
+            ModelRequest {
+                model: "default".to_string(),
+                messages: vec![],
+                max_tokens: 10,
+            },
+            ModelRequest {
+                model: "default".to_string(),
+                messages: vec![ModelMessage {
+                    role: ModelRole::System,
+                    text: "only this".to_string(),
+                }],
+                max_tokens: 10,
+            },
+            ModelRequest {
+                model: "default".to_string(),
+                messages: vec![user("x".to_string())],
+                max_tokens: 0,
+            },
+            ModelRequest {
+                model: "default".to_string(),
+                messages: vec![user("x".repeat(9 * 1024 * 1024))],
+                max_tokens: 10,
+            },
+            ModelRequest {
+                model: "default".to_string(),
+                messages: (0..1025).map(|_| user("x".to_string())).collect(),
+                max_tokens: 10,
+            },
+        ] {
+            assert!(matches!(
+                setup.broker.model_complete(request),
+                Err(FetchError::InvalidRequest(_))
+            ));
+        }
+        assert!(network.urls_sent().is_empty());
+    }
+
+    #[test]
+    fn after_a_private_read_a_model_needs_fresh_approval_too() {
+        let private = a_private_file("private words");
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        let fixture = Fixture::new();
+        let mut grants = RunGrants::new(fixture.storage.clone());
+        grants
+            .grant(Target::Model("default".to_string()), Lifetime::UntilRevoked)
+            .unwrap();
+        let root = TempDir::new().unwrap();
+        let mut broker = Broker::with_network(
+            Scripted::choosing(Answer::Deny, &private.path),
+            network.clone(),
+        )
+        .with_vault(Vault::new(root.path(), FakeStore::default()))
+        .for_run(
+            &fixture.storage,
+            &Manifest::parse(MANIFEST).unwrap(),
+            &RunLimits {
+                memory_bytes: 1,
+                run_time: Duration::from_secs(60),
+                disk_bytes: 1,
+            },
+            RunId::parse(&"1".repeat(32)).unwrap(),
+        );
+        broker.pick_user_file("please").ok().unwrap();
+        assert_eq!(
+            broker.model_complete(ask(10)).err(),
+            Some(FetchError::NotGranted)
+        );
+        assert!(network.urls_sent().is_empty());
     }
 
     #[test]

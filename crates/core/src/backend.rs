@@ -65,6 +65,44 @@ pub enum AccessRefused {
     Internal,
 }
 
+/// Who said something in a request to a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRole {
+    System,
+    User,
+    Assistant,
+}
+
+/// One message in a request to a model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelMessage {
+    pub role: ModelRole,
+    pub text: String,
+}
+
+/// A request to a model from an agent. All of this is untrusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRequest {
+    pub model: String,
+    pub messages: Vec<ModelMessage>,
+    pub max_tokens: u32,
+}
+
+/// How many tokens a request to a model used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+/// A model's answer as it's produced. Dropping it cancels the request.
+pub trait ModelAnswer {
+    /// The next piece of text, or nothing at the end.
+    fn next(&mut self) -> Result<Option<String>, FetchError>;
+    /// The tokens used, once the end has been reached.
+    fn usage(&self) -> Option<TokenUsage>;
+}
+
 /// Something that can be read from anywhere.
 pub trait ReadAnywhere: Read + Seek + Send {}
 
@@ -133,6 +171,14 @@ pub trait RunBroker {
     /// Shows the user a message from the agent, which is untrusted.
     fn send_message(&mut self, _text: &str) -> Result<(), AccessRefused> {
         Err(AccessRefused::Denied("this isn't available".to_string()))
+    }
+
+    /// Starts asking an AI model something.
+    fn model_complete(
+        &mut self,
+        _request: ModelRequest,
+    ) -> Result<Box<dyn ModelAnswer + Send>, FetchError> {
+        Err(FetchError::Denied("this isn't available".to_string()))
     }
 
     /// Asks the user to choose a file. The reason is the agent's own claim, and it's untrusted.

@@ -91,6 +91,12 @@ pub enum AuditEvent {
         /// 0 if nothing came back.
         status: u16,
     },
+    /// A request to an AI model ended, having used this many tokens. What was said isn't recorded.
+    ModelUsed {
+        model: String,
+        input_tokens: u32,
+        output_tokens: u32,
+    },
     /// The agent showed the user a message. What it said isn't recorded, as it can be private.
     MessageSent,
     /// The run was given a file that the user chose. Its name isn't recorded, as it can be private.
@@ -341,6 +347,14 @@ pub fn describe(entry: &AuditEntry) -> String {
             method,
             status,
         } => format!("{} to {} gave {status}", printable(method), target(asked)),
+        AuditEvent::ModelUsed {
+            model,
+            input_tokens,
+            output_tokens,
+        } => format!(
+            "AI model {} used {input_tokens} tokens in and {output_tokens} out",
+            printable(model)
+        ),
         AuditEvent::MessageSent => "showed the user a message".to_string(),
         AuditEvent::UserFilePicked => "given a file that the user chose".to_string(),
         AuditEvent::UserFileRefused => "asked for a file, and didn't get one".to_string(),

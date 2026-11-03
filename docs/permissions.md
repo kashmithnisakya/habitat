@@ -106,6 +106,42 @@ An agent that's been tricked, such as by text in a web page, could send private 
 
 **This reduces the risk, but doesn't remove it.** See the [threat model](threat-model.md#known-weak-spots).
 
+## Secrets
+
+API keys are kept in the operating system's keystore, which is the keychain on a Mac, Credential Manager on Windows and the Secret Service on Linux. Without one, there are no secrets, and nothing falls back to a file.
+
+```bash
+habitat secret add anthropic --host api.anthropic.com --header x-api-key
+```
+
+```bash
+habitat secret list
+```
+
+```bash
+habitat secret remove anthropic
+```
+
+- **An agent can never read one.** Nothing in the agent API returns a secret. The core adds it to requests that the core itself makes.
+- **Each is bound to exact hosts.** A secret can't be sent anywhere else, and the check is for an exact name.
+- **It can only go in a header meant for credentials,** which are `authorization`, `x-api-key` and `api-key`. It can't be set up to go in one that a server might echo back.
+- **A value is never on the command line,** where other programs could see it. It's asked for without being shown, or read from a pipe.
+- **A secret isn't replaced by adding it again.** Remove it first, so that a mistake can't change where a key goes.
+
+Secrets belong to the user, not to one agent. Anything that can run as the user can ask the keystore for them, and on a Mac, the first use asks the user to allow it.
+
+## AI models
+
+An agent asks for a model by name, and the core makes the request and adds the key itself, so the agent never holds it. It only gets the text as it arrives. `default` means the host's choice, which is `claude-opus-5-5` today. Any other name has to start with `claude-`, because only one provider is supported so far, and it has to be listed in the manifest as well.
+
+Add the key with `habitat secret add anthropic --host api.anthropic.com --header x-api-key`.
+
+- **The token budget is checked before each request,** and a request can't ask for more than is left. Actual usage comes from the provider, including input tokens, so the last request can go over. Nothing more goes out after that.
+- **Nothing an agent says to a model is logged,** only which model and how many tokens.
+- **Provider errors are clear, and hold nothing from the provider,** which could mention the key.
+- **A hosted model counts as somewhere that data goes,** so the data-leak rule applies.
+- **Fallbacks are on.** If a safety classifier declines a request, the provider can retry on another model, which can cost more. If it still declines, the agent gets `denied`.
+
 ## Grant lifetimes
 
 | Lifetime | Meaning |

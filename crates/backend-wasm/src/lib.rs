@@ -33,6 +33,7 @@ pub mod bindings {
         with: {
             "habitat:host/types.byte-stream": crate::host::OpenBody,
             "habitat:host/types.user-file": crate::host::OpenUserFile,
+            "habitat:host/types.model-stream": crate::host::OpenAnswer,
         },
     });
 }

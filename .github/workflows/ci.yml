@@ -26,6 +26,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Every test program, so that one failure doesn't hide the others.
       - run: cargo test --workspace --no-fail-fast
+      # Linux runners have no keystore to test with, and it's only safe to add to one here.
+      - name: Test with the real keystore
+        if: runner.os != 'Linux'
+        timeout-minutes: 10
+        run: cargo test -p habitat-broker -p habitat-cli real_keystore -- --ignored
 
   wit:
     name: Validate agent API

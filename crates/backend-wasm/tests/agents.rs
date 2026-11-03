@@ -14,8 +14,8 @@ use habitat_backend_wasm::code_shape::CodeShape;
 use habitat_backend_wasm::compile_limits::CompileLimits;
 use habitat_core::backend::{
     AccessRefused, Backend, DenyEverything, Event, FetchError, FetchRequest, FetchResponse,
-    HostLimits, Lifetime, LoadError, LoadedAgent, RunBroker, RunLimits, RunOutcome, StopSignal,
-    Target,
+    HostLimits, Lifetime, LoadError, LoadedAgent, ModelAnswer, ModelRequest, ModelRole, RunBroker,
+    RunLimits, RunOutcome, StopSignal, Target, TokenUsage,
 };
 use habitat_core::home::{AgentStorage, Home};
 use habitat_core::package::Package;
@@ -924,6 +924,80 @@ fn a_run_can_only_hold_so_many_responses_open() {
         RunOutcome::Completed
     );
     let RunOutcome::Failed(message) = run_with_fetcher("fetch-and-hold 17", fetcher()) else {
+        panic!("this should have failed");
+    };
+    assert!(message.contains("LimitExceeded"), "{message}");
+}
+
+/// Answers with two pieces of text.
+struct FakeAnswer(Vec<String>, bool);
+
+impl ModelAnswer for FakeAnswer {
+    fn next(&mut self) -> Result<Option<String>, FetchError> {
+        if self.0.is_empty() {
+            self.1 = true;
+            return Ok(None);
+        }
+        Ok(Some(self.0.remove(0)))
+    }
+
+    fn usage(&self) -> Option<TokenUsage> {
+        self.1.then_some(TokenUsage {
+            input_tokens: 3,
+            output_tokens: 5,
+        })
+    }
+}
+
+struct FakeModel(Option<FetchError>);
+
+impl RunBroker for FakeModel {
+    fn request_access(&mut self, _: &Target, _: &str) -> Result<Lifetime, AccessRefused> {
+        Err(AccessRefused::Internal)
+    }
+
+    fn model_complete(
+        &mut self,
+        request: ModelRequest,
+    ) -> Result<Box<dyn ModelAnswer + Send>, FetchError> {
+        if let Some(error) = self.0.take() {
+            return Err(error);
+        }
+        assert_eq!(request.model, "default");
+        assert_eq!(request.messages[0].role, ModelRole::User);
+        assert_eq!(request.messages[0].text, "hello");
+        Ok(Box::new(FakeAnswer(
+            vec!["Hello".to_string(), " there".to_string()],
+            false,
+        )))
+    }
+}
+
+fn run_with_model(message: &str, model: FakeModel) -> RunOutcome {
+    let fixture = Fixture::file_agent();
+    fixture.agent.run(
+        &Event::UserMessage(message.to_string()),
+        fixture.home(),
+        &roomy_limits(),
+        &StopSignal::default(),
+        Box::new(model),
+    )
+}
+
+#[test]
+fn an_agent_reads_a_models_answer_as_it_arrives_and_gets_its_usage() {
+    assert_eq!(
+        run_with_model("ask-model-text default Hello there", FakeModel(None)),
+        RunOutcome::Completed
+    );
+}
+
+#[test]
+fn an_agent_gets_the_reason_a_model_refused() {
+    let RunOutcome::Failed(message) = run_with_model(
+        "ask-model-text default x",
+        FakeModel(Some(FetchError::LimitExceeded("over budget".to_string()))),
+    ) else {
         panic!("this should have failed");
     };
     assert!(message.contains("LimitExceeded"), "{message}");

@@ -746,6 +746,115 @@ fn a_hostile_message_cant_pass_for_habitat() {
     assert!(lines[2].starts_with("completed (run "), "{text:?}");
 }
 
+fn add_secret(fixture: &Fixture, args: &[&str], value: &str) -> Output {
+    let mut child = fixture
+        .command()
+        .args(["secret", "add"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(value.as_bytes());
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn a_secret_is_refused_before_the_keystore_is_touched_if_its_not_valid() {
+    let fixture = Fixture::new();
+    for (args, value, message) in [
+        (
+            &["UPPER", "--host", "a.example"][..],
+            "x\n",
+            "secret's name",
+        ),
+        (&["../x", "--host", "a.example"][..], "x\n", "secret's name"),
+        (&["key", "--host", "localhost"][..], "x\n", "valid host"),
+        (&["key", "--host", "*.example.com"][..], "x\n", "valid host"),
+        (
+            &["key", "--host", "a.example", "--header", "cookie"][..],
+            "x\n",
+            "valid header",
+        ),
+        (&["key", "--host", "a.example"][..], "", "between 1 byte"),
+        (&["key", "--host", "a.example"][..], "\n", "between 1 byte"),
+    ] {
+        fails_with(&add_secret(&fixture, args, value), 1, message);
+    }
+    succeeds(&fixture.run(&["secret", "list"]));
+    assert!(stdout(&fixture.run(&["secret", "list"])).contains("no secrets"));
+}
+
+#[test]
+fn a_secret_has_to_say_where_it_can_go_and_cant_be_given_on_the_command_line() {
+    let fixture = Fixture::new();
+    assert_eq!(add_secret(&fixture, &["key"], "x\n").status.code(), Some(2));
+    assert_eq!(
+        add_secret(&fixture, &["key", "sk-value", "--host", "a.example"], "x\n")
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        add_secret(
+            &fixture,
+            &["key", "--value", "sk-value", "--host", "a.example"],
+            "x\n"
+        )
+        .status
+        .code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn removing_a_secret_that_isnt_there_says_so() {
+    let fixture = Fixture::new();
+    fails_with(
+        &fixture.run(&["secret", "remove", "nothing"]),
+        1,
+        "no secret with that name",
+    );
+}
+
+/// With the real keystore, which is only safe to add to in CI.
+#[test]
+#[ignore = "uses the real keystore"]
+fn real_keystore_secrets_can_be_added_listed_and_removed() {
+    const VALUE: &str = "sk-THE-REAL-SECRET-VALUE";
+    let fixture = Fixture::new();
+    let name = format!("habitat-cli-test-{}", std::process::id());
+    let added = add_secret(
+        &fixture,
+        &[
+            name.as_str(),
+            "--host",
+            "api.example.com",
+            "--header",
+            "x-api-key",
+        ],
+        &format!("{VALUE}\n"),
+    );
+    succeeds(&added);
+    assert!(!stdout(&added).contains(VALUE));
+    let listed = fixture.run(&["secret", "list"]);
+    assert!(stdout(&listed).contains(&name), "{}", stdout(&listed));
+    assert!(stdout(&listed).contains("api.example.com"));
+    assert!(!stdout(&listed).contains(VALUE));
+    // Nor does it go in any file of ours.
+    for entry in fs::read_dir(fixture.root()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            assert!(!String::from_utf8_lossy(&fs::read(&path).unwrap()).contains(VALUE));
+        }
+    }
+    succeeds(&fixture.run(&["secret", "remove", &name]));
+    assert!(stdout(&fixture.run(&["secret", "list"])).contains("no secrets"));
+}
+
 #[test]
 fn with_nobody_to_answer_it_means_no() {
     let fixture = installed_asking_agent();

@@ -8,4 +8,6 @@ pub mod audit;
 pub mod broker;
 pub mod gateway;
 pub mod grants;
+pub mod model;
 pub mod policy;
+pub mod vault;
