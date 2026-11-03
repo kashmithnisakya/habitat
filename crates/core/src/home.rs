@@ -92,7 +92,7 @@ impl From<io::Error> for HomeError {
 }
 
 /// One agent's folder. Only `home/` is ever visible to the agent.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AgentStorage {
     name: String,
     path: PathBuf,

@@ -80,6 +80,20 @@ The [policy engine](../crates/broker/src/policy.rs) makes these decisions, and i
 - **A grant only counts while it's declared.** If a package no longer lists something, an old grant for it stops working.
 - **There's no asking for something that can't happen.** A run that has used up its token budget is denied, instead of prompting the user.
 
+## Approval prompts
+
+An agent can't change what a prompt asks, only fill in two places: what it's asking for, which has to be a name that its manifest declares, and its reason, which is labelled as its own claim. Anything in these that a terminal would act on is replaced, and they're cut short. The shell draws the prompt, and [`approval.rs`](../crates/broker/src/approval.rs) doesn't depend on which shell it is.
+
+- **Only a clear yes counts.** No answer within 2 minutes, no shell to ask or an answer that isn't recognised all mean no.
+- **Refused means refused.** In one run, something the user said no to isn't asked about again.
+- **Each run can ask 5 times at most.** After that, requests are denied without asking, so a user can't be worn down.
+
+These have some limits:
+
+- **The limit is per run, so an agent can try again in its next run.** Nothing limits prompts across runs yet.
+- **A prompt can make a run overrun its time limit,** because the time limit can't stop a call that's waiting on the host. It's stopped as soon as the prompt is answered or times out.
+- **Text on a terminal can be misread.** An agent's reason can still say untrue things, so it's labelled as a claim.
+
 ## Grant lifetimes
 
 | Lifetime | Meaning |

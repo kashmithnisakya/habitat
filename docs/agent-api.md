@@ -4,7 +4,7 @@
 
 The bindings for both sides are generated from this file. CI builds a [test agent](../examples/api-check/src/lib.rs) that uses every call, and checks what it imports.
 
-The file calls, `now-ms` and `random-bytes` work. Everything that needs the broker returns `denied` until the broker exists, and that includes `send-message`. `log` currently drops its messages. The version rule below has only been checked by hand, on Wasmtime 50.
+The file calls, `now-ms`, `random-bytes` and `request-access` work. Everything else that needs the broker returns `denied` until it's built, and that includes `send-message`. `log` currently drops its messages. The version rule below has only been checked by hand, on Wasmtime 50.
 
 ## What agents can do
 

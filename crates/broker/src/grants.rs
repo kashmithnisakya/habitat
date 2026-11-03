@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::io;
 
+pub use habitat_core::backend::Lifetime;
 use habitat_core::home::AgentStorage;
 use habitat_core::manifest::{is_host_name, is_model_name};
 use serde::{Deserialize, Serialize};
@@ -15,17 +16,6 @@ use serde::{Deserialize, Serialize};
 use crate::policy::{Grants, Target};
 
 const FORMAT_VERSION: u32 = 1;
-
-/// How long a grant lasts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lifetime {
-    /// Covers a single request.
-    Once,
-    /// Ends when the run does.
-    ThisRun,
-    /// Lasts until the user removes it.
-    UntilRevoked,
-}
 
 /// Why the saved grants couldn't be read or changed. The text holds no host paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,15 +133,15 @@ fn serialize(saved: &SavedGrants) -> Result<Vec<u8>, GrantError> {
 }
 
 /// One run's view of an agent's grants.
-pub struct RunGrants<'a> {
-    storage: &'a AgentStorage,
+pub struct RunGrants {
+    storage: AgentStorage,
     once: HashSet<Target>,
     this_run: HashSet<Target>,
 }
 
-impl<'a> RunGrants<'a> {
+impl RunGrants {
     /// Starts with nothing but what's saved, so nothing from an earlier run can carry over.
-    pub fn new(storage: &'a AgentStorage) -> Self {
+    pub fn new(storage: AgentStorage) -> Self {
         Self {
             storage,
             once: HashSet::new(),
@@ -181,6 +171,26 @@ impl<'a> RunGrants<'a> {
         Ok(())
     }
 
+    /// The kind of grant that covers this target, if any. If there's more than one, this is the
+    /// longest, because that's how long the agent can rely on it.
+    pub fn lifetime_of(&self, target: &Target) -> Option<Lifetime> {
+        let saved = self
+            .storage
+            .read_grants()
+            .ok()
+            .and_then(|data| SavedGrants::parse(data).ok())
+            .is_some_and(|saved| saved.contains(target));
+        if saved {
+            Some(Lifetime::UntilRevoked)
+        } else if self.this_run.contains(target) {
+            Some(Lifetime::ThisRun)
+        } else if self.once.contains(target) {
+            Some(Lifetime::Once)
+        } else {
+            None
+        }
+    }
+
     /// Records that a request was allowed, which uses up a grant for one request. If there's more
     /// than one kind of grant for this target, this uses up the shortest.
     pub fn used(&mut self, target: &Target) {
@@ -191,23 +201,16 @@ impl<'a> RunGrants<'a> {
     pub fn revoke(&mut self, target: &Target) -> Result<bool, GrantError> {
         let once = self.once.remove(target);
         let this_run = self.this_run.remove(target);
-        let saved = revoke_saved(self.storage, target)?;
+        let saved = revoke_saved(&self.storage, target)?;
         Ok(once || this_run || saved)
     }
 }
 
-impl Grants for RunGrants<'_> {
+impl Grants for RunGrants {
     /// Reads what's saved each time. If that fails, it doesn't count, because an unreadable record
     /// of what's allowed can't allow anything.
     fn covers(&self, target: &Target) -> bool {
-        self.once.contains(target)
-            || self.this_run.contains(target)
-            || self
-                .storage
-                .read_grants()
-                .ok()
-                .and_then(|data| SavedGrants::parse(data).ok())
-                .is_some_and(|saved| saved.contains(target))
+        self.lifetime_of(target).is_some()
     }
 }
 
@@ -244,7 +247,7 @@ mod tests {
     fn nothing_is_granted_to_start_with() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let grants = RunGrants::new(&storage);
+        let grants = RunGrants::new(storage.clone());
         assert!(!grants.covers(&host(HOST)));
         assert!(!grants.covers(&model("default")));
         assert_eq!(list_saved(&storage), Ok(Vec::new()));
@@ -254,7 +257,7 @@ mod tests {
     fn once_covers_until_its_used() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         grants.grant(host(HOST), Lifetime::Once).unwrap();
         assert!(grants.covers(&host(HOST)));
         assert!(grants.covers(&host(HOST)), "asking doesn't use it up");
@@ -266,31 +269,31 @@ mod tests {
     fn this_run_lasts_the_whole_run_and_no_longer() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         grants.grant(host(HOST), Lifetime::ThisRun).unwrap();
         for _ in 0..3 {
             assert!(grants.covers(&host(HOST)));
             grants.used(&host(HOST));
         }
         drop(grants);
-        assert!(!RunGrants::new(&storage).covers(&host(HOST)));
+        assert!(!RunGrants::new(storage.clone()).covers(&host(HOST)));
     }
 
     #[test]
     fn once_doesnt_outlast_its_run_even_if_it_wasnt_used() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         grants.grant(host(HOST), Lifetime::Once).unwrap();
         drop(grants);
-        assert!(!RunGrants::new(&storage).covers(&host(HOST)));
+        assert!(!RunGrants::new(storage.clone()).covers(&host(HOST)));
     }
 
     #[test]
     fn neither_short_grant_is_saved_anywhere() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         grants.grant(host(HOST), Lifetime::Once).unwrap();
         grants.grant(model("default"), Lifetime::ThisRun).unwrap();
         assert!(!storage.grants_path().exists());
@@ -301,7 +304,7 @@ mod tests {
     fn until_revoked_survives_a_restart_and_isnt_used_up() {
         let root = TempDir::new().unwrap();
         let storage_one = storage(&root);
-        let mut grants = RunGrants::new(&storage_one);
+        let mut grants = RunGrants::new(storage_one.clone());
         grants.grant(host(HOST), Lifetime::UntilRevoked).unwrap();
         grants
             .grant(model("default"), Lifetime::UntilRevoked)
@@ -311,7 +314,7 @@ mod tests {
         drop(grants);
 
         let reopened = self::storage(&root);
-        let grants = RunGrants::new(&reopened);
+        let grants = RunGrants::new(reopened.clone());
         assert!(grants.covers(&host(HOST)));
         assert!(grants.covers(&model("default")));
         assert_eq!(
@@ -321,10 +324,27 @@ mod tests {
     }
 
     #[test]
+    fn the_longest_grant_is_what_counts() {
+        let root = TempDir::new().unwrap();
+        let storage = storage(&root);
+        let mut grants = RunGrants::new(storage.clone());
+        assert_eq!(grants.lifetime_of(&host(HOST)), None);
+        grants.grant(host(HOST), Lifetime::Once).unwrap();
+        assert_eq!(grants.lifetime_of(&host(HOST)), Some(Lifetime::Once));
+        grants.grant(host(HOST), Lifetime::ThisRun).unwrap();
+        assert_eq!(grants.lifetime_of(&host(HOST)), Some(Lifetime::ThisRun));
+        grants.grant(host(HOST), Lifetime::UntilRevoked).unwrap();
+        assert_eq!(
+            grants.lifetime_of(&host(HOST)),
+            Some(Lifetime::UntilRevoked)
+        );
+    }
+
+    #[test]
     fn using_up_a_once_grant_leaves_a_longer_one_alone() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         grants.grant(host(HOST), Lifetime::ThisRun).unwrap();
         grants.grant(host(HOST), Lifetime::Once).unwrap();
         grants.used(&host(HOST));
@@ -335,7 +355,7 @@ mod tests {
     fn a_grant_covers_exactly_what_it_names() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         for lifetime in [Lifetime::Once, Lifetime::ThisRun, Lifetime::UntilRevoked] {
             grants.grant(host(HOST), lifetime).unwrap();
             for other in [
@@ -354,7 +374,7 @@ mod tests {
     fn invalid_targets_cant_be_granted() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         for lifetime in [Lifetime::Once, Lifetime::ThisRun, Lifetime::UntilRevoked] {
             for target in [
                 host(""),
@@ -382,7 +402,7 @@ mod tests {
     fn revoking_takes_effect_on_the_next_request() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         for lifetime in [Lifetime::Once, Lifetime::ThisRun, Lifetime::UntilRevoked] {
             grants.grant(host(HOST), lifetime).unwrap();
             assert!(grants.covers(&host(HOST)));
@@ -396,7 +416,7 @@ mod tests {
     fn revoking_all_kinds_at_once_removes_them_all() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         for lifetime in [Lifetime::Once, Lifetime::ThisRun, Lifetime::UntilRevoked] {
             grants.grant(host(HOST), lifetime).unwrap();
         }
@@ -408,7 +428,7 @@ mod tests {
     fn revoking_from_outside_a_run_reaches_a_run_thats_going() {
         let root = TempDir::new().unwrap();
         let in_run = storage(&root);
-        let mut grants = RunGrants::new(&in_run);
+        let mut grants = RunGrants::new(in_run.clone());
         grants.grant(host(HOST), Lifetime::UntilRevoked).unwrap();
         assert!(grants.covers(&host(HOST)));
 
@@ -422,7 +442,7 @@ mod tests {
     fn revoking_one_leaves_the_others() {
         let root = TempDir::new().unwrap();
         let storage = storage(&root);
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         grants.grant(host(HOST), Lifetime::UntilRevoked).unwrap();
         grants
             .grant(host("example.com"), Lifetime::UntilRevoked)
@@ -449,7 +469,7 @@ mod tests {
             let storage = storage(&root);
             fs::write(storage.grants_path(), bad).unwrap();
 
-            let mut grants = RunGrants::new(&storage);
+            let mut grants = RunGrants::new(storage.clone());
             assert!(!grants.covers(&host(HOST)));
             assert_eq!(list_saved(&storage), Err(GrantError::Corrupt));
             assert_eq!(
@@ -471,7 +491,7 @@ mod tests {
         let mut text = String::from("format = 1\nnetwork = [\"api.github.com\"]\n");
         text.push_str(&"#".repeat(2 * 1024 * 1024));
         fs::write(storage.grants_path(), text).unwrap();
-        assert!(!RunGrants::new(&storage).covers(&host(HOST)));
+        assert!(!RunGrants::new(storage.clone()).covers(&host(HOST)));
         assert_eq!(list_saved(&storage), Err(GrantError::Corrupt));
     }
 
@@ -485,7 +505,7 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, storage.grants_path()).unwrap();
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&elsewhere, storage.grants_path()).unwrap();
-        assert!(!RunGrants::new(&storage).covers(&host(HOST)));
+        assert!(!RunGrants::new(storage.clone()).covers(&host(HOST)));
         assert!(list_saved(&storage).is_err());
     }
 
@@ -497,7 +517,7 @@ mod tests {
                 let root = &root;
                 scope.spawn(move || {
                     let storage = self::storage(root);
-                    let mut grants = RunGrants::new(&storage);
+                    let mut grants = RunGrants::new(storage.clone());
                     grants
                         .grant(
                             host(&format!("host{index}.example")),
@@ -515,7 +535,7 @@ mod tests {
     fn grants_crash_writer() {
         let dir = env::var(CRASH_DIR_VAR).expect("only for the crash test");
         let storage = AgentStorage::open(Path::new(&dir), "agent").unwrap();
-        let mut grants = RunGrants::new(&storage);
+        let mut grants = RunGrants::new(storage.clone());
         loop {
             grants.grant(host(HOST), Lifetime::UntilRevoked).unwrap();
             revoke_saved(&storage, &host(HOST)).unwrap();

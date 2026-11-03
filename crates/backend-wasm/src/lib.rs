@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use habitat_core::backend::{
-    Backend, Event, LoadError, LoadedAgent, RunLimits, RunOutcome, StopSignal,
+    Backend, Event, LoadError, LoadedAgent, RunBroker, RunLimits, RunOutcome, StopSignal,
 };
 use habitat_core::home::Home;
 use habitat_core::package::Package;
@@ -182,10 +182,20 @@ impl Ticker {
 }
 
 impl LoadedAgent for WasmAgent {
-    fn run(&self, event: &Event, home: Home, limits: &RunLimits, stop: &StopSignal) -> RunOutcome {
+    fn run(
+        &self,
+        event: &Event,
+        home: Home,
+        limits: &RunLimits,
+        stop: &StopSignal,
+        broker: Box<dyn RunBroker + Send>,
+    ) -> RunOutcome {
         // A new store each time, so that nothing in memory carries over between runs, even after
         // a crash.
-        let mut store = Store::new(&self.engine, HostState::new(home, limits.memory_bytes));
+        let mut store = Store::new(
+            &self.engine,
+            HostState::new(home, limits.memory_bytes, broker),
+        );
         store.limiter(HostState::limiter);
 
         // Other runs can make the same engine tick, so each tick only means it's time to check.

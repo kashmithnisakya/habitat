@@ -5,15 +5,16 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use habitat_core::backend::{AccessRefused, Lifetime, RunBroker, Target};
 use habitat_core::home::{EntryKind as HomeEntryKind, Home, HomeError as StoreError};
 use wasmtime::component::Resource;
 use wasmtime::{ResourceLimiter, Result};
 
 use crate::bindings::habitat::host::agent_home;
 use crate::bindings::habitat::host::types::{
-    self, AccessTarget, ByteStream, DirEntry, EntryKind, Grant, HomeError, HostByteStream,
-    HostModelStream, HostUserFile, HttpRequest, HttpResponse, LogLevel, ModelRequest, ModelStream,
-    TokenUsage, UserFile,
+    self, AccessTarget, ByteStream, DirEntry, EntryKind, Grant, GrantLifetime, HomeError,
+    HostByteStream, HostModelStream, HostUserFile, HttpRequest, HttpResponse, LogLevel,
+    ModelRequest, ModelStream, TokenUsage, UserFile,
 };
 
 /// The most that one read returns. Agents read larger files in pieces.
@@ -90,12 +91,14 @@ impl ResourceLimiter for Limiter {
 pub(crate) struct HostState {
     home: Home,
     limiter: Limiter,
+    broker: Box<dyn RunBroker + Send>,
 }
 
 impl HostState {
-    pub(crate) fn new(home: Home, memory_bytes: u64) -> Self {
+    pub(crate) fn new(home: Home, memory_bytes: u64, broker: Box<dyn RunBroker + Send>) -> Self {
         Self {
             home,
+            broker,
             limiter: Limiter {
                 limit: memory_bytes,
                 used: 0,
@@ -201,12 +204,24 @@ impl agent_home::Host for HostState {
         needs_broker()
     }
 
-    fn request_access(
-        &mut self,
-        _target: AccessTarget,
-        _reason: String,
-    ) -> Result<Grant, HomeError> {
-        needs_broker()
+    fn request_access(&mut self, target: AccessTarget, reason: String) -> Result<Grant, HomeError> {
+        let asked_for = match &target {
+            AccessTarget::NetworkHost(host) => Target::NetworkHost(host.clone()),
+            AccessTarget::Model(model) => Target::Model(model.clone()),
+        };
+        match self.broker.request_access(&asked_for, &reason) {
+            Ok(lifetime) => Ok(Grant {
+                target,
+                lifetime: match lifetime {
+                    Lifetime::Once => GrantLifetime::Once,
+                    Lifetime::ThisRun => GrantLifetime::ThisRun,
+                    Lifetime::UntilRevoked => GrantLifetime::UntilRevoked,
+                },
+            }),
+            Err(AccessRefused::Denied(why)) => Err(HomeError::Denied(why)),
+            Err(AccessRefused::LimitExceeded(why)) => Err(HomeError::LimitExceeded(why)),
+            Err(AccessRefused::Internal) => Err(HomeError::Internal),
+        }
     }
 
     fn pick_user_file(&mut self, _reason: String) -> Result<Resource<UserFile>, HomeError> {

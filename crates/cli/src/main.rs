@@ -5,14 +5,18 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use habitat_backend_wasm::WasmBackend;
+use habitat_broker::approval::{Answer, Approver, Prompt};
+use habitat_broker::broker::Broker;
 use habitat_broker::grants::{list_saved, revoke_saved};
 use habitat_broker::policy::Target;
-use habitat_core::backend::{Event, HostLimits, RunOutcome};
+use habitat_core::backend::{Event, HostLimits, Lifetime, RunOutcome};
 use habitat_core::home::{AgentStorage, HomeError};
 use habitat_core::manifest::MAX_MANIFEST_BYTES;
 use habitat_core::package::{MAX_COMPONENT_BYTES, Package};
@@ -163,7 +167,8 @@ fn run_command(cli: Cli) -> Result<(), Failure> {
         None => default_root().map_err(Failure::general)?,
     };
     let backend = WasmBackend::new().map_err(|error| Failure::general(error.to_string()))?;
-    let supervisor = Supervisor::new(&root, backend, HostLimits::default());
+    let supervisor =
+        Supervisor::new(&root, backend, HostLimits::default()).with_broker(Broker::new(Terminal));
     match cli.command {
         Command::Pack { .. } => unreachable!("handled above"),
         Command::Install { package } => install(&supervisor, &package),
@@ -300,6 +305,53 @@ fn run(supervisor: Supervisor, agent: &str, message: String) -> Result<(), Failu
             code,
             format!("{} (run {})", describe_ending(&record), record.id),
         )),
+    }
+}
+
+/// Asks the user on the terminal. The question goes to stderr, so it can't be mixed up with any
+/// output, and answers come from stdin. If that's closed or empty, the answer is no.
+struct Terminal;
+
+/// Lines from stdin, from one thread for the whole program. A read can't be stopped, so after a
+/// question times out, this same thread picks up whatever's typed next.
+fn stdin_lines() -> &'static Mutex<Receiver<String>> {
+    static LINES: OnceLock<Mutex<Receiver<String>>> = OnceLock::new();
+    LINES.get_or_init(|| {
+        let (send, receive) = mpsc::channel();
+        thread::spawn(move || {
+            for line in io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Mutex::new(receive)
+    })
+}
+
+/// Reads an answer. Only these count, so anything else is no.
+fn parse_answer(line: &str) -> Answer {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Answer::Allow(Lifetime::Once),
+        "r" | "run" => Answer::Allow(Lifetime::ThisRun),
+        "a" | "always" => Answer::Allow(Lifetime::UntilRevoked),
+        _ => Answer::Deny,
+    }
+}
+
+impl Approver for Terminal {
+    fn ask(&self, prompt: &Prompt, wait: Duration) -> Answer {
+        let _ = writeln!(
+            io::stderr(),
+            "\n{prompt}\nAllow this? [y] once, [r] for this run, [a] until revoked, [N] no: "
+        );
+        let lines = stdin_lines().lock().unwrap_or_else(PoisonError::into_inner);
+        match lines.recv_timeout(wait) {
+            Ok(line) => parse_answer(&line),
+            // Either there's no answer in time, or nothing more can arrive.
+            Err(_) => Answer::Deny,
+        }
     }
 }
 
@@ -470,6 +522,27 @@ mod tests {
             started_at_ms: 0,
             ended_at_ms: None,
             ending: Some(ending),
+        }
+    }
+
+    #[test]
+    fn only_a_clear_answer_allows_anything() {
+        for (line, answer) in [
+            ("y", Answer::Allow(Lifetime::Once)),
+            (" YES ", Answer::Allow(Lifetime::Once)),
+            ("r", Answer::Allow(Lifetime::ThisRun)),
+            ("run", Answer::Allow(Lifetime::ThisRun)),
+            ("a", Answer::Allow(Lifetime::UntilRevoked)),
+            ("Always", Answer::Allow(Lifetime::UntilRevoked)),
+            ("", Answer::Deny),
+            ("n", Answer::Deny),
+            ("no", Answer::Deny),
+            ("yep", Answer::Deny),
+            ("y y", Answer::Deny),
+            ("yes please", Answer::Deny),
+            ("\u{1b}[A", Answer::Deny),
+        ] {
+            assert_eq!(parse_answer(line), answer, "{line:?}");
         }
     }
 

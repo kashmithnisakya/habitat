@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::home::Home;
-use crate::manifest::{Limits, printable};
+use crate::home::{AgentStorage, Home};
+use crate::manifest::{Limits, Manifest, printable};
 use crate::package::Package;
 
 /// Why an agent ran.
@@ -30,6 +30,69 @@ impl StopSignal {
 
     pub fn is_stopped(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Something outside an agent's home that it can be given access to. The text in here comes from
+/// the agent, so it's untrusted until the broker has checked it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Target {
+    NetworkHost(String),
+    Model(String),
+}
+
+/// How long access lasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lifetime {
+    /// Covers a single request.
+    Once,
+    /// Ends when the run does.
+    ThisRun,
+    /// Lasts until the user removes it.
+    UntilRevoked,
+}
+
+/// Why an agent wasn't given access. Text in here comes from the host, never from the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessRefused {
+    /// The user, or the rules, said no. Asking again won't help.
+    Denied(String),
+    /// Too many requests, or nobody's there to ask.
+    LimitExceeded(String),
+    /// The host failed.
+    Internal,
+}
+
+/// What one run of an agent can ask of the world outside its home. A backend passes each request
+/// here, and never decides anything itself.
+pub trait RunBroker {
+    /// Asks for access to something. The reason is the agent's own claim, and it's untrusted.
+    fn request_access(&mut self, target: &Target, reason: &str) -> Result<Lifetime, AccessRefused>;
+}
+
+/// A broker that refuses everything, for a host that has nothing else.
+#[derive(Debug, Default)]
+pub struct DenyEverything;
+
+impl RunBroker for DenyEverything {
+    fn request_access(&mut self, _: &Target, _: &str) -> Result<Lifetime, AccessRefused> {
+        Err(AccessRefused::Denied("this isn't available".to_string()))
+    }
+}
+
+/// Makes a broker for each run.
+pub trait BrokerFactory: Send + Sync {
+    fn for_run(
+        &self,
+        storage: &AgentStorage,
+        manifest: &Manifest,
+        limits: &RunLimits,
+    ) -> Box<dyn RunBroker + Send>;
+}
+
+impl BrokerFactory for DenyEverything {
+    fn for_run(&self, _: &AgentStorage, _: &Manifest, _: &RunLimits) -> Box<dyn RunBroker + Send> {
+        Box::new(Self)
     }
 }
 
@@ -168,7 +231,14 @@ pub trait Backend: Send + Sync {
 pub trait LoadedAgent {
     /// Runs the agent for one event, starting from nothing but what's in its home. It has to stop
     /// soon after `stop` is set, and report that as [`RunOutcome::Stopped`].
-    fn run(&self, event: &Event, home: Home, limits: &RunLimits, stop: &StopSignal) -> RunOutcome;
+    fn run(
+        &self,
+        event: &Event,
+        home: Home,
+        limits: &RunLimits,
+        stop: &StopSignal,
+        broker: Box<dyn RunBroker + Send>,
+    ) -> RunOutcome;
 }
 
 #[cfg(test)]

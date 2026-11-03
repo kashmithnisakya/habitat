@@ -12,7 +12,8 @@ These tests act like a hostile agent and confirm that each attack fails. Most ar
 | Unapproved network access | Denied and logged |
 | Memory, CPU and disk exhaustion | Run stopped, and the host stays healthy |
 | A package that's costly to compile | Refused, or abandoned after a time limit, and the host stays healthy |
-| Prompt spam | Rate limited |
+| Prompt spam | Rate limited, and tested in [`broker.rs`](../../crates/broker/src/broker.rs) |
+| Rewriting an approval prompt with terminal escapes | Neutralized and labelled, and tested in [`cli.rs`](../../crates/cli/tests/cli.rs) |
 | Tampering with grants or logs | Not reachable from the agent, and log edits are detected |
 | Tampering with run records, or filling them with hostile text | Not reachable from the agent, and its text is made safe and cut short, as tested in [`supervisor.rs`](../../crates/backend-wasm/tests/supervisor.rs) |
 

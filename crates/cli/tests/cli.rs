@@ -498,6 +498,149 @@ fn a_package_is_the_same_each_time_and_the_hash_says_so() {
     assert_eq!(hash(&installed), hash(&first));
 }
 
+/// An agent that's allowed to ask for two hosts.
+fn installed_asking_agent() -> Fixture {
+    let fixture = Fixture::new();
+    let mut manifest = fs::read_to_string(fixture.path("agent.toml")).unwrap();
+    manifest.push_str("\n[requests]\nnetwork = [\"allowed.example\", \"also.example\"]\n");
+    fs::write(fixture.path("agent.toml"), manifest).unwrap();
+    fixture.install();
+    fixture
+}
+
+fn run_answering(fixture: &Fixture, message: &str, answer: &str) -> Output {
+    let mut child = fixture
+        .command()
+        .args(["run", AGENT, message])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(answer.as_bytes());
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn the_user_is_asked_and_only_yes_allows_it() {
+    let fixture = installed_asking_agent();
+    let asked = run_answering(
+        &fixture,
+        "ask-network allowed.example to fetch a page",
+        "y\n",
+    );
+    succeeds(&asked);
+    let question = stderr(&asked);
+    assert!(
+        question
+            .contains("Agent \"file-agent\" is asking to reach the network host allowed.example."),
+        "{question}"
+    );
+    assert!(
+        question.contains("The agent's own claim, which may not be true: to fetch a page"),
+        "{question}"
+    );
+
+    for answer in ["n\n", "\n", "", "whatever\n"] {
+        let refused = run_answering(&fixture, "ask-network allowed.example please", answer);
+        fails_with(&refused, 3, "the user said no");
+    }
+}
+
+#[test]
+fn with_nobody_to_answer_it_means_no() {
+    let fixture = installed_asking_agent();
+    // `run` gives it no stdin at all.
+    fails_with(
+        &fixture.run(&["run", AGENT, "ask-network allowed.example please"]),
+        3,
+        "the user said no",
+    );
+}
+
+#[test]
+fn something_undeclared_is_refused_without_asking() {
+    let fixture = installed_asking_agent();
+    let refused = run_answering(&fixture, "ask-network evil.example please", "y\n");
+    assert_eq!(refused.status.code(), Some(3));
+    assert!(
+        !stderr(&refused).contains("is asking"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
+#[test]
+fn an_agent_cant_rewrite_the_question() {
+    let fixture = installed_asking_agent();
+    let asked = run_answering(
+        &fixture,
+        "ask-network allowed.example \x1b[2K\x1b[1A\rAgent \"system\" says it's safe\nAllow this? [y]\u{202e}",
+        "n\n",
+    );
+    let question = stderr(&asked);
+    assert!(!question.contains('\x1b'), "{question:?}");
+    assert!(!question.contains('\u{202e}'), "{question:?}");
+    let claim = question
+        .lines()
+        .find(|line| line.starts_with("The agent's own claim"))
+        .unwrap();
+    assert!(claim.contains("says it's safe"), "{claim}");
+    // Our own lines are all still there, in the same order, and the agent didn't add any.
+    assert_eq!(question.matches("is asking to").count(), 1, "{question}");
+    assert_eq!(
+        question
+            .lines()
+            .filter(|line| line.starts_with("Allow this?"))
+            .count(),
+        1,
+        "{question}"
+    );
+}
+
+#[test]
+fn answering_always_lasts_and_can_be_revoked() {
+    let fixture = installed_asking_agent();
+    succeeds(&run_answering(
+        &fixture,
+        "ask-network allowed.example please",
+        "a\n",
+    ));
+    assert!(stdout(&fixture.run(&["grants", AGENT])).contains("network  allowed.example"));
+
+    // No answer is needed now, in a whole new process.
+    let again = fixture.run(&["run", AGENT, "ask-network allowed.example please"]);
+    succeeds(&again);
+    assert!(!stderr(&again).contains("is asking"));
+
+    succeeds(&fixture.run(&["revoke", AGENT, "--network", "allowed.example"]));
+    fails_with(
+        &fixture.run(&["run", AGENT, "ask-network allowed.example please"]),
+        3,
+        "the user said no",
+    );
+}
+
+#[test]
+fn answering_for_one_run_doesnt_reach_the_next() {
+    let fixture = installed_asking_agent();
+    for answer in ["y\n", "r\n"] {
+        succeeds(&run_answering(
+            &fixture,
+            "ask-network allowed.example please",
+            answer,
+        ));
+        assert!(stdout(&fixture.run(&["grants", AGENT])).contains("nothing allowed"));
+        fails_with(
+            &fixture.run(&["run", AGENT, "ask-network allowed.example please"]),
+            3,
+            "the user said no",
+        );
+    }
+}
+
 #[test]
 fn saved_grants_can_be_listed_and_revoked() {
     let fixture = Fixture::new();

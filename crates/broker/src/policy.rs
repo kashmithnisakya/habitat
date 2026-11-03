@@ -5,15 +5,8 @@
 
 use std::fmt;
 
+pub use habitat_core::backend::Target;
 use habitat_core::manifest::{FileRequest, Manifest, is_host_name, is_model_name};
-
-/// Something outside the agent's home that a grant can cover. The text in here is untrusted until
-/// [`decide`] has checked it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Target {
-    NetworkHost(String),
-    Model(String),
-}
 
 /// Something an agent is trying to do.
 #[derive(Debug, Clone, PartialEq, Eq)]

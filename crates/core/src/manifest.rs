@@ -229,7 +229,7 @@ fn invalid(field: &'static str, message: String) -> ManifestError {
 
 /// Makes text from a manifest safe to print, so it can't send terminal escape codes or reorder
 /// what the user sees.
-pub(crate) fn printable(text: &str) -> String {
+pub fn printable(text: &str) -> String {
     let mut output = String::new();
     for c in text.chars().take(MAX_MESSAGE_CHARS) {
         if c.is_ascii_graphic() || c == ' ' {

@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use semver::Version;
 
-use crate::backend::{Backend, Event, HostLimits, RunOutcome, StopSignal};
+use crate::backend::{
+    Backend, BrokerFactory, DenyEverything, Event, HostLimits, RunOutcome, StopSignal,
+};
 use crate::home::{AgentStorage, HomeError};
 use crate::package::{Package, PackageError};
 use crate::platform;
@@ -121,6 +123,7 @@ pub struct AgentSummary {
 pub struct Supervisor {
     root: PathBuf,
     backend: Box<dyn Backend>,
+    broker: Box<dyn BrokerFactory>,
     limits: HostLimits,
     stop: StopSignal,
     active_runs: Mutex<usize>,
@@ -133,11 +136,18 @@ impl Supervisor {
         Self {
             root: root.to_path_buf(),
             backend: Box::new(backend),
+            broker: Box::new(DenyEverything),
             limits,
             stop: StopSignal::default(),
             active_runs: Mutex::new(0),
             run_ended: Condvar::new(),
         }
+    }
+
+    /// Sets what decides on what agents ask for, in place of refusing everything.
+    pub fn with_broker(mut self, broker: impl BrokerFactory + 'static) -> Self {
+        self.broker = Box::new(broker);
+        self
     }
 
     /// Installs a package, under the name in its manifest. Its home is created empty.
@@ -231,7 +241,8 @@ impl Supervisor {
             Ok(home) => home,
             Err(error) => return RunEnding::NotStarted(error.to_string()),
         };
-        RunEnding::Ran(agent.run(event, home, &limits, &self.stop))
+        let broker = self.broker.for_run(storage, package.manifest(), &limits);
+        RunEnding::Ran(agent.run(event, home, &limits, &self.stop, broker))
     }
 
     /// An agent's recent runs. A run that's going has no ending yet, and one that was interrupted
@@ -342,7 +353,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::backend::{LoadError, LoadedAgent, RunLimits};
+    use crate::backend::{LoadError, LoadedAgent, RunBroker, RunLimits};
     use crate::home::Home;
     use crate::platform::test_support::symlink;
     use crate::run_log::{EventKind, MAX_RECORDS, RunId};
@@ -392,6 +403,7 @@ mod tests {
             mut home: Home,
             limits: &RunLimits,
             stop: &StopSignal,
+            _broker: Box<dyn RunBroker + Send>,
         ) -> RunOutcome {
             (self.0)(event, &mut home, limits, stop)
         }
