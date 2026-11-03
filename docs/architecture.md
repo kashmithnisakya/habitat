@@ -168,7 +168,7 @@ These limits have gaps:
 | Platform | Approach | Limitation |
 |---|---|---|
 | macOS and Linux | Wasmtime | First targets for development. Apple silicon and Arm Linux are Tier 2 in Wasmtime |
-| Windows (next) | Wasmtime | The code only builds on Unix today, and needs its safety measures replacing, not just porting ([#56](https://github.com/kashmithnisakya/habitat/issues/56)). Windows on Arm is Tier 3 |
+| Windows | Wasmtime | Tested on x86-64, which is Tier 1 in Wasmtime. Windows on Arm is Tier 3. Its safety measures are in [`platform.rs`](../crates/core/src/platform.rs), and what's weaker is in the [threat model](threat-model.md#known-weak-spots) |
 | Android | Wasmtime | [Tier 3](https://docs.wasmtime.dev/stability-tiers.html) in Wasmtime, which it describes as not production ready |
 | iPhone and iPad (later) | Wasmtime's [Pulley interpreter](https://docs.wasmtime.dev/examples-pulley.html) | Android's Tier 3 caveat also applies, and Pulley is roughly 10x slower than native code |
 | Desktop microVM (later) | Second backend, possibly [libkrun](https://github.com/libkrun/libkrun) | The broker API has to work outside WebAssembly too |

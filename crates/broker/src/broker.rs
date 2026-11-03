@@ -404,6 +404,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeNetwork {
         pages: Arc<Mutex<HashMap<String, FakePage>>>,
+        /// Answers with a body of this many bytes, without holding it all in memory.
+        huge_body: Option<u64>,
         sent: Arc<Mutex<Vec<(String, FetchRequest)>>>,
         fails_with: Option<NetworkError>,
     }
@@ -444,6 +446,13 @@ mod tests {
                 .push((url.to_string(), request.clone()));
             if let Some(error) = self.fails_with {
                 return Err(error);
+            }
+            if let Some(size) = self.huge_body {
+                return Ok(Incoming {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Box::new(std::io::repeat(7).take(size)),
+                });
             }
             let pages = self.pages.lock().unwrap();
             let (status, headers, body) =
@@ -1080,6 +1089,25 @@ mod tests {
         let sent = network.sent.lock().unwrap();
         assert_eq!(sent[0].1.headers.len(), 1);
         assert!(sent[1].1.headers.is_empty());
+    }
+
+    #[test]
+    fn an_oversized_response_ends_in_an_error_and_one_at_the_limit_doesnt() {
+        for (size, ok) in [(MAX_RESPONSE_BYTES, true), (MAX_RESPONSE_BYTES + 1, false)] {
+            let network = FakeNetwork {
+                huge_body: Some(size),
+                ..FakeNetwork::default()
+            };
+            let (_fixture, mut broker) = fetch_setup(network);
+            broker.request_access(&host("a.example"), "please").unwrap();
+            let mut response = broker.http_fetch(get("https://a.example/")).ok().unwrap();
+            let copied = std::io::copy(&mut response.body, &mut std::io::sink());
+            if ok {
+                assert_eq!(copied.unwrap(), size);
+            } else {
+                assert_eq!(copied.unwrap_err().kind(), std::io::ErrorKind::FileTooLarge);
+            }
+        }
     }
 
     #[test]
