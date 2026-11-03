@@ -1,13 +1,54 @@
-// Draft agent API. It will change once it runs on real devices.
+// The agent API. See docs/agent-api.md, including the rules for changing this file.
 package habitat:host@0.1.0;
 
 interface types {
+    // Why a call failed. Messages are written by the host, and never hold host paths or secrets.
     variant home-error {
+        // This needs approval first, which the agent can ask for with request-access.
+        not-granted,
+        // Refused. Asking again won't help.
         denied(string),
         not-found,
-        limit-exceeded(string),
         invalid-request(string),
-        internal(string),
+        limit-exceeded(string),
+        timed-out,
+        // An outside service failed. Trying again later may work.
+        unavailable(string),
+        internal,
+    }
+
+    enum entry-kind {
+        file,
+        directory,
+    }
+
+    record dir-entry {
+        name: string,
+        kind: entry-kind,
+        // Always 0 for directories.
+        size: u64,
+    }
+
+    enum log-level {
+        debug,
+        info,
+        warning,
+        error,
+    }
+
+    // Data that arrives in pieces. Dropping it cancels whatever is producing the data.
+    resource byte-stream {
+        // Returns up to max-bytes, or none at the end. The host may return fewer.
+        read: func(max-bytes: u32) -> result<option<list<u8>>, home-error>;
+    }
+
+    enum http-method {
+        get,
+        head,
+        post,
+        put,
+        patch,
+        delete,
     }
 
     record header {
@@ -16,7 +57,7 @@ interface types {
     }
 
     record http-request {
-        method: string,
+        method: http-method,
         url: string,
         headers: list<header>,
         body: option<list<u8>>,
@@ -25,24 +66,50 @@ interface types {
     record http-response {
         status: u16,
         headers: list<header>,
-        body: list<u8>,
+        body: byte-stream,
+    }
+
+    enum model-role {
+        system,
+        user,
+        assistant,
+    }
+
+    record model-message {
+        role: model-role,
+        text: string,
     }
 
     record model-request {
         model: string,
-        prompt: string,
+        messages: list<model-message>,
         max-tokens: u32,
     }
 
-    record model-response {
-        text: string,
+    record token-usage {
         input-tokens: u32,
         output-tokens: u32,
     }
 
+    // A model's answer as it's produced. Dropping it cancels the request.
+    resource model-stream {
+        // Returns the next piece of text, or none at the end.
+        next: func() -> result<option<string>, home-error>;
+        // Returns the tokens used, once the end has been reached.
+        usage: func() -> option<token-usage>;
+    }
+
+    // One file the user chose. It's read-only, and lasts until the run ends.
+    resource user-file {
+        // The file's name, without its folder.
+        name: func() -> string;
+        size: func() -> u64;
+        // Returns up to max-bytes from offset, and nothing at the end. The host may return fewer.
+        read: func(offset: u64, max-bytes: u32) -> result<list<u8>, home-error>;
+    }
+
     variant access-target {
         network-host(string),
-        user-file(string),
         model(string),
     }
 
@@ -64,22 +131,42 @@ interface types {
 }
 
 interface agent-home {
-    use types.{home-error, http-request, http-response, model-request, model-response, access-target, grant};
+    use types.{home-error, dir-entry, log-level, http-request, http-response, model-request, model-stream, user-file, access-target, grant};
 
-    // Inside the agent's home: always allowed, within the disk limit.
-    read-file: func(path: string) -> result<list<u8>, home-error>;
+    // Inside the agent's home: always allowed, within the disk limit. Paths are relative to the
+    // home, and an empty path in list-dir means the home itself.
+
+    // Returns up to max-bytes from offset, and nothing at the end. The host may return fewer.
+    read-file: func(path: string, offset: u64, max-bytes: u32) -> result<list<u8>, home-error>;
+    // Replaces a whole file. After a crash it holds its old or new contents, never a mix.
     write-file: func(path: string, data: list<u8>) -> result<_, home-error>;
+    // Also removes any parent directories that this leaves empty.
+    remove-file: func(path: string) -> result<_, home-error>;
+    list-dir: func(path: string) -> result<list<dir-entry>, home-error>;
+
+    // Provided by the host, because agents have no other clock or source of randomness.
+    now-ms: func() -> u64;
+    random-bytes: func(count: u32) -> result<list<u8>, home-error>;
+
+    // Shows the user a message, marked as coming from this agent.
+    send-message: func(text: string) -> result<_, home-error>;
+    // Adds to the agent's own log, which isn't shown to the user. The host may drop messages.
+    log: func(level: log-level, message: string);
 
     // Outside the home: checked by the broker.
-    model-complete: func(request: model-request) -> result<model-response, home-error>;
+    model-complete: func(request: model-request) -> result<model-stream, home-error>;
     http-fetch: func(request: http-request) -> result<http-response, home-error>;
+    // The reason is shown to the user, marked as the agent's own claim.
     request-access: func(target: access-target, reason: string) -> result<grant, home-error>;
+    // Asks the user to choose a file. The agent never sees or names a path on the host.
+    pick-user-file: func(reason: string) -> result<user-file, home-error>;
 }
 
 world agent {
-    use types.{event, home-error};
+    use types.{event};
 
     import agent-home;
 
-    export handle-event: func(event: event) -> result<_, home-error>;
+    // On failure, returns a message that's treated as the agent's own claim.
+    export handle-event: func(event: event) -> result<_, string>;
 }

@@ -5,6 +5,7 @@ members = [
     "crates/backend-wasm",
     "crates/sdk",
     "crates/cli",
+    "examples/api-check",
 ]
 resolver = "3"
 
