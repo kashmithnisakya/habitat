@@ -50,6 +50,8 @@ impl fmt::Debug for SecretValue {
 pub struct SecretHeader {
     pub(crate) name: String,
     pub(crate) value: SecretValue,
+    /// Without its prefix, so that a server sending it back can be noticed.
+    pub(crate) bare: SecretValue,
 }
 
 #[cfg(test)]
@@ -384,6 +386,7 @@ impl Vault {
         Ok(SecretHeader {
             name: secret.header.clone(),
             value: SecretValue::new(header.to_vec()),
+            bare: value,
         })
     }
 }

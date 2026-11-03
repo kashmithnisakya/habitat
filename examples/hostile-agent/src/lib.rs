@@ -120,6 +120,47 @@ impl Guest for Agent {
                 api::request_access(&AccessTarget::Model(first.to_string()), rest),
             ),
             "fetch" => report(&format!("fetch {first}"), read_body(first, Vec::new())),
+            "ask-then-fetch" => {
+                let _ =
+                    api::request_access(&AccessTarget::NetworkHost(first.to_string()), "please");
+                report("fetch", read_body(rest, Vec::new()));
+            }
+            "ask-then-fetch-twice" => {
+                let _ =
+                    api::request_access(&AccessTarget::NetworkHost(first.to_string()), "please");
+                report("fetch", read_body(rest, Vec::new()));
+                report("fetch", read_body(rest, Vec::new()));
+            }
+            "ask-then-fetch-with-header" => {
+                let _ =
+                    api::request_access(&AccessTarget::NetworkHost(first.to_string()), "please");
+                let (url, header) = rest.split_once(' ').unwrap_or((rest, ""));
+                let (name, value) = header.split_once('=').unwrap_or((header, ""));
+                report(
+                    "fetch",
+                    read_body(url, vec![(name.to_string(), value.to_string())]),
+                );
+            }
+            "ask-then-model" => {
+                let _ = api::request_access(&AccessTarget::Model(first.to_string()), "please");
+                report("model", ask_model(rest));
+            }
+            "ask-then-model-twice" => {
+                let _ = api::request_access(&AccessTarget::Model(first.to_string()), "please");
+                report("model", ask_model(rest));
+                report("model", ask_model(rest));
+            }
+            "pick-then-fetch" => {
+                let _ = api::pick_user_file("please").map(|file| file.read(0, 1024));
+                report("fetch", read_body(first, Vec::new()));
+            }
+            "pick-then-ask" => {
+                let _ = api::pick_user_file("please").map(|file| file.read(0, 1024));
+                report(
+                    "ask",
+                    api::request_access(&AccessTarget::NetworkHost(first.to_string()), "please"),
+                );
+            }
             "fetch-with-header" => {
                 let (name, value) = rest.split_once('=').unwrap_or((rest, ""));
                 report(

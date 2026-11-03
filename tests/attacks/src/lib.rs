@@ -50,7 +50,6 @@ pub const ALLOWED_HOST: &str = "allowed.example";
 /// A second one, for checking one grant doesn't cover another.
 pub const ALSO_ALLOWED_HOST: &str = "also-allowed.example";
 const PROVIDER_HOST: &str = "api.anthropic.com";
-const MB: usize = 1024 * 1024;
 
 /// What a check found. A test that gets one has found a real problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +229,12 @@ impl Network for FakeNetwork {
 /// A keystore in memory, holding the planted secret.
 #[derive(Clone, Default)]
 pub struct FakeStore(Arc<Mutex<HashMap<String, Vec<u8>>>>);
+
+impl FakeStore {
+    pub fn get_for_tests(&self, name: &str) -> Option<Vec<u8>> {
+        self.0.lock().unwrap().get(name).cloned()
+    }
+}
 
 impl SecretStore for FakeStore {
     fn put(&self, name: &str, _: &SecretValue) -> Result<(), VaultError> {
@@ -647,6 +652,3 @@ pub fn no_breach(result: Result<(), Breach>) {
         panic!("{breach}");
     }
 }
-
-/// Plenty of room for what a test writes, without making a test slow.
-pub const ROOMY_MB: usize = MB;

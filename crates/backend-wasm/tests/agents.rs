@@ -1002,3 +1002,15 @@ fn an_agent_gets_the_reason_a_model_refused() {
     };
     assert!(message.contains("LimitExceeded"), "{message}");
 }
+
+#[test]
+fn a_run_can_only_hold_so_many_model_answers_open() {
+    let RunOutcome::Failed(message) = run_with_model("hold-answers 5", FakeModel(None)) else {
+        panic!("this should have failed");
+    };
+    assert!(message.contains("LimitExceeded"), "{message}");
+    assert_eq!(
+        run_with_model("hold-answers 4", FakeModel(None)),
+        RunOutcome::Completed
+    );
+}
