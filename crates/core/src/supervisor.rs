@@ -748,7 +748,13 @@ mod tests {
         let fixture = Fixture::new();
         let runs = fixture.agent_path().join("runs");
         let backend = FakeBackend::new(move |_, _, _, _| {
-            fs::remove_dir_all(&runs).unwrap();
+            // A folder where the run's next record would be written to first, so that it can't be.
+            let record = fs::read_dir(&runs).unwrap().next().unwrap().unwrap();
+            let name = record
+                .file_name()
+                .to_string_lossy()
+                .replace(".toml", ".new");
+            fs::create_dir(runs.join(name)).unwrap();
             RunOutcome::failed("how it went")
         });
         let supervisor = fixture.supervisor(backend);
