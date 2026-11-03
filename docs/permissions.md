@@ -74,6 +74,12 @@ Network hosts must be lowercase and contain a dot. Schemes, ports, paths and wil
 | Read a user file outside the home | Always asks, and the user chooses one file for the current run |
 | Read a raw secret | Never allowed |
 
+The [policy engine](../crates/broker/src/policy.rs) makes these decisions, and it's tested against this table. It holds no I/O, and anything that the table doesn't cover is denied. A few more details:
+
+- **Malformed requests are denied first.** A target has to follow the same rules as the manifest, and it has to match a declared name exactly. For example, `API.GITHUB.COM` and `api.github.com.` aren't `api.github.com`.
+- **A grant only counts while it's declared.** If a package no longer lists something, an old grant for it stops working.
+- **There's no asking for something that can't happen.** A run that has used up its token budget is denied, instead of prompting the user.
+
 ## Grant lifetimes
 
 | Lifetime | Meaning |
