@@ -55,8 +55,10 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_habitat"));
         command
             .current_dir(self.folder.path())
-            .env_remove("HABITAT_HOME")
             .env("HABITAT_HOME", self.root())
+            // So that even a bug can't reach the real folder of whoever runs these tests.
+            .env("HOME", self.path("no-such-home"))
+            .env_remove("XDG_DATA_HOME")
             .stdin(Stdio::null());
         command
     }
