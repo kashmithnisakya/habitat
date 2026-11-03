@@ -62,6 +62,7 @@ impl Guest for Agent {
                     std::hint::black_box(api::now_ms());
                 }
             }
+            "fetch" => fetch(first, rest),
             "ask-model" => {
                 let target = AccessTarget::Model(first.to_string());
                 api::request_access(&target, rest)
@@ -82,6 +83,36 @@ impl Guest for Agent {
 }
 
 static mut MEMORY: u32 = 0;
+
+/// Fetches a URL, reads all of it a little at a time, and checks how much there was, with the
+/// status at the start. For example, `fetch https://a.example/ 200:5`.
+fn fetch(url: &str, expected: &str) -> Result<(), String> {
+    use habitat_sdk::bindings::habitat::host::types::{HttpMethod, HttpRequest};
+
+    let response = api::http_fetch(&HttpRequest {
+        method: HttpMethod::Get,
+        url: url.to_string(),
+        headers: Vec::new(),
+        body: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let mut size = 0;
+    while let Some(piece) = response
+        .body
+        .read(1000)
+        .map_err(|error| error.to_string())?
+    {
+        if piece.len() > 1000 {
+            return Err("a read returned more than was asked for".to_string());
+        }
+        size += piece.len();
+    }
+    let got = format!("{}:{size}", response.status);
+    if got != expected {
+        return Err(format!("got {got}"));
+    }
+    Ok(())
+}
 
 /// Allocates and touches this many MB, and frees them again.
 fn allocate(megabytes: &str) -> Result<(), String> {

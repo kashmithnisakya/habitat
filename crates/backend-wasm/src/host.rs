@@ -3,22 +3,27 @@
 //! Everything here takes untrusted input from the agent. Calls that need the broker are denied
 //! until the broker exists.
 
+use std::io::{self, Read};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use habitat_core::backend::{AccessRefused, Lifetime, RunBroker, Target};
+use habitat_core::backend::{
+    AccessRefused, FetchError, FetchMethod, FetchRequest, Lifetime, RunBroker, Target,
+};
 use habitat_core::home::{EntryKind as HomeEntryKind, Home, HomeError as StoreError};
-use wasmtime::component::Resource;
+use wasmtime::component::{Resource, ResourceTable};
 use wasmtime::{ResourceLimiter, Result};
 
 use crate::bindings::habitat::host::agent_home;
 use crate::bindings::habitat::host::types::{
-    self, AccessTarget, ByteStream, DirEntry, EntryKind, Grant, GrantLifetime, HomeError,
-    HostByteStream, HostModelStream, HostUserFile, HttpRequest, HttpResponse, LogLevel,
+    self, AccessTarget, DirEntry, EntryKind, Grant, GrantLifetime, Header, HomeError,
+    HostByteStream, HostModelStream, HostUserFile, HttpMethod, HttpRequest, HttpResponse, LogLevel,
     ModelRequest, ModelStream, TokenUsage, UserFile,
 };
 
 /// The most that one read returns. Agents read larger files in pieces.
 const MAX_READ_BYTES: u32 = 1024 * 1024;
+/// How many response bodies one run can have open at once, since each can hold a connection.
+const MAX_OPEN_BODIES: usize = 16;
 /// The most random bytes that one call returns.
 const MAX_RANDOM_BYTES: u32 = 1024;
 
@@ -87,11 +92,16 @@ impl ResourceLimiter for Limiter {
     }
 }
 
+/// A response body that an agent is reading, and can stop reading by dropping it.
+pub struct OpenBody(Box<dyn Read + Send>);
+
 /// What one run of an agent can reach.
 pub(crate) struct HostState {
     home: Home,
     limiter: Limiter,
     broker: Box<dyn RunBroker + Send>,
+    table: ResourceTable,
+    open_bodies: usize,
 }
 
 impl HostState {
@@ -99,6 +109,8 @@ impl HostState {
         Self {
             home,
             broker,
+            table: ResourceTable::new(),
+            open_bodies: 0,
             limiter: Limiter {
                 limit: memory_bytes,
                 used: 0,
@@ -128,6 +140,18 @@ fn from_store(error: StoreError) -> HomeError {
             HomeError::LimitExceeded(error.to_string())
         }
         StoreError::Io(_) => HomeError::Internal,
+    }
+}
+
+fn from_fetch(error: FetchError) -> HomeError {
+    match error {
+        FetchError::NotGranted => HomeError::NotGranted,
+        FetchError::Denied(why) => HomeError::Denied(why),
+        FetchError::InvalidRequest(why) => HomeError::InvalidRequest(why),
+        FetchError::LimitExceeded(why) => HomeError::LimitExceeded(why),
+        FetchError::TimedOut => HomeError::TimedOut,
+        FetchError::Unavailable(why) => HomeError::Unavailable(why),
+        FetchError::Internal => HomeError::Internal,
     }
 }
 
@@ -200,8 +224,46 @@ impl agent_home::Host for HostState {
         needs_broker()
     }
 
-    fn http_fetch(&mut self, _request: HttpRequest) -> Result<HttpResponse, HomeError> {
-        needs_broker()
+    fn http_fetch(&mut self, request: HttpRequest) -> Result<HttpResponse, HomeError> {
+        if self.open_bodies >= MAX_OPEN_BODIES {
+            return Err(HomeError::LimitExceeded(format!(
+                "the limit is {MAX_OPEN_BODIES} response bodies at once"
+            )));
+        }
+        let response = self
+            .broker
+            .http_fetch(FetchRequest {
+                method: match request.method {
+                    HttpMethod::Get => FetchMethod::Get,
+                    HttpMethod::Head => FetchMethod::Head,
+                    HttpMethod::Post => FetchMethod::Post,
+                    HttpMethod::Put => FetchMethod::Put,
+                    HttpMethod::Patch => FetchMethod::Patch,
+                    HttpMethod::Delete => FetchMethod::Delete,
+                },
+                url: request.url,
+                headers: request
+                    .headers
+                    .into_iter()
+                    .map(|header| (header.name, header.value))
+                    .collect(),
+                body: request.body,
+            })
+            .map_err(from_fetch)?;
+        let body = self
+            .table
+            .push(OpenBody(response.body))
+            .map_err(|_| HomeError::Internal)?;
+        self.open_bodies += 1;
+        Ok(HttpResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|(name, value)| Header { name, value })
+                .collect(),
+            body,
+        })
     }
 
     fn request_access(&mut self, target: AccessTarget, reason: String) -> Result<Grant, HomeError> {
@@ -231,21 +293,44 @@ impl agent_home::Host for HostState {
 
 impl types::Host for HostState {}
 
-// Nothing can create these resources yet, so an agent can never hold one to call these with.
-
 impl HostByteStream for HostState {
     fn read(
         &mut self,
-        _stream: Resource<ByteStream>,
-        _max_bytes: u32,
+        stream: Resource<OpenBody>,
+        max_bytes: u32,
     ) -> Result<Option<Vec<u8>>, HomeError> {
-        needs_broker()
+        let body = self
+            .table
+            .get_mut(&stream)
+            .map_err(|_| HomeError::Internal)?;
+        let mut data = vec![0; max_bytes.min(MAX_READ_BYTES) as usize];
+        // Asking for nothing can't tell us whether it's the end, so that's what it gets.
+        if data.is_empty() {
+            return Ok(Some(data));
+        }
+        let count = body.0.read(&mut data).map_err(|error| match error.kind() {
+            io::ErrorKind::FileTooLarge => {
+                HomeError::LimitExceeded("the response is too large".to_string())
+            }
+            io::ErrorKind::TimedOut => HomeError::TimedOut,
+            _ => HomeError::Unavailable("reading the response failed".to_string()),
+        })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        data.truncate(count);
+        Ok(Some(data))
     }
 
-    fn drop(&mut self, _stream: Resource<ByteStream>) -> Result<()> {
+    fn drop(&mut self, stream: Resource<OpenBody>) -> Result<()> {
+        // Closing it cancels whatever's left of the download.
+        self.table.delete(stream)?;
+        self.open_bodies = self.open_bodies.saturating_sub(1);
         Ok(())
     }
 }
+
+// Nothing can create these resources yet, so an agent can never hold one to call these with.
 
 impl HostModelStream for HostState {
     fn next(&mut self, _stream: Resource<ModelStream>) -> Result<Option<String>, HomeError> {

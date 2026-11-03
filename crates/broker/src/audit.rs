@@ -82,6 +82,15 @@ pub enum AuditEvent {
         #[serde(with = "saved_target")]
         target: Target,
     },
+    /// A network request was made, and this is what came back. Only the host is recorded, because a
+    /// URL's path and query can hold private data.
+    Fetched {
+        #[serde(with = "saved_target")]
+        target: Target,
+        method: String,
+        /// 0 if nothing came back.
+        status: u16,
+    },
     /// The run has hit [`MAX_ENTRIES_PER_RUN`], so nothing else it asks for will be allowed.
     LimitReached,
     /// The run ended. This is one of a few words chosen by the supervisor.
@@ -321,6 +330,11 @@ pub fn describe(entry: &AuditEntry) -> String {
             format!("allowed {} {lasting}", target(asked))
         }
         AuditEvent::Refused { target: asked } => format!("refused {}", target(asked)),
+        AuditEvent::Fetched {
+            target: asked,
+            method,
+            status,
+        } => format!("{} to {} gave {status}", printable(method), target(asked)),
         AuditEvent::LimitReached => "reached the limit on requests".to_string(),
         AuditEvent::RunEnded { how } => format!("run ended: {}", printable(how)),
     };

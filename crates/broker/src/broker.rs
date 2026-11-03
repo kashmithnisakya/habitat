@@ -1,8 +1,12 @@
 //! Puts the policy, the grants and the user together, for each request that one run makes.
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use habitat_core::backend::{AccessRefused, BrokerFactory, Lifetime, RunBroker, RunLimits, Target};
+use habitat_core::backend::{
+    AccessRefused, BrokerFactory, FetchError, FetchMethod, FetchRequest, FetchResponse, Lifetime,
+    RunBroker, RunLimits, Target,
+};
 use habitat_core::home::AgentStorage;
 use habitat_core::manifest::Manifest;
 
@@ -10,18 +14,33 @@ use habitat_core::run_log::RunId;
 
 use crate::approval::{ANSWER_TIME, Answer, Approver, Prompt, PromptLimit};
 use crate::audit::{AuditError, AuditEvent, AuditLog};
+use crate::gateway::{
+    CheckedUrl, Incoming, LimitedBody, MAX_HOP_TIME, MAX_REDIRECTS, MAX_RESPONSE_BYTES, Network,
+    NetworkError, RealNetwork, check_request, check_url, clean_response_headers, follow,
+    redirected,
+};
 use crate::grants::RunGrants;
 use crate::policy::{Action, Context, Decision, DenyReason, decide};
 
 /// Makes a broker for each run, which asks the user through the given shell.
 pub struct Broker {
     approver: Arc<dyn Approver>,
+    network: Arc<dyn Network>,
 }
 
 impl Broker {
     pub fn new(approver: impl Approver + 'static) -> Self {
+        Self::with_network(approver, RealNetwork::new())
+    }
+
+    /// The same, using this in place of the real network.
+    pub fn with_network(
+        approver: impl Approver + 'static,
+        network: impl Network + 'static,
+    ) -> Self {
         Self {
             approver: Arc::new(approver),
+            network: Arc::new(network),
         }
     }
 }
@@ -40,7 +59,7 @@ impl BrokerFactory for Broker {
         &self,
         storage: &AgentStorage,
         manifest: &Manifest,
-        _limits: &RunLimits,
+        limits: &RunLimits,
         run_id: RunId,
     ) -> Box<dyn RunBroker + Send> {
         Box::new(ForRun {
@@ -48,8 +67,10 @@ impl BrokerFactory for Broker {
             manifest: manifest.clone(),
             grants: RunGrants::new(storage.clone()),
             approver: Arc::clone(&self.approver),
+            network: Arc::clone(&self.network),
             limit: PromptLimit::default(),
             tokens_left: manifest.limits().model_budget_tokens,
+            deadline: Instant::now() + limits.run_time,
         })
     }
 }
@@ -60,8 +81,11 @@ struct ForRun {
     manifest: Manifest,
     grants: RunGrants,
     approver: Arc<dyn Approver>,
+    network: Arc<dyn Network>,
     limit: PromptLimit,
     tokens_left: u64,
+    /// When the run's time is up. A call can't be interrupted, so it has to stop by itself.
+    deadline: Instant,
 }
 
 fn refused(reason: DenyReason) -> AccessRefused {
@@ -112,6 +136,121 @@ impl RunBroker for ForRun {
         let result = self.decide_request(target, reason);
         self.logged(target, result)
     }
+
+    fn http_fetch(&mut self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        let mut url = check_url(&request.url).map_err(invalid_request)?;
+        check_request(&request).map_err(invalid_request)?;
+        let mut request = request;
+        for _ in 0..=MAX_REDIRECTS {
+            let incoming = self.one_hop(&url, &request)?;
+            if let Some(location) = redirect_location(&incoming) {
+                let next = follow(&url, location).map_err(|_| {
+                    FetchError::Denied(
+                        "the site redirected somewhere that isn't allowed".to_string(),
+                    )
+                })?;
+                request = redirected(request, incoming.status, next.host == url.host);
+                url = next;
+                continue;
+            }
+            return Ok(FetchResponse {
+                status: incoming.status,
+                headers: clean_response_headers(incoming.headers),
+                body: Box::new(LimitedBody {
+                    inner: incoming.body,
+                    left: MAX_RESPONSE_BYTES,
+                }),
+            });
+        }
+        Err(FetchError::LimitExceeded("too many redirects".to_string()))
+    }
+}
+
+fn invalid_request(reason: &str) -> FetchError {
+    FetchError::InvalidRequest(reason.to_string())
+}
+
+/// Where a response redirects to, if it does.
+fn redirect_location(incoming: &Incoming) -> Option<&str> {
+    if !matches!(incoming.status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    incoming
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.as_str())
+}
+
+fn method_name(method: FetchMethod) -> &'static str {
+    match method {
+        FetchMethod::Get => "GET",
+        FetchMethod::Head => "HEAD",
+        FetchMethod::Post => "POST",
+        FetchMethod::Put => "PUT",
+        FetchMethod::Patch => "PATCH",
+        FetchMethod::Delete => "DELETE",
+    }
+}
+
+impl ForRun {
+    fn log_for_fetch(&mut self, event: AuditEvent) -> Result<(), FetchError> {
+        self.log(event).map_err(|refused| match refused {
+            AccessRefused::LimitExceeded(why) => FetchError::LimitExceeded(why),
+            _ => FetchError::Internal,
+        })
+    }
+
+    /// Makes one request to one host, after checking the policy for it, as every hop has to.
+    fn one_hop(
+        &mut self,
+        url: &CheckedUrl,
+        request: &FetchRequest,
+    ) -> Result<Incoming, FetchError> {
+        let target = Target::NetworkHost(url.host.clone());
+        self.log_for_fetch(AuditEvent::Requested {
+            target: target.clone(),
+        })?;
+        let context = Context {
+            manifest: &self.manifest,
+            grants: &self.grants,
+            tokens_left: self.tokens_left,
+        };
+        let refused = match decide(&context, &Action::Reach(target.clone())) {
+            Decision::Allow => None,
+            Decision::Ask => Some(FetchError::NotGranted),
+            Decision::Deny(reason) => Some(FetchError::Denied(reason.to_string())),
+        };
+        if let Some(refused) = refused {
+            self.log_for_fetch(AuditEvent::Refused { target })?;
+            return Err(refused);
+        }
+        // A grant for one request is used up from here, whatever happens next.
+        self.grants.used(&target);
+
+        let wait = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default()
+            .min(MAX_HOP_TIME);
+        if wait.is_zero() {
+            return Err(FetchError::TimedOut);
+        }
+        let method = method_name(request.method).to_string();
+        let result = self.network.send(url, request, wait);
+        self.log_for_fetch(AuditEvent::Fetched {
+            target,
+            method,
+            status: result.as_ref().map_or(0, |incoming| incoming.status),
+        })?;
+        result.map_err(|error| match error {
+            NetworkError::TimedOut => FetchError::TimedOut,
+            NetworkError::Blocked => {
+                FetchError::Denied("that site's address isn't on the public internet".to_string())
+            }
+            NetworkError::Failed => FetchError::Unavailable("the request failed".to_string()),
+        })
+    }
 }
 
 impl ForRun {
@@ -154,7 +293,9 @@ impl ForRun {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
+    use std::io::Read;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -179,6 +320,68 @@ mod tests {
         network = ["a.example", "b.example", "c.example", "d.example", "e.example", "f.example", "g.example"]
         models = ["default"]
     "#;
+
+    /// A status, headers and body.
+    type FakePage = (u16, Vec<(String, String)>, Vec<u8>);
+
+    /// Answers each host with what it's told to, and remembers what it was asked for.
+    #[derive(Clone, Default)]
+    struct FakeNetwork {
+        pages: Arc<Mutex<HashMap<String, FakePage>>>,
+        sent: Arc<Mutex<Vec<(String, FetchRequest)>>>,
+        fails_with: Option<NetworkError>,
+    }
+
+    impl FakeNetwork {
+        fn page(self, url: &str, status: u16, headers: &[(&str, &str)], body: &[u8]) -> Self {
+            let headers = headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            self.pages
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), (status, headers, body.to_vec()));
+            self
+        }
+
+        fn urls_sent(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(url, _)| url.clone())
+                .collect()
+        }
+    }
+
+    impl Network for FakeNetwork {
+        fn send(
+            &self,
+            url: &CheckedUrl,
+            request: &FetchRequest,
+            _wait: Duration,
+        ) -> Result<Incoming, NetworkError> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((url.to_string(), request.clone()));
+            if let Some(error) = self.fails_with {
+                return Err(error);
+            }
+            let pages = self.pages.lock().unwrap();
+            let (status, headers, body) =
+                pages
+                    .get(&url.to_string())
+                    .cloned()
+                    .unwrap_or((404, vec![], vec![]));
+            Ok(Incoming {
+                status,
+                headers,
+                body: Box::new(std::io::Cursor::new(body)),
+            })
+        }
+    }
 
     /// Gives the same answer each time, and remembers what it was asked.
     #[derive(Clone)]
@@ -230,7 +433,12 @@ mod tests {
                 disk_bytes: 1,
             };
             let run_id = RunId::parse(&"1".repeat(32)).unwrap();
-            Broker::new(approver).for_run(&self.storage, &manifest, &limits, run_id)
+            Broker::with_network(approver, FakeNetwork::default()).for_run(
+                &self.storage,
+                &manifest,
+                &limits,
+                run_id,
+            )
         }
     }
 
@@ -444,8 +652,10 @@ mod tests {
             manifest: manifest.clone(),
             grants: RunGrants::new(fixture.storage.clone()),
             approver: Arc::new(Scripted::new(Answer::Allow(Lifetime::UntilRevoked))),
+            network: Arc::new(FakeNetwork::default()),
             limit: PromptLimit::default(),
             tokens_left: 0,
+            deadline: Instant::now() + Duration::from_secs(60),
         };
         // This takes the last entry to record the request, and the next to say that's the limit.
         assert!(matches!(
@@ -482,6 +692,347 @@ mod tests {
             broker.request_access(&host("a.example"), "please"),
             Ok(Lifetime::UntilRevoked)
         );
+    }
+
+    fn fetch_setup(network: FakeNetwork) -> (Fixture, Box<dyn RunBroker + Send>) {
+        fetch_setup_with(
+            network,
+            Answer::Allow(Lifetime::UntilRevoked),
+            Duration::from_secs(60),
+        )
+    }
+
+    fn fetch_setup_with(
+        network: FakeNetwork,
+        answer: Answer,
+        run_time: Duration,
+    ) -> (Fixture, Box<dyn RunBroker + Send>) {
+        let fixture = Fixture::new();
+        let manifest = Manifest::parse(MANIFEST).unwrap();
+        let limits = RunLimits {
+            memory_bytes: 1,
+            run_time,
+            disk_bytes: 1,
+        };
+        let run_id = RunId::parse(&"1".repeat(32)).unwrap();
+        let broker = Broker::with_network(Scripted::new(answer), network).for_run(
+            &fixture.storage,
+            &manifest,
+            &limits,
+            run_id,
+        );
+        (fixture, broker)
+    }
+
+    fn get(url: &str) -> FetchRequest {
+        FetchRequest {
+            method: FetchMethod::Get,
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
+    fn fetch_events(fixture: &Fixture) -> Vec<AuditEvent> {
+        verify(&fixture.storage)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.event)
+            .collect()
+    }
+
+    #[test]
+    fn a_fetch_without_a_grant_says_so_and_sends_nothing() {
+        let network = FakeNetwork::default();
+        let (_fixture, mut broker) = fetch_setup(network.clone());
+        assert_eq!(
+            broker.http_fetch(get("https://a.example/")).err(),
+            Some(FetchError::NotGranted)
+        );
+        assert!(network.urls_sent().is_empty());
+    }
+
+    #[test]
+    fn a_fetch_of_something_undeclared_is_denied_and_sends_nothing() {
+        let network = FakeNetwork::default();
+        let (_fixture, mut broker) = fetch_setup(network.clone());
+        broker.request_access(&host("a.example"), "please").unwrap();
+        assert!(matches!(
+            broker.http_fetch(get("https://evil.example/")),
+            Err(FetchError::Denied(_))
+        ));
+        assert!(network.urls_sent().is_empty());
+    }
+
+    #[test]
+    fn a_bad_url_or_header_sends_nothing() {
+        let network = FakeNetwork::default();
+        let (_fixture, mut broker) = fetch_setup(network.clone());
+        broker.request_access(&host("a.example"), "please").unwrap();
+        for url in [
+            "http://a.example/",
+            "https://user@a.example/",
+            "https://a.example:8443/",
+        ] {
+            assert!(
+                matches!(
+                    broker.http_fetch(get(url)),
+                    Err(FetchError::InvalidRequest(_))
+                ),
+                "{url}"
+            );
+        }
+        let mut request = get("https://a.example/");
+        request
+            .headers
+            .push(("Host".to_string(), "evil.example".to_string()));
+        assert!(matches!(
+            broker.http_fetch(request),
+            Err(FetchError::InvalidRequest(_))
+        ));
+        assert!(network.urls_sent().is_empty());
+    }
+
+    #[test]
+    fn an_allowed_fetch_returns_the_page_and_is_logged() {
+        let network = FakeNetwork::default().page(
+            "https://a.example/page?secret=1",
+            200,
+            &[("Content-Type", "text/plain"), ("Set-Cookie", "session=x")],
+            b"hello",
+        );
+        let (fixture, mut broker) = fetch_setup(network);
+        broker.request_access(&host("a.example"), "please").unwrap();
+        let mut response = broker
+            .http_fetch(get("https://a.example/page?secret=1"))
+            .ok()
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.headers,
+            [("Content-Type".to_string(), "text/plain".to_string())]
+        );
+        let mut body = String::new();
+        response.body.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "hello");
+
+        assert!(fetch_events(&fixture).contains(&AuditEvent::Fetched {
+            target: host("a.example"),
+            method: "GET".to_string(),
+            status: 200,
+        }));
+        // The path and query aren't logged, as they can hold private data.
+        let text = fs::read_to_string(fixture.storage.audit_path()).unwrap();
+        assert!(!text.contains("secret"), "{text}");
+    }
+
+    #[test]
+    fn a_redirect_to_an_approved_host_is_followed_and_each_hop_checked() {
+        let network = FakeNetwork::default()
+            .page(
+                "https://a.example/",
+                302,
+                &[("Location", "https://b.example/next")],
+                b"",
+            )
+            .page("https://b.example/next", 200, &[], b"arrived");
+        let (fixture, mut broker) = fetch_setup(network.clone());
+        broker.request_access(&host("a.example"), "please").unwrap();
+        broker.request_access(&host("b.example"), "please").unwrap();
+        let response = broker.http_fetch(get("https://a.example/")).ok().unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            network.urls_sent(),
+            ["https://a.example/", "https://b.example/next"]
+        );
+        let events = fetch_events(&fixture);
+        for name in ["a.example", "b.example"] {
+            assert!(events.contains(&AuditEvent::Requested { target: host(name) }));
+        }
+    }
+
+    #[test]
+    fn a_redirect_to_an_unapproved_host_goes_no_further() {
+        let network = FakeNetwork::default().page(
+            "https://a.example/",
+            302,
+            &[("Location", "https://b.example/")],
+            b"",
+        );
+        let (fixture, mut broker) = fetch_setup(network.clone());
+        broker.request_access(&host("a.example"), "please").unwrap();
+        assert_eq!(
+            broker.http_fetch(get("https://a.example/")).err(),
+            Some(FetchError::NotGranted)
+        );
+        assert_eq!(network.urls_sent(), ["https://a.example/"]);
+        assert!(fetch_events(&fixture).contains(&AuditEvent::Refused {
+            target: host("b.example")
+        }));
+    }
+
+    #[test]
+    fn a_redirect_to_an_undeclared_host_is_denied() {
+        let network = FakeNetwork::default().page(
+            "https://a.example/",
+            302,
+            &[("Location", "https://evil.example/")],
+            b"",
+        );
+        let (_fixture, mut broker) = fetch_setup(network.clone());
+        broker.request_access(&host("a.example"), "please").unwrap();
+        assert!(matches!(
+            broker.http_fetch(get("https://a.example/")),
+            Err(FetchError::Denied(_))
+        ));
+        assert_eq!(network.urls_sent().len(), 1);
+    }
+
+    #[test]
+    fn redirects_to_anything_but_https_are_denied() {
+        for location in [
+            "http://a.example/",
+            "file:///etc/passwd",
+            "//evil.example/",
+            "https://127.0.0.1/",
+        ] {
+            let network = FakeNetwork::default().page(
+                "https://a.example/",
+                302,
+                &[("Location", location)],
+                b"",
+            );
+            let (_fixture, mut broker) = fetch_setup(network.clone());
+            broker.request_access(&host("a.example"), "please").unwrap();
+            assert!(
+                matches!(
+                    broker.http_fetch(get("https://a.example/")),
+                    Err(FetchError::Denied(_))
+                ),
+                "{location}"
+            );
+            assert_eq!(network.urls_sent().len(), 1, "{location}");
+        }
+    }
+
+    #[test]
+    fn a_grant_for_one_request_only_covers_one_hop() {
+        let network = FakeNetwork::default()
+            .page("https://a.example/", 302, &[("Location", "/next")], b"")
+            .page("https://a.example/next", 200, &[], b"");
+        let (_fixture, mut broker) = fetch_setup_with(
+            network.clone(),
+            Answer::Allow(Lifetime::Once),
+            Duration::from_secs(60),
+        );
+        broker.request_access(&host("a.example"), "please").unwrap();
+        assert_eq!(
+            broker.http_fetch(get("https://a.example/")).err(),
+            Some(FetchError::NotGranted)
+        );
+        assert_eq!(network.urls_sent(), ["https://a.example/"]);
+    }
+
+    #[test]
+    fn redirect_loops_stop_at_the_limit() {
+        let network = FakeNetwork::default().page(
+            "https://a.example/",
+            302,
+            &[("Location", "https://a.example/")],
+            b"",
+        );
+        let (_fixture, mut broker) = fetch_setup(network.clone());
+        broker.request_access(&host("a.example"), "please").unwrap();
+        assert!(matches!(
+            broker.http_fetch(get("https://a.example/")),
+            Err(FetchError::LimitExceeded(_))
+        ));
+        assert_eq!(network.urls_sent().len(), MAX_REDIRECTS as usize + 1);
+    }
+
+    #[test]
+    fn a_redirect_with_nowhere_to_go_is_just_a_response() {
+        let network = FakeNetwork::default().page("https://a.example/", 302, &[], b"odd");
+        let (_fixture, mut broker) = fetch_setup(network);
+        broker.request_access(&host("a.example"), "please").unwrap();
+        assert_eq!(
+            broker
+                .http_fetch(get("https://a.example/"))
+                .ok()
+                .unwrap()
+                .status,
+            302
+        );
+    }
+
+    #[test]
+    fn a_redirect_to_another_host_doesnt_carry_credentials() {
+        let network = FakeNetwork::default()
+            .page(
+                "https://a.example/",
+                302,
+                &[("Location", "https://b.example/")],
+                b"",
+            )
+            .page("https://b.example/", 200, &[], b"");
+        let (_fixture, mut broker) = fetch_setup(network.clone());
+        broker.request_access(&host("a.example"), "please").unwrap();
+        broker.request_access(&host("b.example"), "please").unwrap();
+        let mut request = get("https://a.example/");
+        request
+            .headers
+            .push(("Authorization".to_string(), "secret".to_string()));
+        assert!(broker.http_fetch(request).is_ok());
+        let sent = network.sent.lock().unwrap();
+        assert_eq!(sent[0].1.headers.len(), 1);
+        assert!(sent[1].1.headers.is_empty());
+    }
+
+    #[test]
+    fn network_failures_are_reported_and_logged() {
+        for (error, check) in [
+            (NetworkError::TimedOut, FetchError::TimedOut),
+            (
+                NetworkError::Failed,
+                FetchError::Unavailable("the request failed".to_string()),
+            ),
+            (
+                NetworkError::Blocked,
+                FetchError::Denied("that site's address isn't on the public internet".to_string()),
+            ),
+        ] {
+            let network = FakeNetwork {
+                fails_with: Some(error),
+                ..FakeNetwork::default()
+            };
+            let (fixture, mut broker) = fetch_setup(network);
+            broker.request_access(&host("a.example"), "please").unwrap();
+            assert_eq!(
+                broker.http_fetch(get("https://a.example/")).err(),
+                Some(check)
+            );
+            assert!(fetch_events(&fixture).contains(&AuditEvent::Fetched {
+                target: host("a.example"),
+                method: "GET".to_string(),
+                status: 0,
+            }));
+        }
+    }
+
+    #[test]
+    fn a_fetch_after_the_runs_time_is_up_sends_nothing() {
+        let network = FakeNetwork::default().page("https://a.example/", 200, &[], b"");
+        let (_fixture, mut broker) = fetch_setup_with(
+            network.clone(),
+            Answer::Allow(Lifetime::ThisRun),
+            Duration::ZERO,
+        );
+        broker.request_access(&host("a.example"), "please").unwrap();
+        assert_eq!(
+            broker.http_fetch(get("https://a.example/")).err(),
+            Some(FetchError::TimedOut)
+        );
+        assert!(network.urls_sent().is_empty());
     }
 
     #[test]

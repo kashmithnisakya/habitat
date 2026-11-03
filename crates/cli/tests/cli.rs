@@ -633,6 +633,34 @@ fn a_changed_log_is_reported_and_agents_cant_reach_outside() {
 }
 
 #[test]
+fn a_fetch_needs_a_grant_and_everything_is_logged() {
+    let fixture = installed_asking_agent();
+    fails_with(
+        &fixture.run(&["run", AGENT, "fetch https://allowed.example/page 200:0"]),
+        3,
+        "NotGranted",
+    );
+    fails_with(
+        &fixture.run(&["run", AGENT, "fetch https://evil.example/ 200:0"]),
+        3,
+        "Denied",
+    );
+    fails_with(
+        &fixture.run(&["run", AGENT, "fetch http://allowed.example/ 200:0"]),
+        3,
+        "InvalidRequest",
+    );
+    let log = stdout(&fixture.run(&["log", AGENT]));
+    assert!(
+        log.contains("refused network host allowed.example"),
+        "{log}"
+    );
+    assert!(log.contains("refused network host evil.example"), "{log}");
+    assert!(!log.contains("/page"), "{log}");
+    succeeds(&fixture.run(&["log", AGENT, "--verify"]));
+}
+
+#[test]
 fn with_nobody_to_answer_it_means_no() {
     let fixture = installed_asking_agent();
     // `run` gives it no stdin at all.

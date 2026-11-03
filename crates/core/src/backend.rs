@@ -4,6 +4,7 @@
 //! backend could implement them later. See `docs/architecture.md`.
 
 use std::fmt;
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -64,11 +65,57 @@ pub enum AccessRefused {
     Internal,
 }
 
+/// An HTTP method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchMethod {
+    Get,
+    Head,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+/// A network request from an agent. All of this is untrusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchRequest {
+    pub method: FetchMethod,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+/// A response on its way back to an agent. Reading its body fails, instead of ending early, if it
+/// goes over a limit or takes too long.
+pub struct FetchResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Box<dyn Read + Send>,
+}
+
+/// Why a network request didn't work. Text in here comes from the host, never from the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    /// This needs approval first, which the agent can ask for.
+    NotGranted,
+    Denied(String),
+    InvalidRequest(String),
+    LimitExceeded(String),
+    TimedOut,
+    Unavailable(String),
+    Internal,
+}
+
 /// What one run of an agent can ask of the world outside its home. A backend passes each request
 /// here, and never decides anything itself.
 pub trait RunBroker {
     /// Asks for access to something. The reason is the agent's own claim, and it's untrusted.
     fn request_access(&mut self, target: &Target, reason: &str) -> Result<Lifetime, AccessRefused>;
+
+    /// Makes a network request.
+    fn http_fetch(&mut self, _request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        Err(FetchError::Denied("this isn't available".to_string()))
+    }
 }
 
 /// A broker that refuses everything, for a host that has nothing else.
