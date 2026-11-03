@@ -6,7 +6,10 @@ use habitat_core::backend::{AccessRefused, BrokerFactory, Lifetime, RunBroker, R
 use habitat_core::home::AgentStorage;
 use habitat_core::manifest::Manifest;
 
+use habitat_core::run_log::RunId;
+
 use crate::approval::{ANSWER_TIME, Answer, Approver, Prompt, PromptLimit};
+use crate::audit::{AuditError, AuditEvent, AuditLog};
 use crate::grants::RunGrants;
 use crate::policy::{Action, Context, Decision, DenyReason, decide};
 
@@ -24,13 +27,24 @@ impl Broker {
 }
 
 impl BrokerFactory for Broker {
+    fn run_ended(&self, storage: &AgentStorage, run_id: RunId, how: &str) {
+        // The run's record has this too, so there's nothing more to do if it can't be logged.
+        if let Ok(mut audit) = AuditLog::open(storage, run_id) {
+            let _ = audit.append(&AuditEvent::RunEnded {
+                how: how.to_string(),
+            });
+        }
+    }
+
     fn for_run(
         &self,
         storage: &AgentStorage,
         manifest: &Manifest,
         _limits: &RunLimits,
+        run_id: RunId,
     ) -> Box<dyn RunBroker + Send> {
         Box::new(ForRun {
+            audit: AuditLog::open(storage, run_id),
             manifest: manifest.clone(),
             grants: RunGrants::new(storage.clone()),
             approver: Arc::clone(&self.approver),
@@ -42,6 +56,7 @@ impl BrokerFactory for Broker {
 
 /// The broker for one run. Nothing here outlives the run, except a grant until revoked.
 struct ForRun {
+    audit: Result<AuditLog, AuditError>,
     manifest: Manifest,
     grants: RunGrants,
     approver: Arc<dyn Approver>,
@@ -56,8 +71,51 @@ fn refused(reason: DenyReason) -> AccessRefused {
     }
 }
 
+impl ForRun {
+    /// Records something. If it can't be recorded, nothing else gets to happen.
+    fn log(&mut self, event: AuditEvent) -> Result<(), AccessRefused> {
+        let audit = self.audit.as_mut().map_err(|_| AccessRefused::Internal)?;
+        match audit.append(&event) {
+            Ok(()) => Ok(()),
+            Err(AuditError::TooManyEntries) => Err(AccessRefused::LimitExceeded(
+                "this run has made too many requests".to_string(),
+            )),
+            Err(_) => Err(AccessRefused::Internal),
+        }
+    }
+
+    fn logged(
+        &mut self,
+        target: &Target,
+        result: Result<Lifetime, AccessRefused>,
+    ) -> Result<Lifetime, AccessRefused> {
+        let event = match &result {
+            Ok(lifetime) => AuditEvent::Allowed {
+                target: target.clone(),
+                lifetime: *lifetime,
+            },
+            Err(_) => AuditEvent::Refused {
+                target: target.clone(),
+            },
+        };
+        // It's already been decided, so if a yes can't be recorded, it turns into a no.
+        self.log(event)?;
+        result
+    }
+}
+
 impl RunBroker for ForRun {
     fn request_access(&mut self, target: &Target, reason: &str) -> Result<Lifetime, AccessRefused> {
+        self.log(AuditEvent::Requested {
+            target: target.clone(),
+        })?;
+        let result = self.decide_request(target, reason);
+        self.logged(target, result)
+    }
+}
+
+impl ForRun {
+    fn decide_request(&mut self, target: &Target, reason: &str) -> Result<Lifetime, AccessRefused> {
         let context = Context {
             manifest: &self.manifest,
             grants: &self.grants,
@@ -96,6 +154,7 @@ impl RunBroker for ForRun {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -103,6 +162,7 @@ mod tests {
 
     use super::*;
     use crate::approval::{MAX_PROMPTS_PER_RUN, NobodyThere};
+    use crate::audit::{MAX_ENTRIES_PER_RUN, verify};
 
     const MANIFEST: &str = r#"
         [agent]
@@ -169,7 +229,8 @@ mod tests {
                 run_time: Duration::from_secs(1),
                 disk_bytes: 1,
             };
-            Broker::new(approver).for_run(&self.storage, &manifest, &limits)
+            let run_id = RunId::parse(&"1".repeat(32)).unwrap();
+            Broker::new(approver).for_run(&self.storage, &manifest, &limits, run_id)
         }
     }
 
@@ -289,6 +350,138 @@ mod tests {
                 .unwrap();
             assert_eq!(approver.times_asked(), 2, "{lifetime:?}");
         }
+    }
+
+    #[test]
+    fn every_request_and_decision_is_logged_with_its_run() {
+        let fixture = Fixture::new();
+        let mut broker = fixture.run(Scripted::new(Answer::Deny));
+        let _ = broker.request_access(&host("a.example"), "because");
+        let _ = broker.request_access(&host("evil.example"), "because");
+        drop(broker);
+        let mut broker = fixture.run(Scripted::new(Answer::Allow(Lifetime::Once)));
+        broker
+            .request_access(&host("b.example"), "because")
+            .unwrap();
+
+        let entries = verify(&fixture.storage).unwrap();
+        let events: Vec<AuditEvent> = entries.iter().map(|entry| entry.event.clone()).collect();
+        assert_eq!(
+            events,
+            [
+                AuditEvent::Requested {
+                    target: host("a.example")
+                },
+                AuditEvent::Refused {
+                    target: host("a.example")
+                },
+                AuditEvent::Requested {
+                    target: host("evil.example")
+                },
+                AuditEvent::Refused {
+                    target: host("evil.example")
+                },
+                AuditEvent::Requested {
+                    target: host("b.example")
+                },
+                AuditEvent::Allowed {
+                    target: host("b.example"),
+                    lifetime: Lifetime::Once
+                },
+            ]
+        );
+        assert!(entries.iter().all(|entry| entry.run == "1".repeat(32)));
+    }
+
+    #[test]
+    fn what_the_agent_says_isnt_logged() {
+        let fixture = Fixture::new();
+        let mut broker = fixture.run(Scripted::new(Answer::Deny));
+        let _ = broker.request_access(&host("a.example"), "sk-ant-SECRET-KEY");
+        let text = fs::read_to_string(fixture.storage.audit_path()).unwrap();
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[test]
+    fn a_request_that_cant_be_logged_is_refused_without_asking() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.storage.audit_path()).unwrap();
+        let approver = Scripted::new(Answer::Allow(Lifetime::UntilRevoked));
+        let mut broker = fixture.run(approver.clone());
+        assert_eq!(
+            broker.request_access(&host("a.example"), "please"),
+            Err(AccessRefused::Internal)
+        );
+        assert_eq!(approver.times_asked(), 0);
+        assert!(!fixture.storage.grants_path().exists());
+    }
+
+    #[test]
+    fn a_request_is_refused_if_logging_starts_failing_part_way_through_a_run() {
+        let fixture = Fixture::new();
+        let approver = Scripted::new(Answer::Allow(Lifetime::UntilRevoked));
+        let mut broker = fixture.run(approver.clone());
+        broker.request_access(&host("a.example"), "please").unwrap();
+        // A folder where the next write of the log's position goes, so that it can't happen.
+        let blocked = fixture.storage.audit_path().with_extension("head-new");
+        fs::create_dir(&blocked).unwrap();
+        assert_eq!(
+            broker.request_access(&host("b.example"), "please"),
+            Err(AccessRefused::Internal)
+        );
+        assert_eq!(approver.times_asked(), 1);
+    }
+
+    #[test]
+    fn a_flood_of_requests_stops_at_the_limit() {
+        let fixture = Fixture::new();
+        let manifest = Manifest::parse(MANIFEST).unwrap();
+        let run_id = RunId::parse(&"1".repeat(32)).unwrap();
+        let mut audit = AuditLog::open(&fixture.storage, run_id).unwrap();
+        audit.skip_ahead(MAX_ENTRIES_PER_RUN - 1);
+        let mut broker = ForRun {
+            audit: Ok(audit),
+            manifest: manifest.clone(),
+            grants: RunGrants::new(fixture.storage.clone()),
+            approver: Arc::new(Scripted::new(Answer::Allow(Lifetime::UntilRevoked))),
+            limit: PromptLimit::default(),
+            tokens_left: 0,
+        };
+        // This takes the last entry to record the request, and the next to say that's the limit.
+        assert!(matches!(
+            broker.request_access(&host("a.example"), "please"),
+            Err(AccessRefused::LimitExceeded(_))
+        ));
+        assert!(matches!(
+            broker.request_access(&host("a.example"), "please"),
+            Err(AccessRefused::LimitExceeded(_))
+        ));
+        // The log says that it stopped, and it still checks out.
+        let entries = verify(&fixture.storage).unwrap();
+        assert!(matches!(
+            entries[entries.len() - 1].event,
+            AuditEvent::LimitReached
+        ));
+    }
+
+    #[test]
+    fn an_agent_is_told_how_long_its_access_lasts() {
+        let fixture = Fixture::new();
+        let mut broker = fixture.run(Scripted::new(Answer::Allow(Lifetime::UntilRevoked)));
+        assert_eq!(
+            broker.request_access(&host("a.example"), "please"),
+            Ok(Lifetime::UntilRevoked)
+        );
+        // It already has this, so nobody's asked, and the answer's the same.
+        assert_eq!(
+            broker.request_access(&host("a.example"), "please"),
+            Ok(Lifetime::UntilRevoked)
+        );
+        let mut broker = fixture.run(NobodyThere);
+        assert_eq!(
+            broker.request_access(&host("a.example"), "please"),
+            Ok(Lifetime::UntilRevoked)
+        );
     }
 
     #[test]

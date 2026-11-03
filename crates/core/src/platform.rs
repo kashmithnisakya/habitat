@@ -1,4 +1,5 @@
-//! What the operating systems do differently, for the things that the core's safety rests on.
+//! What the operating systems do differently, for the things that the core's safety rests on. Other
+//! trusted crates can use this too.
 //!
 //! Each function makes the same promise on every system. Where a system can't keep it fully, the
 //! function says so, and so does `docs/threat-model.md`.
@@ -70,7 +71,7 @@ pub(crate) fn dont_block(options: &mut DirOpenOptions) -> &mut DirOpenOptions {
 
 /// Opens a file for reading, without following a link or waiting on a named pipe. On Windows, this
 /// opens a link itself, so that the caller sees it isn't a regular file.
-pub(crate) fn open_no_follow(path: &Path) -> io::Result<File> {
+pub fn open_no_follow(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     no_follow(&mut options);
@@ -95,7 +96,7 @@ fn no_follow(options: &mut OpenOptions) {
 }
 
 /// Opens a file for reading and writing, creating it if needed, without following a link.
-pub(crate) fn open_or_create_no_follow(path: &Path) -> io::Result<File> {
+pub fn open_or_create_no_follow(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     no_follow(&mut options);
@@ -169,7 +170,7 @@ pub(crate) fn sync_dir(dir: &Dir) -> io::Result<()> {
 }
 
 /// The same as [`sync_dir`], for a folder that isn't open.
-pub(crate) fn sync_dir_path(path: &Path) -> io::Result<()> {
+pub fn sync_dir_path(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         File::open(path)?.sync_all()

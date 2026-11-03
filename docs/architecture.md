@@ -120,7 +120,13 @@ Next to `agents/`, `locks/<agent-id>.lock` is locked for as long as an agent is 
 
 Removing an agent deletes this whole folder, and is refused while the agent is running. The folder is first moved to a `removed/` folder next to `agents/`, so the agent is gone in one step. If the host dies part way through, a later install under the same name can't inherit what's left of the old agent's home.
 
-The audit log includes a hash of the previous entry in each new entry, so edits to earlier entries are detectable. This doesn't stop someone with full control of the device from replacing the whole log.
+The [audit log](../crates/broker/src/audit.rs) records every request that leaves an agent's home, each decision, and how each run ended, along with the run's ID. Each entry includes a hash of the previous one, so editing, removing or reordering entries is detectable, and `audit.head` holds the latest position, so that removing entries from the end is too. `habitat log <agent>` shows it and `habitat log <agent> --verify` checks it.
+
+- **If it can't be logged, it doesn't happen.** A request is refused if the log can't be written or has been changed.
+- **Nothing the agent wrote goes in the log.** Its reasons aren't stored, and no field can hold headers or bodies, which keeps API keys out. A malformed target is made safe and cut short.
+- **Each run can add 10,000 entries.** After that, requests are refused, so an agent can't fill the disk.
+
+This doesn't stop someone with full control of the device from replacing the whole log and `audit.head`. It's also never shortened, so it grows for as long as the agent stays installed.
 
 ## Resource limits
 

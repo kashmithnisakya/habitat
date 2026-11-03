@@ -20,7 +20,7 @@ use crate::backend::{
 use crate::home::{AgentStorage, HomeError};
 use crate::package::{Package, PackageError};
 use crate::platform;
-use crate::run_log::{RunEnding, RunHistory, RunLog, RunRecord};
+use crate::run_log::{RunEnding, RunHistory, RunId, RunLog, RunRecord};
 
 /// How many more times to try for a lock, and how long to wait in between.
 const LOCK_RETRIES: u32 = 10;
@@ -207,10 +207,13 @@ impl Supervisor {
 
         // A panic is a bug in the host, but it shouldn't let one agent take down the others. Its
         // message isn't kept, because it could hold text from the agent.
-        let ending = panic::catch_unwind(AssertUnwindSafe(|| self.load_and_run(&storage, event)))
-            .unwrap_or_else(|_| {
-                RunEnding::Ran(RunOutcome::Internal("the host panicked".to_string()))
-            });
+        let run_id = record.id;
+        let ending = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.load_and_run(&storage, event, run_id)
+        }))
+        .unwrap_or_else(|_| RunEnding::Ran(RunOutcome::Internal("the host panicked".to_string())));
+        self.broker
+            .run_ended(&storage, run_id, ending_summary(&ending));
         record.end(ending);
 
         let saved = log.save(&record);
@@ -222,7 +225,7 @@ impl Supervisor {
         }
     }
 
-    fn load_and_run(&self, storage: &AgentStorage, event: &Event) -> RunEnding {
+    fn load_and_run(&self, storage: &AgentStorage, event: &Event, run_id: RunId) -> RunEnding {
         // This checks that the package hasn't changed since it was installed.
         let package = match Package::load_installed(storage) {
             Ok(package) => package,
@@ -241,7 +244,9 @@ impl Supervisor {
             Ok(home) => home,
             Err(error) => return RunEnding::NotStarted(error.to_string()),
         };
-        let broker = self.broker.for_run(storage, package.manifest(), &limits);
+        let broker = self
+            .broker
+            .for_run(storage, package.manifest(), &limits, run_id);
         RunEnding::Ran(agent.run(event, home, &limits, &self.stop, broker))
     }
 
@@ -314,6 +319,23 @@ impl Supervisor {
     }
 }
 
+/// How a run ended, in a few words of our own. What the agent said isn't included.
+fn ending_summary(ending: &RunEnding) -> &'static str {
+    match ending {
+        RunEnding::Interrupted => "interrupted",
+        RunEnding::NotStarted(_) => "not-started",
+        RunEnding::Ran(outcome) => match outcome {
+            RunOutcome::Completed => "completed",
+            RunOutcome::Failed(_) => "failed",
+            RunOutcome::TimeLimit => "time-limit",
+            RunOutcome::MemoryLimit => "memory-limit",
+            RunOutcome::Stopped => "stopped",
+            RunOutcome::Crashed(_) => "crashed",
+            RunOutcome::Internal(_) => "host-failed",
+        },
+    }
+}
+
 fn open_existing(root: &Path, agent_name: &str) -> Result<AgentStorage, SupervisorError> {
     AgentStorage::open_existing(root, agent_name).map_err(|error| match error {
         HomeError::InvalidPath(_) => SupervisorError::InvalidName,
@@ -356,7 +378,7 @@ mod tests {
     use crate::backend::{LoadError, LoadedAgent, RunBroker, RunLimits};
     use crate::home::Home;
     use crate::platform::test_support::symlink;
-    use crate::run_log::{EventKind, MAX_RECORDS, RunId};
+    use crate::run_log::{EventKind, MAX_RECORDS};
 
     const NAME: &str = "agent";
     const MANIFEST: &str = "[agent]\nname = \"agent\"\nversion = \"0.1.0\"\n\n[limits]\nmemory_mb = 8\nrun_seconds = 7\ndisk_mb = 1\n";
