@@ -1,11 +1,11 @@
 //! Runs real components through the backend. These need the `wasm32-unknown-unknown` target,
 //! because they build the sample agent in `examples/file-agent`.
 
-use std::env;
+mod support;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{OnceLock, mpsc};
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,11 +13,13 @@ use habitat_backend_wasm::WasmBackend;
 use habitat_backend_wasm::code_shape::CodeShape;
 use habitat_backend_wasm::compile_limits::CompileLimits;
 use habitat_core::backend::{
-    Backend, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome,
+    Backend, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome, StopSignal,
 };
 use habitat_core::home::{AgentStorage, Home};
 use habitat_core::package::Package;
 use tempfile::TempDir;
+
+use support::file_agent_code;
 
 const MANIFEST: &str = "[agent]\nname = \"file-agent\"\nversion = \"0.1.0\"\n\n[limits]\nmemory_mb = 64\nrun_seconds = 10\ndisk_mb = 1\n";
 const MB: u64 = 1024 * 1024;
@@ -82,49 +84,6 @@ fn component_with_memory_pages(pages: u32) -> Vec<u8> {
     ))
 }
 
-fn file_agent_code() -> &'static [u8] {
-    static CODE: OnceLock<Vec<u8>> = OnceLock::new();
-    CODE.get_or_init(|| {
-        // For a test run on a device, where the agent was built beforehand.
-        if let Ok(path) = env::var("HABITAT_TEST_AGENT") {
-            return fs::read(path).unwrap();
-        }
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        // Its own folder, so that this can't wait on the build that's running these tests.
-        let target_dir: PathBuf = root.join("target/test-agents");
-        let output = Command::new(env::var("CARGO").unwrap_or("cargo".to_string()))
-            .current_dir(&root)
-            .args([
-                "build",
-                "-p",
-                "habitat-file-agent",
-                "--release",
-                "--target",
-                "wasm32-unknown-unknown",
-                "--target-dir",
-            ])
-            .arg(&target_dir)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "couldn't build the sample agent. If the target is missing, run \
-             `rustup target add wasm32-unknown-unknown`.\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let module =
-            fs::read(target_dir.join("wasm32-unknown-unknown/release/habitat_file_agent.wasm"))
-                .unwrap();
-        wit_component::ComponentEncoder::default()
-            .module(&module)
-            .unwrap()
-            .validate(true)
-            .encode()
-            .unwrap()
-    })
-}
-
 struct Fixture {
     _root: TempDir,
     storage: AgentStorage,
@@ -185,6 +144,7 @@ impl Fixture {
             &Event::UserMessage(message.to_string()),
             self.home(),
             limits,
+            &StopSignal::default(),
         )
     }
 
@@ -270,7 +230,14 @@ fn files_persist_between_runs_but_memory_does_not() {
 #[test]
 fn the_agent_is_told_what_kind_of_event_it_is() {
     let fixture = Fixture::file_agent();
-    let run = |event: Event| fixture.agent.run(&event, fixture.home(), &roomy_limits());
+    let run = |event: Event| {
+        fixture.agent.run(
+            &event,
+            fixture.home(),
+            &roomy_limits(),
+            &StopSignal::default(),
+        )
+    };
     let scheduled = |name: &str| Event::Scheduled(name.to_string());
     assert_eq!(run(scheduled("expect-scheduled")), RunOutcome::Completed);
     assert_ne!(run(scheduled("expect-user-message")), RunOutcome::Completed);
@@ -313,6 +280,7 @@ fn the_disk_limit_applies_to_agents() {
         &Event::UserMessage("write a.txt hello".to_string()),
         small_home,
         &roomy_limits(),
+        &StopSignal::default(),
     );
     let RunOutcome::Failed(message) = outcome else {
         panic!("the write wasn't refused: {outcome:?}");
@@ -843,9 +811,12 @@ fn a_manifest_cant_raise_its_limits_above_the_hosts() {
 
         let small_home = fixture.storage.home(limits.disk_bytes).unwrap();
         let too_big = format!("expect-big big.bin {}", 2 * MB);
-        let outcome = fixture
-            .agent
-            .run(&Event::UserMessage(too_big), small_home, &limits);
+        let outcome = fixture.agent.run(
+            &Event::UserMessage(too_big),
+            small_home,
+            &limits,
+            &StopSignal::default(),
+        );
         let RunOutcome::Failed(message) = outcome else {
             panic!("the disk limit wasn't applied: {outcome:?}");
         };

@@ -29,6 +29,7 @@ The trusted parts are the Rust core, the shell and the operating system.
 | Exhausting CPU, memory, disk or model budget | Limits per run and per agent |
 | Making the compiler use up CPU or memory, with a package that's cheap to send | [Limits checked before compiling](compile-costs.md), a time limit, and one compile at a time. Memory isn't enforced once compiling has started |
 | Changing grants or logs | Stored outside the agent's home, and the log is hash-chained |
+| Hiding what a run did by crashing or being stopped, or filling the disk with records | A run is recorded before it starts, and records are outside the agent's home. They hold a limited amount of the agent's text, and only the latest 1,000 are kept |
 | Attacking the broker with malformed input | Safe Rust, strict validation and fuzzing |
 | Hostile agent packages | A [strict package format](packages.md) with size limits and no paths taken from the archive, and packages contain only WebAssembly |
 

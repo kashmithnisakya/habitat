@@ -49,6 +49,19 @@ impl Guest for Agent {
             "call-host-forever" => loop {
                 std::hint::black_box(api::now_ms());
             },
+            // These save a file first, so that a test can tell when the agent is really running.
+            "write-then-loop" => {
+                api::write_file(first, rest.as_bytes()).map_err(|error| error.to_string())?;
+                loop {
+                    std::hint::black_box(0);
+                }
+            }
+            "write-then-call-host" => {
+                api::write_file(first, rest.as_bytes()).map_err(|error| error.to_string())?;
+                loop {
+                    std::hint::black_box(api::now_ms());
+                }
+            }
             "fail" => Err(rest.to_string()),
             "panic" => panic!("told to"),
             other => Err(format!("unknown command: {other}")),

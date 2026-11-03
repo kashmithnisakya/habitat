@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use habitat_backend_wasm::WasmBackend;
 use habitat_backend_wasm::compile_limits::CompileLimits;
-use habitat_core::backend::{Backend, Event, LoadError, RunLimits, RunOutcome};
+use habitat_core::backend::{Backend, Event, LoadError, RunLimits, RunOutcome, StopSignal};
 use habitat_core::home::AgentStorage;
 use habitat_core::package::Package;
 use hostile_code::*;
@@ -81,7 +81,12 @@ fn assert_runs(backend: &WasmBackend) {
         run_time: Duration::from_secs(60),
         disk_bytes: 1024 * 1024,
     };
-    let outcome = agent.run(&Event::UserMessage("hello".to_string()), home, &limits);
+    let outcome = agent.run(
+        &Event::UserMessage("hello".to_string()),
+        home,
+        &limits,
+        &StopSignal::default(),
+    );
     assert_eq!(outcome, RunOutcome::Completed);
 }
 
