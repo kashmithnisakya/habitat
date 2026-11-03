@@ -82,13 +82,14 @@ This fits phones, which can pause or stop apps at any time. If a run crashes or 
 ```text
 agents/<agent-id>/
 ├── package/        # Read-only agent code and manifest
+├── package.sha256  # Hash of the installed package, used to detect changes to it
 ├── home/           # Agent's files
 ├── tmp/            # Files being written, which are moved into home/ when complete
 ├── grants.db       # Permissions, only the core can write to this
 └── audit.db        # Tamper-evident log, only the core can write to this
 ```
 
-Only `home/` is visible to the agent.
+Only `home/` is visible to the agent. See [Agent packages](packages.md) for the package format.
 
 The audit log includes a hash of the previous entry in each new entry, so edits to earlier entries are detectable. This doesn't stop someone with full control of the device from replacing the whole log.
 

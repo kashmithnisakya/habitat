@@ -46,7 +46,7 @@ Planned guarantees:
 |---|---|
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
-| Mac core, broker and secrets | Not started |
+| Mac core, broker and secrets | In progress: the manifest, home store and package format are built, but agents can't run yet |
 | Attack tests | Not started |
 | Android app | Not started |
 
@@ -57,6 +57,7 @@ Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/ha
 - [Architecture](docs/architecture.md)
 - [Threat model](docs/threat-model.md)
 - [Permission model](docs/permissions.md)
+- [Agent packages](docs/packages.md)
 - [Roadmap](docs/roadmap.md)
 - [Design decisions](docs/decisions/README.md)
 - [Android feasibility report (draft)](docs/feasibility-android.md)
