@@ -77,6 +77,14 @@ Agents are event-based. Each run follows the same steps:
 
 This fits phones, which can pause or stop apps at any time. If a run crashes or hits a limit, the supervisor stops it, logs what happened and keeps the last saved state. Writes must be atomic, so a crash can't leave half-written state.
 
+## Backends
+
+The core talks to a backend through two small traits in [`crates/core/src/backend.rs`](../crates/core/src/backend.rs), so that a microVM backend could be added later. `Backend::load` checks a package's code and prepares it. `LoadedAgent::run` runs it for one event, and reports how the run ended.
+
+The Wasmtime backend links only the [agent API](agent-api.md), and refuses to load a component that imports anything else, such as WASI sockets. Each run starts with a new instance, so nothing in memory carries over, even after a crash. A crash is reported as the kind of trap only, because a full error can hold names chosen by the agent.
+
+Today the code is compiled every time it's loaded, and no limits are enforced on CPU or memory. Compiling once and saving the result comes later, as the [feasibility report](feasibility-android.md) recommends.
+
 ## Storage
 
 ```text

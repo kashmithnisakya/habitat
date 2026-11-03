@@ -31,6 +31,8 @@ Read these before making design changes:
 
 ## Commands
 
+The tests build a sample agent, so they need the WebAssembly target. Add it with `rustup target add wasm32-unknown-unknown`.
+
 Run all of these before committing:
 
 ```bash

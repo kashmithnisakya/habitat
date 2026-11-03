@@ -46,7 +46,7 @@ Planned guarantees:
 |---|---|
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
-| Mac core, broker and secrets | In progress: the manifest, home store and package format are built, but agents can't run yet |
+| Mac core, broker and secrets | In progress: an agent can run through Wasmtime and use files in its home, with no limits on CPU or memory yet |
 | Attack tests | Not started |
 | Android app | Not started |
 
@@ -81,7 +81,11 @@ docs/                # Design documents
 
 ## Build
 
-You need a recent stable [Rust toolchain](https://rustup.rs).
+You need a recent stable [Rust toolchain](https://rustup.rs), and the WebAssembly target for building test agents:
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
 
 ```bash
 cargo build --workspace
