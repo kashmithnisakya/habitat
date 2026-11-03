@@ -63,6 +63,7 @@ impl Guest for Agent {
                 }
             }
             "fetch" => fetch(first, rest),
+            "pick-file" => pick_file(first, rest),
             "fetch-and-hold" => fetch_and_hold(first),
             "ask-model" => {
                 let target = AccessTarget::Model(first.to_string());
@@ -84,6 +85,33 @@ impl Guest for Agent {
 }
 
 static mut MEMORY: u32 = 0;
+
+/// Asks the user for a file, and checks its name and what's in it. It also has to read it a few
+/// ways. The name of the file has no spaces, and is everything up to the first space.
+fn pick_file(name: &str, contents: &str) -> Result<(), String> {
+    let file = api::pick_user_file("to read it").map_err(|error| error.to_string())?;
+    if file.name() != name {
+        return Err(format!("the name is {}", file.name()));
+    }
+    if file.size() != contents.len() as u64 {
+        return Err(format!("the size is {}", file.size()));
+    }
+    let all = file.read(0, u32::MAX).map_err(|error| error.to_string())?;
+    if all != contents.as_bytes() {
+        return Err("the contents are different".to_string());
+    }
+    let tail = file.read(1, 2).map_err(|error| error.to_string())?;
+    if tail != contents.as_bytes()[1..3.min(contents.len())] {
+        return Err("reading part of it went wrong".to_string());
+    }
+    let past = file
+        .read(contents.len() as u64 + 5, 10)
+        .map_err(|error| error.to_string())?;
+    if !past.is_empty() {
+        return Err("reading past the end returned something".to_string());
+    }
+    Ok(())
+}
 
 /// Opens this many responses at once, keeping them all open.
 fn fetch_and_hold(count: &str) -> Result<(), String> {

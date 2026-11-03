@@ -3,6 +3,7 @@
 //! This only decides. It does no I/O, so that every decision can be tested and nothing here can
 //! fail halfway. `docs/permissions.md` has the rules, and anything they don't cover is denied.
 
+use std::collections::HashSet;
 use std::fmt;
 
 pub use habitat_core::backend::Target;
@@ -68,6 +69,21 @@ pub struct Context<'a> {
     pub grants: &'a dyn Grants,
     /// How many tokens this run has left for AI models.
     pub tokens_left: u64,
+    /// Whether this run has read the user's private data, and so what it can still reach without
+    /// asking again. See [`decide`].
+    pub leak_check: LeakCheck<'a>,
+}
+
+/// What the data-leak rule needs to know about a run. An agent that's been tricked could send
+/// private data to somewhere it's already allowed to reach. So once it's read any, somewhere it
+/// hasn't already been in this run needs a fresh approval, whatever grants there are. This reduces
+/// the risk, but it doesn't remove it, as `docs/threat-model.md` explains.
+#[derive(Debug, Clone, Copy)]
+pub enum LeakCheck<'a> {
+    /// The run hasn't read anything private.
+    NothingPrivateRead,
+    /// It has, and the user has approved these since.
+    PrivateRead { reached: &'a HashSet<Target> },
 }
 
 /// Decides on an action. Declaring something in a manifest only lets an agent ask, and a grant
@@ -107,7 +123,12 @@ fn decide_reach(context: &Context, target: &Target) -> Decision {
     if needs_tokens && context.tokens_left == 0 {
         return Decision::Deny(DenyReason::OverBudget);
     }
-    if context.grants.covers(target) {
+    // Hosted AI models count here too, as they're somewhere that data goes.
+    let needs_fresh_approval = match context.leak_check {
+        LeakCheck::NothingPrivateRead => false,
+        LeakCheck::PrivateRead { reached } => !reached.contains(target),
+    };
+    if context.grants.covers(target) && !needs_fresh_approval {
         Decision::Allow
     } else {
         Decision::Ask
@@ -176,6 +197,7 @@ mod tests {
             manifest: &manifest,
             grants: &grants,
             tokens_left,
+            leak_check: LeakCheck::NothingPrivateRead,
         };
         decide(&context, &action)
     }
@@ -437,6 +459,68 @@ mod tests {
                 decide_with(MANIFEST, vec![target], 100, action)
             );
         }
+    }
+
+    fn decide_after_private_read(target: Target, granted: bool, reached: &[Target]) -> Decision {
+        let manifest = Manifest::parse(MANIFEST).unwrap();
+        let grants = Granted(if granted {
+            vec![target.clone()]
+        } else {
+            vec![]
+        });
+        let reached: HashSet<Target> = reached.iter().cloned().collect();
+        let context = Context {
+            manifest: &manifest,
+            grants: &grants,
+            tokens_left: 100,
+            leak_check: LeakCheck::PrivateRead { reached: &reached },
+        };
+        decide(&context, &Action::Reach(target))
+    }
+
+    #[test]
+    fn after_reading_private_data_a_new_destination_asks_even_if_its_granted() {
+        assert_eq!(
+            decide_after_private_read(host(GITHUB), true, &[]),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide_after_private_read(model("default"), true, &[]),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn after_reading_private_data_somewhere_already_reached_doesnt_ask_again() {
+        assert_eq!(
+            decide_after_private_read(host(GITHUB), true, &[host(GITHUB)]),
+            Decision::Allow
+        );
+        // Somewhere else being reached doesn't count.
+        assert_eq!(
+            decide_after_private_read(host(GITHUB), true, &[model("default")]),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn reaching_somewhere_doesnt_stand_in_for_a_grant() {
+        assert_eq!(
+            decide_after_private_read(host(GITHUB), false, &[host(GITHUB)]),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn the_leak_rule_doesnt_help_with_anything_else_thats_refused() {
+        assert_eq!(
+            decide_after_private_read(host("evil.example"), true, &[host("evil.example")]),
+            deny(DenyReason::NotDeclared)
+        );
+        assert_eq!(
+            decide_after_private_read(host("BAD"), true, &[host("BAD")]),
+            deny(DenyReason::Malformed)
+        );
     }
 
     #[test]

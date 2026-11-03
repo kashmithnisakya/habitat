@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use habitat_backend_wasm::WasmBackend;
-use habitat_broker::approval::{Answer, Approver, Prompt};
+use habitat_broker::approval::{Answer, Approver, FilePrompt, Prompt};
 use habitat_broker::audit;
 use habitat_broker::broker::Broker;
 use habitat_broker::grants::{list_saved, revoke_saved};
@@ -351,6 +351,17 @@ fn parse_answer(line: &str) -> Answer {
 }
 
 impl Approver for Terminal {
+    fn pick_file(&self, prompt: &FilePrompt, wait: Duration) -> Option<PathBuf> {
+        let _ = writeln!(
+            io::stderr(),
+            "\n{prompt}\nType the path of a file to allow it, or press Enter for no: "
+        );
+        let lines = stdin_lines().lock().unwrap_or_else(PoisonError::into_inner);
+        let line = lines.recv_timeout(wait).ok()?;
+        let path = line.trim();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    }
+
     fn ask(&self, prompt: &Prompt, wait: Duration) -> Answer {
         let _ = writeln!(
             io::stderr(),

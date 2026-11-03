@@ -94,6 +94,18 @@ These have some limits:
 - **A prompt can make a run overrun its time limit,** because the time limit can't stop a call that's waiting on the host. It's stopped as soon as the prompt is answered or times out.
 - **Text on a terminal can be misread.** An agent's reason can still say untrue things, so it's labelled as a claim.
 
+## User files
+
+An agent can ask the user to choose a file, if its manifest has `files = "ask"`. It gets a handle to that one file, with its name and what's in it, and never its folder or path. The handle lasts until the run ends. Choosing nothing means no. `habitat run` asks for a path to be typed in, and the Android app will use the system's file picker.
+
+A link is refused, because what it leads to may not be what the user meant. The audit log records that a file was given, but not its name, which can be private.
+
+## Data-leak rule
+
+An agent that's been tricked, such as by text in a web page, could send private data to somewhere it's already allowed to reach. So once a run has been given a user's file, anywhere it wants to reach from then on needs a fresh approval, even with a grant until revoked. The prompt says why. This applies to network hosts and AI models, and to each hop of a redirect. Somewhere approved after that can be used again in the same run. A new run starts fresh.
+
+**This reduces the risk, but doesn't remove it.** See the [threat model](threat-model.md#known-weak-spots).
+
 ## Grant lifetimes
 
 | Lifetime | Meaning |

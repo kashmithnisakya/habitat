@@ -50,4 +50,9 @@ The trusted parts are the Rust core, the shell and the operating system.
   - Only Windows on x86-64 is tested. Windows on Arm is Tier 3 in Wasmtime.
   - Ctrl-C and closing the console aren't tested, because CI has no console to send them from.
 - Approval prompts depend on people reading them.
+- The data-leak rule only reduces the risk of private data being sent somewhere:
+  - The user can approve the destination, because the prompt can't tell what's going to be sent.
+  - It starts from the moment an agent is given a file, so it can't help with what's already in the agent's home. An agent can save private data in its home and send it in a later run, when the rule has started fresh.
+  - It knows nothing about what's private in the agent's own files, or in what comes back from the network.
+  - An agent can read a file, ask for approval for a destination it had a reason to reach, and hide what it read in an ordinary-looking request.
 - The audit log can't detect full replacement by someone who controls the device.

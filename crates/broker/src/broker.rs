@@ -1,18 +1,22 @@
 //! Puts the policy, the grants and the user together, for each request that one run makes.
 
+use std::collections::HashSet;
+use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use habitat_core::backend::{
     AccessRefused, BrokerFactory, FetchError, FetchMethod, FetchRequest, FetchResponse, Lifetime,
-    RunBroker, RunLimits, Target,
+    PickedFile, RunBroker, RunLimits, Target,
 };
 use habitat_core::home::AgentStorage;
-use habitat_core::manifest::Manifest;
+use habitat_core::manifest::{Manifest, printable};
+use habitat_core::platform;
 
 use habitat_core::run_log::RunId;
 
-use crate::approval::{ANSWER_TIME, Answer, Approver, Prompt, PromptLimit};
+use crate::approval::{ANSWER_TIME, Answer, Approver, FilePrompt, Prompt, PromptLimit};
 use crate::audit::{AuditError, AuditEvent, AuditLog};
 use crate::gateway::{
     CheckedUrl, Incoming, LimitedBody, MAX_HOP_TIME, MAX_REDIRECTS, MAX_RESPONSE_BYTES, Network,
@@ -20,7 +24,7 @@ use crate::gateway::{
     redirected,
 };
 use crate::grants::RunGrants;
-use crate::policy::{Action, Context, Decision, DenyReason, decide};
+use crate::policy::{Action, Context, Decision, DenyReason, LeakCheck, decide};
 
 /// Makes a broker for each run, which asks the user through the given shell.
 pub struct Broker {
@@ -43,6 +47,25 @@ impl Broker {
             network: Arc::new(network),
         }
     }
+}
+
+/// Opens the one file that the user chose. This holds on to it, so an agent can only ever read that
+/// file, and it refuses a link, as what it leads to may not be what the user meant.
+fn open_picked(path: &Path) -> io::Result<PickedFile> {
+    let file = platform::open_no_follow(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let name = path
+        .file_name()
+        .map(|name| printable(&name.to_string_lossy()))
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    Ok(PickedFile {
+        name,
+        size: metadata.len(),
+        file: Box::new(file),
+    })
 }
 
 impl BrokerFactory for Broker {
@@ -68,6 +91,8 @@ impl BrokerFactory for Broker {
             grants: RunGrants::new(storage.clone()),
             approver: Arc::clone(&self.approver),
             network: Arc::clone(&self.network),
+            private_read: false,
+            reached: HashSet::new(),
             limit: PromptLimit::default(),
             tokens_left: manifest.limits().model_budget_tokens,
             deadline: Instant::now() + limits.run_time,
@@ -82,6 +107,10 @@ struct ForRun {
     grants: RunGrants,
     approver: Arc<dyn Approver>,
     network: Arc<dyn Network>,
+    /// Whether this run has read the user's private data, which only ever goes from no to yes.
+    private_read: bool,
+    /// What the user has approved since this run read private data.
+    reached: HashSet<Target>,
     limit: PromptLimit,
     tokens_left: u64,
     /// When the run's time is up. A call can't be interrupted, so it has to stop by itself.
@@ -135,6 +164,16 @@ impl RunBroker for ForRun {
         })?;
         let result = self.decide_request(target, reason);
         self.logged(target, result)
+    }
+
+    fn pick_user_file(&mut self, reason: &str) -> Result<PickedFile, AccessRefused> {
+        let result = self.pick_file(reason);
+        self.log(if result.is_ok() {
+            AuditEvent::UserFilePicked
+        } else {
+            AuditEvent::UserFileRefused
+        })?;
+        result
     }
 
     fn http_fetch(&mut self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
@@ -211,12 +250,7 @@ impl ForRun {
         self.log_for_fetch(AuditEvent::Requested {
             target: target.clone(),
         })?;
-        let context = Context {
-            manifest: &self.manifest,
-            grants: &self.grants,
-            tokens_left: self.tokens_left,
-        };
-        let refused = match decide(&context, &Action::Reach(target.clone())) {
+        let refused = match self.decide(&Action::Reach(target.clone())) {
             Decision::Allow => None,
             Decision::Ask => Some(FetchError::NotGranted),
             Decision::Deny(reason) => Some(FetchError::Denied(reason.to_string())),
@@ -254,13 +288,50 @@ impl ForRun {
 }
 
 impl ForRun {
-    fn decide_request(&mut self, target: &Target, reason: &str) -> Result<Lifetime, AccessRefused> {
+    fn decide(&self, action: &Action) -> Decision {
         let context = Context {
             manifest: &self.manifest,
             grants: &self.grants,
             tokens_left: self.tokens_left,
+            leak_check: if self.private_read {
+                LeakCheck::PrivateRead {
+                    reached: &self.reached,
+                }
+            } else {
+                LeakCheck::NothingPrivateRead
+            },
         };
-        match decide(&context, &Action::Reach(target.clone())) {
+        decide(&context, action)
+    }
+
+    fn pick_file(&mut self, reason: &str) -> Result<PickedFile, AccessRefused> {
+        if let Decision::Deny(reason) = self.decide(&Action::ReadUserFile) {
+            return Err(refused(reason));
+        }
+        if !self.limit.may_ask_for_file() {
+            return Err(AccessRefused::LimitExceeded(
+                "this run can't ask the user about that any more".to_string(),
+            ));
+        }
+        let prompt = FilePrompt::new(self.manifest.name(), reason);
+        let Some(path) = self.approver.pick_file(&prompt, ANSWER_TIME) else {
+            self.limit.file_refused();
+            return Err(AccessRefused::Denied(
+                "the user didn't choose a file".to_string(),
+            ));
+        };
+        let picked = open_picked(&path).map_err(|_| {
+            AccessRefused::Denied("the file that the user chose couldn't be read".to_string())
+        })?;
+        // From here on, it's what the data-leak rule is for. This counts even if the agent never
+        // reads the file, since that can't be told from here in time.
+        self.private_read = true;
+        self.reached.clear();
+        Ok(picked)
+    }
+
+    fn decide_request(&mut self, target: &Target, reason: &str) -> Result<Lifetime, AccessRefused> {
+        match self.decide(&Action::Reach(target.clone())) {
             // It already has access, and saying so can't reveal anything that using it wouldn't.
             Decision::Allow => self
                 .grants
@@ -273,12 +344,14 @@ impl ForRun {
                         "this run can't ask the user about that any more".to_string(),
                     ));
                 }
-                let prompt = Prompt::new(self.manifest.name(), target, reason);
+                let prompt = Prompt::new(self.manifest.name(), target, reason, self.private_read);
                 match self.approver.ask(&prompt, ANSWER_TIME) {
                     Answer::Allow(lifetime) => {
                         self.grants
                             .grant(target.clone(), lifetime)
                             .map_err(|_| AccessRefused::Internal)?;
+                        // This is the fresh approval that the data-leak rule asks for.
+                        self.reached.insert(target.clone());
                         Ok(lifetime)
                     }
                     Answer::Deny => {
@@ -296,6 +369,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::io::Read;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -319,6 +393,7 @@ mod tests {
         [requests]
         network = ["a.example", "b.example", "c.example", "d.example", "e.example", "f.example", "g.example"]
         models = ["default"]
+        files = "ask"
     "#;
 
     /// A status, headers and body.
@@ -397,6 +472,8 @@ mod tests {
     struct Scripted {
         answer: Answer,
         asked: Arc<Mutex<Vec<(Prompt, Duration)>>>,
+        file: Option<PathBuf>,
+        file_prompts: Arc<Mutex<Vec<FilePrompt>>>,
     }
 
     impl Scripted {
@@ -404,6 +481,15 @@ mod tests {
             Self {
                 answer,
                 asked: Arc::default(),
+                file: None,
+                file_prompts: Arc::default(),
+            }
+        }
+
+        fn choosing(answer: Answer, file: &Path) -> Self {
+            Self {
+                file: Some(file.to_path_buf()),
+                ..Self::new(answer)
             }
         }
 
@@ -416,6 +502,11 @@ mod tests {
         fn ask(&self, prompt: &Prompt, wait: Duration) -> Answer {
             self.asked.lock().unwrap().push((prompt.clone(), wait));
             self.answer
+        }
+
+        fn pick_file(&self, prompt: &FilePrompt, _wait: Duration) -> Option<PathBuf> {
+            self.file_prompts.lock().unwrap().push(prompt.clone());
+            self.file.clone()
         }
     }
 
@@ -662,6 +753,8 @@ mod tests {
             grants: RunGrants::new(fixture.storage.clone()),
             approver: Arc::new(Scripted::new(Answer::Allow(Lifetime::UntilRevoked))),
             network: Arc::new(FakeNetwork::default()),
+            private_read: false,
+            reached: HashSet::new(),
             limit: PromptLimit::default(),
             tokens_left: 0,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -1061,6 +1154,259 @@ mod tests {
             Some(FetchError::TimedOut)
         );
         assert!(network.urls_sent().is_empty());
+    }
+
+    struct WithFile {
+        _folder: TempDir,
+        path: PathBuf,
+    }
+
+    fn a_private_file(contents: &str) -> WithFile {
+        let folder = TempDir::new().unwrap();
+        let path = folder.path().join("diary.txt");
+        fs::write(&path, contents).unwrap();
+        WithFile {
+            _folder: folder,
+            path,
+        }
+    }
+
+    #[test]
+    fn the_user_chooses_a_file_and_the_agent_gets_only_that() {
+        let private = a_private_file("private words");
+        let fixture = Fixture::new();
+        let approver = Scripted::choosing(Answer::Deny, &private.path);
+        let mut broker = fixture.run(approver.clone());
+        let mut picked = broker.pick_user_file("to summarise it").ok().unwrap();
+        assert_eq!(picked.name, "diary.txt");
+        assert_eq!(picked.size, 13);
+        let mut contents = String::new();
+        picked.file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "private words");
+        let prompts = approver.file_prompts.lock().unwrap();
+        assert_eq!(prompts[0].agents_claim, "to summarise it");
+    }
+
+    #[test]
+    fn nobody_choosing_a_file_means_no_and_isnt_asked_again() {
+        let fixture = Fixture::new();
+        let approver = Scripted::new(Answer::Deny);
+        let mut broker = fixture.run(approver.clone());
+        assert!(matches!(
+            broker.pick_user_file("please"),
+            Err(AccessRefused::Denied(_))
+        ));
+        assert!(matches!(
+            broker.pick_user_file("please"),
+            Err(AccessRefused::LimitExceeded(_))
+        ));
+        assert_eq!(approver.file_prompts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn asking_for_a_file_is_denied_if_its_not_declared() {
+        let private = a_private_file("x");
+        let fixture = Fixture::new();
+        let manifest = Manifest::parse(
+            "[agent]\nname = \"tester\"\nversion = \"1.0.0\"\n\n[limits]\nmemory_mb = 8\nrun_seconds = 1\ndisk_mb = 1\n",
+        )
+        .unwrap();
+        let limits = RunLimits {
+            memory_bytes: 1,
+            run_time: Duration::from_secs(1),
+            disk_bytes: 1,
+        };
+        let approver = Scripted::choosing(Answer::Deny, &private.path);
+        let mut broker = Broker::with_network(approver.clone(), FakeNetwork::default()).for_run(
+            &fixture.storage,
+            &manifest,
+            &limits,
+            RunId::parse(&"1".repeat(32)).unwrap(),
+        );
+        assert!(matches!(
+            broker.pick_user_file("please"),
+            Err(AccessRefused::Denied(_))
+        ));
+        assert!(approver.file_prompts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_link_or_a_folder_isnt_opened_and_errors_dont_reveal_the_path() {
+        let private = a_private_file("private");
+        let folder = TempDir::new().unwrap();
+        let link = folder.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&private.path, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&private.path, &link).unwrap();
+        for chosen in [
+            link.as_path(),
+            folder.path(),
+            Path::new("/no/such/secret-path"),
+        ] {
+            let fixture = Fixture::new();
+            let mut broker = fixture.run(Scripted::choosing(Answer::Deny, chosen));
+            let error = broker.pick_user_file("please").err().unwrap();
+            let text = format!("{error:?}");
+            assert!(
+                !text.contains("secret-path") && !text.contains("link"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_the_name_nor_the_path_of_a_file_is_logged() {
+        let private = a_private_file("private words");
+        let fixture = Fixture::new();
+        let mut broker = fixture.run(Scripted::choosing(Answer::Deny, &private.path));
+        assert!(broker.pick_user_file("please").is_ok());
+        let text = fs::read_to_string(fixture.storage.audit_path()).unwrap();
+        assert!(text.contains("user-file-picked"), "{text}");
+        assert!(!text.contains("diary"), "{text}");
+    }
+
+    #[test]
+    fn after_a_private_read_a_granted_host_needs_fresh_approval() {
+        let private = a_private_file("private words");
+        let network = FakeNetwork::default().page("https://a.example/", 200, &[], b"");
+        let fixture = Fixture::new();
+        let approver = Scripted::choosing(Answer::Allow(Lifetime::UntilRevoked), &private.path);
+        let manifest = Manifest::parse(MANIFEST).unwrap();
+        let limits = RunLimits {
+            memory_bytes: 1,
+            run_time: Duration::from_secs(60),
+            disk_bytes: 1,
+        };
+        let run_id = RunId::parse(&"1".repeat(32)).unwrap();
+        let factory = Broker::with_network(approver.clone(), network.clone());
+        let mut broker = factory.for_run(&fixture.storage, &manifest, &limits, run_id);
+
+        // A long-lived grant, used as normal.
+        broker.request_access(&host("a.example"), "please").unwrap();
+        assert!(broker.http_fetch(get("https://a.example/")).is_ok());
+        assert_eq!(approver.times_asked(), 1);
+
+        // It reads something private, and that grant isn't enough any more.
+        broker.pick_user_file("please").ok().unwrap();
+        assert_eq!(
+            broker.http_fetch(get("https://a.example/")).err(),
+            Some(FetchError::NotGranted)
+        );
+        assert_eq!(network.urls_sent().len(), 1);
+
+        // It has to ask, the user sees why, and then that one destination can be used.
+        broker
+            .request_access(&host("a.example"), "to send it")
+            .unwrap();
+        {
+            let asked = approver.asked.lock().unwrap();
+            assert_eq!(asked.len(), 2);
+            assert!(asked[1].0.after_private_read);
+            assert!(!asked[0].0.after_private_read);
+        }
+        assert!(broker.http_fetch(get("https://a.example/")).is_ok());
+
+        // Another granted host still needs its own approval, in the same run.
+        fixture_grant(&fixture, "b.example");
+        assert_eq!(
+            broker.http_fetch(get("https://b.example/")).err(),
+            Some(FetchError::NotGranted)
+        );
+    }
+
+    fn fixture_grant(fixture: &Fixture, name: &str) {
+        let mut grants = RunGrants::new(fixture.storage.clone());
+        grants.grant(host(name), Lifetime::UntilRevoked).unwrap();
+    }
+
+    #[test]
+    fn a_refused_approval_after_a_private_read_leaves_the_host_unreachable() {
+        let private = a_private_file("private words");
+        let network = FakeNetwork::default().page("https://a.example/", 200, &[], b"");
+        let fixture = Fixture::new();
+        fixture_grant(&fixture, "a.example");
+        let manifest = Manifest::parse(MANIFEST).unwrap();
+        let limits = RunLimits {
+            memory_bytes: 1,
+            run_time: Duration::from_secs(60),
+            disk_bytes: 1,
+        };
+        let run_id = RunId::parse(&"1".repeat(32)).unwrap();
+        let factory = Broker::with_network(
+            Scripted::choosing(Answer::Deny, &private.path),
+            network.clone(),
+        );
+        let mut broker = factory.for_run(&fixture.storage, &manifest, &limits, run_id);
+        broker.pick_user_file("please").ok().unwrap();
+        assert!(matches!(
+            broker.request_access(&host("a.example"), "to send it"),
+            Err(AccessRefused::Denied(_))
+        ));
+        assert_eq!(
+            broker.http_fetch(get("https://a.example/")).err(),
+            Some(FetchError::NotGranted)
+        );
+        assert!(network.urls_sent().is_empty());
+    }
+
+    #[test]
+    fn a_redirect_after_a_private_read_needs_approval_too() {
+        let private = a_private_file("private words");
+        let network = FakeNetwork::default()
+            .page(
+                "https://a.example/",
+                302,
+                &[("Location", "https://b.example/")],
+                b"",
+            )
+            .page("https://b.example/", 200, &[], b"");
+        let fixture = Fixture::new();
+        fixture_grant(&fixture, "b.example");
+        let manifest = Manifest::parse(MANIFEST).unwrap();
+        let limits = RunLimits {
+            memory_bytes: 1,
+            run_time: Duration::from_secs(60),
+            disk_bytes: 1,
+        };
+        let run_id = RunId::parse(&"1".repeat(32)).unwrap();
+        let factory = Broker::with_network(
+            Scripted::choosing(Answer::Allow(Lifetime::ThisRun), &private.path),
+            network.clone(),
+        );
+        let mut broker = factory.for_run(&fixture.storage, &manifest, &limits, run_id);
+        broker.pick_user_file("please").ok().unwrap();
+        broker
+            .request_access(&host("a.example"), "to send it")
+            .unwrap();
+        assert_eq!(
+            broker.http_fetch(get("https://a.example/")).err(),
+            Some(FetchError::NotGranted)
+        );
+        assert_eq!(network.urls_sent(), ["https://a.example/"]);
+    }
+
+    #[test]
+    fn the_rule_starts_fresh_with_each_run() {
+        let private = a_private_file("private words");
+        let network = FakeNetwork::default().page("https://a.example/", 200, &[], b"");
+        let fixture = Fixture::new();
+        fixture_grant(&fixture, "a.example");
+        let manifest = Manifest::parse(MANIFEST).unwrap();
+        let limits = RunLimits {
+            memory_bytes: 1,
+            run_time: Duration::from_secs(60),
+            disk_bytes: 1,
+        };
+        let run_id = RunId::parse(&"1".repeat(32)).unwrap();
+        let factory =
+            Broker::with_network(Scripted::choosing(Answer::Deny, &private.path), network);
+        let mut first = factory.for_run(&fixture.storage, &manifest, &limits, run_id);
+        first.pick_user_file("please").ok().unwrap();
+        assert!(first.http_fetch(get("https://a.example/")).is_err());
+        drop(first);
+        let mut second = factory.for_run(&fixture.storage, &manifest, &limits, run_id);
+        assert!(second.http_fetch(get("https://a.example/")).is_ok());
     }
 
     #[test]

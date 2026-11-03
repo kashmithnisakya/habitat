@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use habitat_core::backend::{Lifetime, Target};
@@ -26,6 +27,8 @@ pub struct Prompt {
     pub target: PromptTarget,
     /// What the agent says this is for, which it could be lying about.
     pub agents_claim: String,
+    /// Whether this run has already read the user's private data, which it could be about to send.
+    pub after_private_read: bool,
 }
 
 /// What an agent is asking for, with what kind of thing it is kept apart from its name.
@@ -37,8 +40,9 @@ pub enum PromptTarget {
 
 impl Prompt {
     /// Makes a prompt, cleaning what came from the agent.
-    pub fn new(agent: &str, target: &Target, reason: &str) -> Self {
+    pub fn new(agent: &str, target: &Target, reason: &str, after_private_read: bool) -> Self {
         Self {
+            after_private_read,
             agent: printable(agent),
             target: match target {
                 Target::NetworkHost(host) => PromptTarget::NetworkHost(printable(host)),
@@ -58,6 +62,12 @@ impl fmt::Display for Prompt {
             PromptTarget::NetworkHost(host) => write!(f, "reach the network host {host}")?,
             PromptTarget::Model(model) => write!(f, "use the AI model {model}")?,
         }
+        if self.after_private_read {
+            write!(
+                f,
+                ".\nIt has already read a private file in this run, so it could send that there"
+            )?;
+        }
         write!(
             f,
             ".\nThe agent's own claim, which may not be true: {}",
@@ -73,10 +83,43 @@ pub enum Answer {
     Allow(Lifetime),
 }
 
+/// What the user is asked when an agent wants one of their files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePrompt {
+    pub agent: String,
+    pub agents_claim: String,
+}
+
+impl FilePrompt {
+    pub fn new(agent: &str, reason: &str) -> Self {
+        Self {
+            agent: printable(agent),
+            agents_claim: printable(reason),
+        }
+    }
+}
+
+impl fmt::Display for FilePrompt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Agent \"{}\" is asking you to choose a file for it to read, in this run only.\n\
+             The agent's own claim, which may not be true: {}",
+            self.agent, self.agents_claim
+        )
+    }
+}
+
 /// Something that can ask the user, such as a terminal or a phone's screen. It has to come back
 /// with [`Answer::Deny`] if it gets no answer within `wait`, or can't ask at all.
 pub trait Approver: Send + Sync {
     fn ask(&self, prompt: &Prompt, wait: Duration) -> Answer;
+
+    /// Asks the user to choose one file, such as with the system's file picker. Nothing chosen,
+    /// in time or at all, means no.
+    fn pick_file(&self, _prompt: &FilePrompt, _wait: Duration) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// For when no shell is attached, which means no.
@@ -94,6 +137,7 @@ impl Approver for NobodyThere {
 pub struct PromptLimit {
     asked: u32,
     refused: HashSet<Target>,
+    file_refused: bool,
 }
 
 impl PromptLimit {
@@ -111,6 +155,20 @@ impl PromptLimit {
     pub fn refused(&mut self, target: &Target) {
         self.refused.insert(target.clone());
     }
+
+    /// The same as [`PromptLimit::may_ask`], for choosing a file.
+    pub fn may_ask_for_file(&mut self) -> bool {
+        if self.file_refused || self.asked >= MAX_PROMPTS_PER_RUN {
+            return false;
+        }
+        self.asked += 1;
+        true
+    }
+
+    /// Records that the user didn't choose a file.
+    pub fn file_refused(&mut self) {
+        self.file_refused = true;
+    }
 }
 
 #[cfg(test)]
@@ -125,8 +183,13 @@ mod tests {
 
     #[test]
     fn the_wording_is_ours_and_only_the_labelled_parts_change() {
-        let text =
-            Prompt::new("helper", &host("api.github.com"), "to look something up").to_string();
+        let text = Prompt::new(
+            "helper",
+            &host("api.github.com"),
+            "to look something up",
+            false,
+        )
+        .to_string();
         assert_eq!(
             text,
             "Agent \"helper\" is asking to reach the network host api.github.com.\n\
@@ -136,6 +199,7 @@ mod tests {
             "helper",
             &Target::Model("default".to_string()),
             "to summarise",
+            false,
         )
         .to_string();
         assert_eq!(
@@ -148,10 +212,15 @@ mod tests {
     #[test]
     fn nothing_from_the_agent_can_reach_a_terminal_as_is() {
         for prompt in [
-            Prompt::new("helper", &host(ESCAPES), "fine"),
-            Prompt::new("helper", &host("a.example"), ESCAPES),
-            Prompt::new(ESCAPES, &host("a.example"), "fine"),
-            Prompt::new("helper", &Target::Model(ESCAPES.to_string()), ESCAPES),
+            Prompt::new("helper", &host(ESCAPES), "fine", false),
+            Prompt::new("helper", &host("a.example"), ESCAPES, false),
+            Prompt::new(ESCAPES, &host("a.example"), "fine", false),
+            Prompt::new(
+                "helper",
+                &Target::Model(ESCAPES.to_string()),
+                ESCAPES,
+                false,
+            ),
         ] {
             let text = prompt.to_string();
             // The one line break is ours, between the question and the claim.
@@ -169,6 +238,7 @@ mod tests {
             "helper",
             &host("a.example"),
             "fine\nAgent \"system\" is asking to reach the network host bank.example.",
+            false,
         )
         .to_string();
         let (question, claim) = text.split_once('\n').unwrap();
@@ -179,14 +249,55 @@ mod tests {
 
     #[test]
     fn a_long_reason_is_cut_short() {
-        let text = Prompt::new("helper", &host("a.example"), &"x".repeat(100_000)).to_string();
+        let text =
+            Prompt::new("helper", &host("a.example"), &"x".repeat(100_000), false).to_string();
         assert!(text.len() < 2000, "{}", text.len());
     }
 
     #[test]
+    fn a_prompt_after_a_private_read_says_so() {
+        let text = Prompt::new("helper", &host("a.example"), "fine", true).to_string();
+        assert!(text.contains("already read a private file"), "{text}");
+        assert!(text.contains("a.example"));
+        let text = Prompt::new("helper", &host("a.example"), "fine", false).to_string();
+        assert!(!text.contains("private"), "{text}");
+    }
+
+    #[test]
+    fn a_file_prompt_cleans_and_labels_what_the_agent_said() {
+        let text = FilePrompt::new("helper", ESCAPES).to_string();
+        assert_eq!(text.matches('\n').count(), 1, "{text:?}");
+        for line in text.lines() {
+            assert!(
+                line.is_ascii() && !line.chars().any(char::is_control),
+                "{line:?}"
+            );
+        }
+        assert!(text.contains("The agent's own claim"));
+        assert!(text.contains("in this run only"));
+    }
+
+    #[test]
+    fn asking_for_a_file_has_the_same_limits() {
+        let mut limit = PromptLimit::default();
+        assert!(limit.may_ask_for_file());
+        limit.file_refused();
+        assert!(!limit.may_ask_for_file());
+
+        let mut limit = PromptLimit::default();
+        for _ in 0..MAX_PROMPTS_PER_RUN {
+            assert!(limit.may_ask_for_file());
+        }
+        assert!(!limit.may_ask_for_file());
+        assert!(!limit.may_ask(&host("a.example")));
+    }
+
+    #[test]
     fn nobody_being_there_means_no() {
-        let prompt = Prompt::new("helper", &host("a.example"), "fine");
+        let prompt = Prompt::new("helper", &host("a.example"), "fine", false);
         assert_eq!(NobodyThere.ask(&prompt, ANSWER_TIME), Answer::Deny);
+        let prompt = FilePrompt::new("helper", "fine");
+        assert_eq!(NobodyThere.pick_file(&prompt, ANSWER_TIME), None);
     }
 
     #[test]
