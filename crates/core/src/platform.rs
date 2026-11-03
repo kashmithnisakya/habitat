@@ -222,6 +222,7 @@ pub(crate) mod test_support {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code, reason = "Windows only has a C API for these")]
 mod windows {
     use std::io;
     use std::iter;

@@ -1213,6 +1213,7 @@ mod tests {
         target_os = "android",
         ignore = "Android's security policy stops this test from creating a named pipe"
     )]
+    #[allow(unsafe_code, reason = "making a named pipe, for this test")]
     fn named_pipes_are_denied_without_hanging() {
         let fixture = Fixture::new();
         let pipe = fixture.home_path().join("pipe");
