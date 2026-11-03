@@ -81,7 +81,7 @@ This fits phones, which can pause or stop apps at any time. If a run crashes or 
 
 The core talks to a backend through two small traits in [`crates/core/src/backend.rs`](../crates/core/src/backend.rs), so that a microVM backend could be added later. `Backend::load` checks a package's code and prepares it. `LoadedAgent::run` runs it for one event, and reports how the run ended.
 
-The Wasmtime backend links only the [agent API](agent-api.md), and refuses to load a component that imports anything else, such as WASI sockets. Each run starts with a new instance, so nothing in memory carries over, even after a crash. A crash is reported as the kind of trap only, because a full error can hold names chosen by the agent.
+The Wasmtime backend links only the [agent API](agent-api.md), and refuses to load a component that imports anything else, such as WASI sockets. It also refuses one that would [cost too much to compile](#resource-limits). Each run starts with a new instance, so nothing in memory carries over, even after a crash. A crash is reported as the kind of trap only, because a full error can hold names chosen by the agent.
 
 Today the code is compiled every time it's loaded. Compiling once and saving the result comes later, as the [feasibility report](feasibility-android.md) recommends.
 
@@ -109,10 +109,15 @@ Each limit comes from the agent's manifest, up to a maximum set by the host, so 
 - **Memory:** a limit per run, using Wasmtime's `ResourceLimiter`. All of a run's memories and tables count towards one total, because Wasmtime's built-in limits apply to each memory separately. A run can also create at most 100 instances, 100 memories and 100 tables.
 - **Disk:** a cap on each agent's home, enforced by the home store.
 - **AI models:** a token budget per run, enforced by the gateway.
+- **Compiling:** loading a package compiles it, before any of the above apply. File size says little about what that costs, as a file under 4 KB can use 3 GB of memory and more. So the backend reads the code first, and refuses it with `LoadError::TooCostly` if it's over [limits on what makes compiling expensive](compile-costs.md#the-limits), such as nested components, or locals times branches. It then compiles on a thread of its own, and stops waiting after 120 seconds. The compiler can't be stopped, so only one package compiles at a time, and a later load waits or returns `LoadError::Busy`. See [decision 0006](decisions/0006-limit-compile-cost.md).
 
 These limits have gaps:
 
-- **Compiling isn't limited.** Loading a package compiles it before any of these limits apply, so a hostile package could use a lot of the host's CPU and memory at that point. The only protection today is the 128 MB limit on a package's code.
+- **Memory isn't enforced while compiling.** The limits on code are what keeps memory down, and nothing stops a compile that uses more than expected. The most we've measured within the limits is about 2.2 GB on a Mac and 1.3 GB on an emulator, which could get the app stopped on a low-end phone. A kind of bomb that we haven't found could use more. Only compiling in a separate process would fix this.
+- **An abandoned compile keeps running.** After the time limit, it keeps using one core until it ends, and other packages have to wait for it. Within the limits, a compile takes up to about 95 seconds on a Mac, and could take several times that on a phone.
+- **The time limit depends on the device.** Everything else gives the same answer on every device, but a large package could compile in time on a Mac and not on a slow phone.
+- **None of this has been measured on a real phone.** [The figures](compile-costs.md) are from a Mac and an Android emulator, and the limits were chosen from those and from 21 real programs.
+- **The limits are tied to this version of Wasmtime.** They need measuring again after an upgrade.
 - **Host calls can't be interrupted.** Epoch interruption only stops WebAssembly code, so a call that blocks inside the host has to enforce its own time limit. Today's calls are short file operations, but the network and model gateways will have to do this.
 - **The host's own overhead isn't counted.** The limit covers the agent's memories and tables, not compiled code, Wasmtime's bookkeeping or the host's temporary copies of data passed through the API.
 

@@ -8,6 +8,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -128,7 +129,8 @@ pub struct Package {
     index: Vec<u8>,
     manifest_text: Vec<u8>,
     manifest: Manifest,
-    component: Vec<u8>,
+    // Shared, so that a backend can compile it on another thread without a second copy of it.
+    component: Arc<Vec<u8>>,
     hash: PackageHash,
 }
 
@@ -221,7 +223,7 @@ impl Package {
             index,
             manifest_text,
             manifest,
-            component,
+            component: Arc::new(component),
             hash,
         })
     }
@@ -234,6 +236,11 @@ impl Package {
     /// The WebAssembly component. It hasn't been fully validated yet.
     pub fn component(&self) -> &[u8] {
         &self.component
+    }
+
+    /// The same as `component`, for use after this package may have gone.
+    pub fn shared_component(&self) -> Arc<Vec<u8>> {
+        Arc::clone(&self.component)
     }
 
     /// The hash of the package's contents.
@@ -339,7 +346,7 @@ impl Package {
         [
             (INDEX_NAME, &self.index),
             (MANIFEST_NAME, &self.manifest_text),
-            (COMPONENT_NAME, &self.component),
+            (COMPONENT_NAME, self.component.as_slice()),
         ]
     }
 }
@@ -554,6 +561,7 @@ mod tests {
         assert_eq!(read_back.hash(), original.hash());
         assert_eq!(read_back.manifest().name(), "research-helper");
         assert_eq!(read_back.component(), component());
+        assert_eq!(*read_back.shared_component(), component());
 
         let fixture = Fixture::new();
         read_back.install(&fixture.storage).unwrap();

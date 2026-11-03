@@ -65,6 +65,12 @@ pub enum LoadError {
     ForbiddenImport(String),
     /// The agent was built for an API that this host doesn't provide.
     Incompatible(String),
+    /// Compiling the agent's code would cost the host more than it allows. The reason holds
+    /// nothing from the package.
+    TooCostly(String),
+    /// Another package is still being compiled, and it may be a hostile one. This one hasn't been
+    /// checked at all, so try again later.
+    Busy,
     /// The backend failed, through no fault of the agent.
     Internal(String),
 }
@@ -99,6 +105,10 @@ impl fmt::Display for LoadError {
             Self::Incompatible(message) => {
                 write!(f, "the agent doesn't match this host's API: {message}")
             }
+            Self::TooCostly(reason) => {
+                write!(f, "the agent's code is too costly to compile: {reason}")
+            }
+            Self::Busy => write!(f, "another agent's code is still being compiled"),
             Self::Internal(message) => write!(f, "the backend failed: {message}"),
         }
     }
@@ -210,6 +220,18 @@ mod tests {
         let limits = host.limits_for(&requested(u32::MAX, u32::MAX, u32::MAX));
         assert_eq!(limits.memory_bytes, u64::from(u32::MAX) * MB);
         assert_eq!(limits.disk_bytes, u64::from(u32::MAX) * MB);
+    }
+
+    #[test]
+    fn refusals_to_compile_say_why() {
+        assert_eq!(
+            LoadError::TooCostly("modules: 2, over the limit of 1".to_string()).to_string(),
+            "the agent's code is too costly to compile: modules: 2, over the limit of 1"
+        );
+        assert_eq!(
+            LoadError::Busy.to_string(),
+            "another agent's code is still being compiled"
+        );
     }
 
     #[test]
