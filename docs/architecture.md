@@ -50,6 +50,7 @@ See the [threat model](threat-model.md) for what this does and doesn't protect a
 | Broker | `broker` | Decides on and carries out every request that leaves the agent's home |
 | Backend | `backend-wasm` | Runs the untrusted agent |
 | SDK | `sdk` | Helps authors build agents against the agent API |
+| Mobile | `mobile` | What the phone app calls in the core, through UniFFI. It makes no decisions |
 
 ## Phone app
 

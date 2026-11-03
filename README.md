@@ -72,7 +72,8 @@ crates/
 ├── broker/          # Policy, vault, gateway and audit log
 ├── backend-wasm/    # Wasmtime backend
 ├── sdk/             # Rust library for agent authors
-└── cli/             # Mac and Linux command line
+├── cli/             # Mac and Linux command line
+└── mobile/          # What the phone app calls in the core
 wit/                 # The agent-home API
 app/                 # Flutter app for Android and iPhone
 android/             # Android feasibility test

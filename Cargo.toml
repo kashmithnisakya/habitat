@@ -5,6 +5,7 @@ members = [
     "crates/backend-wasm",
     "crates/sdk",
     "crates/cli",
+    "crates/mobile",
     "examples/api-check",
     "examples/file-agent",
     "examples/hello-agent",

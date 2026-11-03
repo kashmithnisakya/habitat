@@ -1,0 +1,29 @@
+[package]
+name = "habitat-mobile"
+description = "What the phone app calls in the Rust core, through UniFFI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "habitat_mobile"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+habitat-backend-wasm = { path = "../backend-wasm" }
+habitat-core = { path = "../core" }
+uniffi = "0.32.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wit-component = "0.263.0"

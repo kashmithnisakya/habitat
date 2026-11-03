@@ -24,6 +24,7 @@ Read these before making design changes:
 | `crates/backend-wasm` | Wasmtime backend |
 | `crates/sdk` | Rust library for agent authors |
 | `crates/cli` | Command line |
+| `crates/mobile` | What the phone app calls in the core, through UniFFI |
 | `wit/` | The agent API |
 | `app/` | Flutter app for Android and iPhone, with its Kotlin and Swift layers |
 | `android/` | Android feasibility test |
