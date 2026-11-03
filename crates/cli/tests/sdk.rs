@@ -30,6 +30,7 @@ fn habitat(folder: &Path) -> Command {
         .env("HABITAT_HOME", folder.join("root"))
         // So that even a bug can't reach the real folder of whoever runs these tests.
         .env("HOME", folder.join("no-such-home"))
+        .env("LOCALAPPDATA", folder.join("no-such-home"))
         .env_remove("XDG_DATA_HOME")
         .stdin(Stdio::null());
     command
