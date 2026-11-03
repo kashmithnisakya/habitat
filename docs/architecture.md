@@ -88,8 +88,8 @@ The [supervisor](../crates/core/src/supervisor.rs) does this as follows:
 These have some limits:
 
 - **Saving isn't all or nothing.** "Saved state" means every write that finished. An agent that's stopped between writing two related files keeps the first, so the agent has to write in an order it can recover from. There's no way yet to save several files at once.
-- **Nothing retries.** A run that fails or is refused stays that way, and it's up to the shell to ask again. That includes a run refused because the history was being read at that moment.
-- **The shell has to call `shut_down`.** Nothing handles signals yet, or Android's lifecycle events. Without that, stopping the host counts as being killed, which is safe but gives the agent no chance to stop first.
+- **Nothing retries.** A run that fails or is refused stays that way, and it's up to the shell to ask again. That includes a run refused because something else was using the agent's folder at that moment, such as `habitat list` reading its records.
+- **The shell has to call `shut_down`.** The CLI does this on Ctrl-C and `SIGTERM`, and gives a compile 5 seconds before exiting without it. Nothing handles Android's lifecycle events yet. Without that, stopping the host counts as being killed, which is safe but gives the agent no chance to stop first.
 - **Records aren't the audit log.** They say that a run happened and how it ended. They aren't protected against tampering by someone with access to the device, and old ones get removed. The audit log can use the run ID to link its entries to a run.
 - **The lock needs a local file system.** File locks may not work on a network drive, and Habitat doesn't check for that.
 
@@ -116,6 +116,8 @@ agents/<agent-id>/
 ```
 
 Only `home/` is visible to the agent. See [Agent packages](packages.md) for the package format.
+
+Removing an agent deletes this whole folder, and is refused while the agent is running. The folder is first moved to a `removed/` folder next to `agents/`, so the agent is gone in one step. If the host dies part way through, a later install under the same name can't inherit what's left of the old agent's home.
 
 The audit log includes a hash of the previous entry in each new entry, so edits to earlier entries are detectable. This doesn't stop someone with full control of the device from replacing the whole log.
 

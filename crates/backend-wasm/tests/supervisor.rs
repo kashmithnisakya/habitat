@@ -16,7 +16,7 @@ use habitat_core::backend::{Event, HostLimits, RunOutcome};
 use habitat_core::home::AgentStorage;
 use habitat_core::package::Package;
 use habitat_core::run_log::{RunEnding, RunRecord};
-use habitat_core::supervisor::{RunError, Supervisor};
+use habitat_core::supervisor::{Supervisor, SupervisorError};
 use tempfile::TempDir;
 
 use support::file_agent_code;
@@ -219,7 +219,7 @@ fn shutting_down_stops_an_agent_that_wont_stop_by_itself() {
         });
         assert_eq!(
             supervisor.run(NAME, &message("x")),
-            Err(RunError::ShuttingDown)
+            Err(SupervisorError::ShuttingDown)
         );
 
         // The next time the host starts, everything is as the agent saved it.
@@ -238,7 +238,7 @@ fn only_one_run_of_an_agent_at_a_time() {
         wait_until("the agent to save its file", || saved.exists());
         assert_eq!(
             supervisor.run(NAME, &message("expect saved.txt x")),
-            Err(RunError::AlreadyRunning)
+            Err(SupervisorError::AlreadyRunning)
         );
         assert!(supervisor.shut_down(WAIT_LIMIT));
         run.join().unwrap().unwrap();
@@ -287,7 +287,7 @@ fn killing_the_host_during_a_run_loses_nothing_that_was_saved() {
     let supervisor = supervisor(root.path());
     assert_eq!(
         supervisor.run(NAME, &message("x")),
-        Err(RunError::AlreadyRunning)
+        Err(SupervisorError::AlreadyRunning)
     );
     let history = supervisor.history(NAME).unwrap();
     assert_eq!(history.runs.len(), 2);

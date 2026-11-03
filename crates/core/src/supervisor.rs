@@ -12,19 +12,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use semver::Version;
+
 use crate::backend::{Backend, Event, HostLimits, RunOutcome, StopSignal};
 use crate::home::{AgentStorage, HomeError};
-use crate::package::Package;
+use crate::package::{Package, PackageError};
 use crate::run_log::{RunEnding, RunHistory, RunLog, RunRecord};
 
-/// Why a run didn't happen, or couldn't be fully recorded. Messages hold no host paths.
+/// Why something the supervisor was asked to do didn't happen. Messages hold no host paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunError {
+pub enum SupervisorError {
     /// That can't be the name of an agent.
     InvalidName,
     /// No package is installed for this agent.
     NotInstalled,
-    /// This agent is already running, on this host process or another one.
+    /// This agent is running, on this host process or another one, or something else is using
+    /// its folder for a moment.
     AlreadyRunning,
     /// The host is shutting down, so it isn't starting anything new.
     ShuttingDown,
@@ -32,9 +35,13 @@ pub enum RunError {
     NotRecorded(io::ErrorKind),
     /// The agent ran, but how it ended couldn't be saved. This is how it ended.
     EndingNotSaved(Box<RunRecord>),
+    /// The package couldn't be installed.
+    Package(PackageError),
+    /// The host's file system failed.
+    Storage(io::ErrorKind),
 }
 
-impl fmt::Display for RunError {
+impl fmt::Display for SupervisorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidName => write!(f, "that isn't a valid agent name"),
@@ -50,11 +57,13 @@ impl fmt::Display for RunError {
             Self::EndingNotSaved(record) => {
                 write!(f, "the ending of run {} couldn't be saved", record.id)
             }
+            Self::Package(error) => write!(f, "{error}"),
+            Self::Storage(kind) => write!(f, "file system error: {kind}"),
         }
     }
 }
 
-impl std::error::Error for RunError {}
+impl std::error::Error for SupervisorError {}
 
 /// Held for as long as an agent is running. The operating system lets go of it when the process
 /// ends, however that happens, so a killed host can't leave an agent locked.
@@ -63,7 +72,7 @@ struct RunLock {
 }
 
 impl RunLock {
-    fn try_acquire(storage: &AgentStorage) -> Result<Self, RunError> {
+    fn try_acquire(storage: &AgentStorage) -> Result<Self, SupervisorError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -75,14 +84,24 @@ impl RunLock {
             .map_err(not_recorded)?;
         match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(RunError::AlreadyRunning),
+            Err(TryLockError::WouldBlock) => Err(SupervisorError::AlreadyRunning),
             Err(TryLockError::Error(error)) => Err(not_recorded(error)),
         }
     }
 }
 
-fn not_recorded(error: io::Error) -> RunError {
-    RunError::NotRecorded(error.kind())
+fn not_recorded(error: io::Error) -> SupervisorError {
+    SupervisorError::NotRecorded(error.kind())
+}
+
+/// What's known about one installed agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSummary {
+    /// Safe to print, like everything else here.
+    pub name: String,
+    /// `None` if its manifest can't be read any more, which only something else could cause.
+    pub version: Option<Version>,
+    pub last_run: Option<RunRecord>,
 }
 
 /// Starts agents, and stops them when the host shuts down. A host should have one of these, and
@@ -109,10 +128,53 @@ impl Supervisor {
         }
     }
 
+    /// Installs a package, under the name in its manifest. Its home is created empty.
+    pub fn install(&self, package: &Package) -> Result<(), SupervisorError> {
+        let storage = AgentStorage::open(&self.root, package.manifest().name())
+            .map_err(|error| storage_error(&error))?;
+        let _lock = RunLock::try_acquire(&storage)?;
+        package.install(&storage).map_err(SupervisorError::Package)
+    }
+
+    /// Lists the installed agents, sorted by name.
+    pub fn list(&self) -> Result<Vec<AgentSummary>, SupervisorError> {
+        let names = AgentStorage::names(&self.root)
+            .map_err(|error| SupervisorError::Storage(error.kind()))?;
+        let mut agents = Vec::new();
+        for name in names {
+            // Any folder without a recorded package is an install that didn't finish.
+            let Ok(storage) = self.installed_agent(&name) else {
+                continue;
+            };
+            let history = self.history(&name).ok();
+            agents.push(AgentSummary {
+                version: Package::installed_version(&storage).ok(),
+                last_run: history.and_then(|history| history.runs.into_iter().last()),
+                name,
+            });
+        }
+        Ok(agents)
+    }
+
+    /// Deletes an agent, with its package, its home and its records, and nothing else. This is
+    /// refused while the agent is running.
+    pub fn remove(&self, agent_name: &str) -> Result<(), SupervisorError> {
+        let storage = open_existing(&self.root, agent_name)?;
+        let _lock = RunLock::try_acquire(&storage)?;
+        storage
+            .remove()
+            .map_err(|error| SupervisorError::Storage(error.kind()))
+    }
+
+    /// Whether [`Supervisor::shut_down`] has been called.
+    pub fn is_shutting_down(&self) -> bool {
+        self.stop.is_stopped()
+    }
+
     /// Runs an agent for one event, and waits for it to end. Whatever the agent does, this returns
     /// a record of it, and the next run can start. Anything the agent saved before it failed is
     /// still there, because each write to its home is saved as it happens.
-    pub fn run(&self, agent_name: &str, event: &Event) -> Result<RunRecord, RunError> {
+    pub fn run(&self, agent_name: &str, event: &Event) -> Result<RunRecord, SupervisorError> {
         let _active = self.count_this_run()?;
         let storage = self.installed_agent(agent_name)?;
         let _lock = RunLock::try_acquire(&storage)?;
@@ -134,7 +196,7 @@ impl Supervisor {
         let _ = log.prune();
         match saved {
             Ok(()) => Ok(record),
-            Err(_) => Err(RunError::EndingNotSaved(Box::new(record))),
+            Err(_) => Err(SupervisorError::EndingNotSaved(Box::new(record))),
         }
     }
 
@@ -151,7 +213,7 @@ impl Supervisor {
         };
         // Compiling can take a while, and can't be interrupted.
         if self.stop.is_stopped() {
-            return RunEnding::NotStarted(RunError::ShuttingDown.to_string());
+            return RunEnding::NotStarted(SupervisorError::ShuttingDown.to_string());
         }
         let home = match storage.home(limits.disk_bytes) {
             Ok(home) => home,
@@ -162,8 +224,8 @@ impl Supervisor {
 
     /// An agent's recent runs. A run that's going has no ending yet, and one that was interrupted
     /// is marked as that. This holds the agent's lock while it reads, so a run asked for at that
-    /// moment is refused with [`RunError::AlreadyRunning`], and can be asked for again.
-    pub fn history(&self, agent_name: &str) -> Result<RunHistory, RunError> {
+    /// moment is refused with [`SupervisorError::AlreadyRunning`], and can be asked for again.
+    pub fn history(&self, agent_name: &str) -> Result<RunHistory, SupervisorError> {
         let storage = open_existing(&self.root, agent_name)?;
         let log = RunLog::open(&storage).map_err(not_recorded)?;
         let lock = match RunLock::try_acquire(&storage) {
@@ -171,7 +233,7 @@ impl Supervisor {
                 log.close_interrupted().map_err(not_recorded)?;
                 Some(lock)
             }
-            Err(RunError::AlreadyRunning) => None,
+            Err(SupervisorError::AlreadyRunning) => None,
             Err(error) => return Err(error),
         };
         let history = log.history().map_err(not_recorded)?;
@@ -202,10 +264,10 @@ impl Supervisor {
 
     /// Checks under the same lock that `shut_down` waits on, so that it can't miss a run that's
     /// just starting.
-    fn count_this_run(&self) -> Result<ActiveRun<'_>, RunError> {
+    fn count_this_run(&self) -> Result<ActiveRun<'_>, SupervisorError> {
         let mut active = self.active_runs();
         if self.stop.is_stopped() {
-            return Err(RunError::ShuttingDown);
+            return Err(SupervisorError::ShuttingDown);
         }
         *active += 1;
         Ok(ActiveRun { supervisor: self })
@@ -217,24 +279,30 @@ impl Supervisor {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn installed_agent(&self, agent_name: &str) -> Result<AgentStorage, RunError> {
+    fn installed_agent(&self, agent_name: &str) -> Result<AgentStorage, SupervisorError> {
         let storage = open_existing(&self.root, agent_name)?;
         match storage.package_hash_path().symlink_metadata() {
             Ok(_) => Ok(storage),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(RunError::NotInstalled),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(SupervisorError::NotInstalled)
+            }
             Err(error) => Err(not_recorded(error)),
         }
     }
 }
 
-fn open_existing(root: &Path, agent_name: &str) -> Result<AgentStorage, RunError> {
+fn open_existing(root: &Path, agent_name: &str) -> Result<AgentStorage, SupervisorError> {
     AgentStorage::open_existing(root, agent_name).map_err(|error| match error {
-        HomeError::InvalidPath(_) => RunError::InvalidName,
-        HomeError::NotFound => RunError::NotInstalled,
-        other => RunError::NotRecorded(match other {
-            HomeError::Io(kind) => kind,
-            _ => io::ErrorKind::Other,
-        }),
+        HomeError::InvalidPath(_) => SupervisorError::InvalidName,
+        HomeError::NotFound => SupervisorError::NotInstalled,
+        other => storage_error(&other),
+    })
+}
+
+fn storage_error(error: &HomeError) -> SupervisorError {
+    SupervisorError::Storage(match error {
+        HomeError::Io(kind) => *kind,
+        _ => io::ErrorKind::Other,
     })
 }
 
@@ -253,6 +321,7 @@ impl Drop for ActiveRun<'_> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
@@ -618,18 +687,18 @@ mod tests {
         let supervisor = fixture.supervisor(backend);
         assert_eq!(
             supervisor.run("nobody", &message("x")),
-            Err(RunError::NotInstalled)
+            Err(SupervisorError::NotInstalled)
         );
         assert_eq!(
             supervisor.history("nobody").map(|_| ()),
-            Err(RunError::NotInstalled)
+            Err(SupervisorError::NotInstalled)
         );
         assert!(!fixture.root.path().join("agents/nobody").exists());
 
         AgentStorage::open(fixture.root.path(), "empty").unwrap();
         assert_eq!(
             supervisor.run("empty", &message("x")),
-            Err(RunError::NotInstalled)
+            Err(SupervisorError::NotInstalled)
         );
     }
 
@@ -640,12 +709,12 @@ mod tests {
         for name in ["", "..", "../agent", "a/b", "/etc", "Agent\n"] {
             assert_eq!(
                 supervisor.run(name, &message("x")),
-                Err(RunError::InvalidName),
+                Err(SupervisorError::InvalidName),
                 "{name:?}"
             );
             assert_eq!(
                 supervisor.history(name).map(|_| ()),
-                Err(RunError::InvalidName),
+                Err(SupervisorError::InvalidName),
                 "{name:?}"
             );
         }
@@ -663,13 +732,16 @@ mod tests {
         let backend = FakeBackend::new(|_, _, _, _| panic!("this shouldn't run"));
         let supervisor = fixture.supervisor(backend);
         let error = supervisor.run(NAME, &message("x")).unwrap_err();
-        assert!(matches!(error, RunError::NotRecorded(_)), "{error:?}");
+        assert!(
+            matches!(error, SupervisorError::NotRecorded(_)),
+            "{error:?}"
+        );
 
         // The same goes if there's nowhere for records to go at all.
         fs::remove_dir_all(&runs).unwrap();
         fs::write(&runs, "not a folder").unwrap();
         let error = supervisor.run(NAME, &message("x")).unwrap_err();
-        assert!(matches!(error, RunError::NotRecorded(_)), "{error:?}");
+        assert!(matches!(error, SupervisorError::Storage(_)), "{error:?}");
     }
 
     #[test]
@@ -681,7 +753,8 @@ mod tests {
             RunOutcome::failed("how it went")
         });
         let supervisor = fixture.supervisor(backend);
-        let Err(RunError::EndingNotSaved(record)) = supervisor.run(NAME, &message("x")) else {
+        let Err(SupervisorError::EndingNotSaved(record)) = supervisor.run(NAME, &message("x"))
+        else {
             panic!("the run should have reported this");
         };
         assert_eq!(
@@ -702,12 +775,12 @@ mod tests {
 
             assert_eq!(
                 supervisor.run(NAME, &message("second")),
-                Err(RunError::AlreadyRunning)
+                Err(SupervisorError::AlreadyRunning)
             );
             // Nor can a second supervisor get around it, as another process would try to.
             assert_eq!(
                 fixture.supervisor(scripted()).run(NAME, &message("second")),
-                Err(RunError::AlreadyRunning)
+                Err(SupervisorError::AlreadyRunning)
             );
             assert_eq!(fixture.record_count(), 1);
 
@@ -828,10 +901,12 @@ mod tests {
         let fixture = Fixture::new();
         let backend = FakeBackend::new(|_, _, _, _| panic!("this shouldn't run"));
         let supervisor = fixture.supervisor(backend);
+        assert!(!supervisor.is_shutting_down());
         assert!(supervisor.shut_down(Duration::ZERO));
+        assert!(supervisor.is_shutting_down());
         assert_eq!(
             supervisor.run(NAME, &message("x")),
-            Err(RunError::ShuttingDown)
+            Err(SupervisorError::ShuttingDown)
         );
         assert_eq!(fixture.record_count(), 0);
         // The history can still be read.
@@ -923,6 +998,284 @@ mod tests {
         );
     }
 
+    fn version(text: &str) -> Option<Version> {
+        Some(Version::parse(text).unwrap())
+    }
+
+    fn other_manifest(name: &str, version: &str) -> String {
+        format!(
+            "[agent]\nname = \"{name}\"\nversion = \"{version}\"\n\n[limits]\nmemory_mb = 8\nrun_seconds = 7\ndisk_mb = 1\n"
+        )
+    }
+
+    fn package(manifest: &str) -> Package {
+        Package::new(manifest, COMPONENT.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn installing_makes_an_agent_that_can_run() {
+        let root = TempDir::new().unwrap();
+        let supervisor = Supervisor::new(root.path(), scripted(), HostLimits::default());
+        assert_eq!(
+            supervisor.run(NAME, &message("x")),
+            Err(SupervisorError::NotInstalled)
+        );
+        supervisor.install(&package(MANIFEST)).unwrap();
+        let record = supervisor.run(NAME, &message("x")).unwrap();
+        assert_eq!(ending(&record), &RunOutcome::Completed);
+    }
+
+    #[test]
+    fn installing_twice_is_refused_and_keeps_the_agents_files() {
+        let fixture = Fixture::new();
+        let supervisor = fixture.supervisor(scripted());
+        supervisor.run(NAME, &message("write")).unwrap();
+        assert_eq!(
+            supervisor.install(&package(MANIFEST)),
+            Err(SupervisorError::Package(PackageError::AlreadyInstalled))
+        );
+        let record = supervisor.run(NAME, &message("check")).unwrap();
+        assert_eq!(ending(&record), &RunOutcome::Completed);
+    }
+
+    #[test]
+    fn listing_shows_installed_agents_in_order() {
+        let root = TempDir::new().unwrap();
+        let supervisor = Supervisor::new(root.path(), scripted(), HostLimits::default());
+        assert_eq!(supervisor.list(), Ok(Vec::new()));
+
+        supervisor
+            .install(&package(&other_manifest("zebra", "2.0.0")))
+            .unwrap();
+        supervisor
+            .install(&package(&other_manifest("ant", "1.2.3")))
+            .unwrap();
+        supervisor.run("zebra", &message("x")).unwrap();
+        let record = supervisor.run("zebra", &message("x")).unwrap();
+
+        // None of these are agents.
+        AgentStorage::open(root.path(), "unfinished-install").unwrap();
+        fs::write(root.path().join("agents/a-file"), "x").unwrap();
+        fs::create_dir(root.path().join("agents/Not-A-Name")).unwrap();
+
+        assert_eq!(
+            supervisor.list().unwrap(),
+            vec![
+                AgentSummary {
+                    name: "ant".to_string(),
+                    version: version("1.2.3"),
+                    last_run: None,
+                },
+                AgentSummary {
+                    name: "zebra".to_string(),
+                    version: version("2.0.0"),
+                    last_run: Some(record),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_broken_agent_is_still_listed() {
+        let fixture = Fixture::new();
+        let manifest = fixture.agent_path().join("package/agent.toml");
+        fs::remove_file(&manifest).unwrap();
+        fs::write(&manifest, "not a manifest").unwrap();
+        let agents = fixture.supervisor(scripted()).list().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, NAME);
+        assert_eq!(agents[0].version, None);
+    }
+
+    #[test]
+    fn removing_deletes_that_agent_and_nothing_else() {
+        let fixture = Fixture::new();
+        fixture.install("other", &other_manifest("other", "0.1.0"));
+        let supervisor = fixture.supervisor(scripted());
+        supervisor.run(NAME, &message("write")).unwrap();
+        supervisor.run("other", &message("write")).unwrap();
+        let beside = fixture.root.path().join("beside-agents.txt");
+        fs::write(&beside, "keep").unwrap();
+
+        supervisor.remove(NAME).unwrap();
+
+        assert!(!fixture.agent_path().exists());
+        assert_eq!(
+            fs::read_dir(fixture.root.path().join("removed"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            supervisor.run(NAME, &message("x")),
+            Err(SupervisorError::NotInstalled)
+        );
+        assert_eq!(fs::read_to_string(&beside).unwrap(), "keep");
+        let other = supervisor.run("other", &message("check")).unwrap();
+        assert_eq!(ending(&other), &RunOutcome::Completed);
+    }
+
+    #[test]
+    fn a_new_agent_with_the_same_name_gets_nothing_from_the_old_one() {
+        let fixture = Fixture::new();
+        let backend = FakeBackend::new(|event, home, _, _| match text(event) {
+            "write" => {
+                home.write("saved", b"state").unwrap();
+                RunOutcome::Completed
+            }
+            _ => {
+                assert_eq!(home.read("saved"), Err(HomeError::NotFound));
+                RunOutcome::Completed
+            }
+        });
+        let supervisor = fixture.supervisor(backend);
+        supervisor.run(NAME, &message("write")).unwrap();
+        supervisor.remove(NAME).unwrap();
+        supervisor.install(&package(MANIFEST)).unwrap();
+        let record = supervisor.run(NAME, &message("check")).unwrap();
+        assert_eq!(ending(&record), &RunOutcome::Completed);
+        assert_eq!(supervisor.history(NAME).unwrap().runs, vec![record]);
+    }
+
+    #[test]
+    fn an_agent_is_gone_in_one_step_even_if_deleting_its_files_fails() {
+        let fixture = Fixture::new();
+        let stuck = fixture.agent_path().join("home/stuck");
+        fs::create_dir(&stuck).unwrap();
+        fs::write(stuck.join("file"), "x").unwrap();
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o500)).unwrap();
+        // The superuser can delete it anyway, and then there's nothing to see here.
+        let can_delete_anyway = fs::write(stuck.join("probe"), "x").is_ok();
+
+        let supervisor = fixture.supervisor(scripted());
+        let result = supervisor.remove(NAME);
+        assert!(!fixture.agent_path().exists());
+        assert_eq!(
+            supervisor.run(NAME, &message("x")),
+            Err(SupervisorError::NotInstalled)
+        );
+        assert_eq!(supervisor.list(), Ok(Vec::new()));
+        supervisor.install(&package(MANIFEST)).unwrap();
+        let home = fixture.agent_path().join("home");
+        assert_eq!(fs::read_dir(home).unwrap().count(), 0);
+
+        if !can_delete_anyway {
+            assert!(
+                matches!(result, Err(SupervisorError::Storage(_))),
+                "{result:?}"
+            );
+            let removed = fixture.root.path().join("removed");
+            let left = fs::read_dir(&removed).unwrap().next().unwrap().unwrap();
+            let stuck = left.path().join("home/stuck");
+            fs::set_permissions(stuck, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[test]
+    fn installing_is_refused_while_the_agent_runs() {
+        let fixture = Fixture::new();
+        let (started, has_started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let supervisor = fixture.supervisor(held(started, released));
+        thread::scope(|scope| {
+            let run = scope.spawn(|| supervisor.run(NAME, &message("x")));
+            has_started.recv().unwrap();
+            assert_eq!(
+                supervisor.install(&package(MANIFEST)),
+                Err(SupervisorError::AlreadyRunning)
+            );
+            release.send(()).unwrap();
+            run.join().unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn removing_doesnt_follow_symlinks_out_of_the_agents_folder() {
+        let fixture = Fixture::new();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("file.txt");
+        fs::write(&file, "keep").unwrap();
+        let home = fixture.agent_path().join("home");
+        symlink(outside.path(), home.join("linked-folder")).unwrap();
+        symlink(&file, home.join("linked-file")).unwrap();
+
+        fixture.supervisor(scripted()).remove(NAME).unwrap();
+
+        assert!(!fixture.agent_path().exists());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "keep");
+    }
+
+    #[test]
+    fn a_symlink_in_place_of_an_agents_folder_is_removed_without_touching_its_target() {
+        let fixture = Fixture::new();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("file.txt");
+        fs::write(&file, "keep").unwrap();
+        symlink(outside.path(), fixture.root.path().join("agents/linked")).unwrap();
+
+        fixture.supervisor(scripted()).remove("linked").unwrap();
+
+        assert!(!fixture.root.path().join("agents/linked").exists());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "keep");
+    }
+
+    #[test]
+    fn removing_is_refused_while_the_agent_runs() {
+        let fixture = Fixture::new();
+        let (started, has_started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let supervisor = fixture.supervisor(held(started, released));
+        thread::scope(|scope| {
+            let run = scope.spawn(|| supervisor.run(NAME, &message("x")));
+            has_started.recv().unwrap();
+            assert_eq!(
+                supervisor.remove(NAME),
+                Err(SupervisorError::AlreadyRunning)
+            );
+            assert!(fixture.agent_path().join("package").exists());
+            release.send(()).unwrap();
+            run.join().unwrap().unwrap();
+        });
+        supervisor.remove(NAME).unwrap();
+    }
+
+    #[test]
+    fn what_a_crash_left_while_removing_is_cleared_and_doesnt_count_as_an_agent() {
+        let fixture = Fixture::new();
+        let left_behind = fixture.root.path().join("removed/agent-0123");
+        fs::create_dir_all(left_behind.join("home")).unwrap();
+        fs::write(left_behind.join("home/file"), "x").unwrap();
+        let supervisor = fixture.supervisor(scripted());
+        assert_eq!(supervisor.list().unwrap().len(), 1);
+
+        supervisor.remove(NAME).unwrap();
+        assert_eq!(
+            fs::read_dir(fixture.root.path().join("removed"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(supervisor.list(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn removing_refuses_bad_names_and_unknown_agents() {
+        let fixture = Fixture::new();
+        let supervisor = fixture.supervisor(scripted());
+        for name in ["", ".", "..", "../agents", "agent/home", "/etc", "Agent"] {
+            assert_eq!(
+                supervisor.remove(name),
+                Err(SupervisorError::InvalidName),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            supervisor.remove("nobody"),
+            Err(SupervisorError::NotInstalled)
+        );
+        assert!(fixture.agent_path().exists());
+    }
+
     #[test]
     fn errors_hold_no_host_paths() {
         let fixture = Fixture::new();
@@ -935,12 +1288,14 @@ mod tests {
             ending: None,
         };
         for error in [
-            RunError::InvalidName,
-            RunError::NotInstalled,
-            RunError::AlreadyRunning,
-            RunError::ShuttingDown,
-            RunError::NotRecorded(io::ErrorKind::PermissionDenied),
-            RunError::EndingNotSaved(Box::new(record)),
+            SupervisorError::InvalidName,
+            SupervisorError::NotInstalled,
+            SupervisorError::AlreadyRunning,
+            SupervisorError::ShuttingDown,
+            SupervisorError::NotRecorded(io::ErrorKind::PermissionDenied),
+            SupervisorError::EndingNotSaved(Box::new(record)),
+            SupervisorError::Package(PackageError::NotInstalled),
+            SupervisorError::Storage(io::ErrorKind::PermissionDenied),
         ] {
             let text = error.to_string();
             assert!(!text.contains(&root) && !text.contains('/'), "{text}");

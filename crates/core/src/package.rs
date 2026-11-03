@@ -10,6 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
+use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Entries, EntryType, Header};
@@ -340,6 +341,17 @@ impl Package {
             return Err(PackageError::WrongAgent);
         }
         Ok(package)
+    }
+
+    /// Reads the version of an agent's installed package, to show to someone. This only reads the
+    /// manifest, so unlike [`Package::load_installed`], it doesn't check that nothing has changed.
+    pub fn installed_version(storage: &AgentStorage) -> Result<Version, PackageError> {
+        let path = storage.package_path().join(MANIFEST_NAME);
+        let text = read_installed(&path, MAX_MANIFEST)?;
+        let text = std::str::from_utf8(&text)
+            .map_err(|_| PackageError::Malformed("agent.toml isn't UTF-8"))?;
+        let manifest = Manifest::parse(text).map_err(PackageError::Manifest)?;
+        Ok(manifest.version().clone())
     }
 
     fn files(&self) -> [(&'static str, &[u8]); 3] {

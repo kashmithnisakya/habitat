@@ -5,7 +5,7 @@
 Habitat gives an agent its own persistent space to live in. The agent keeps its files, memory and tools there, but it can't touch your settings, personal data or other apps unless you allow it.
 
 > [!WARNING]
-> **Early development: nothing works yet, and this is not secure.** The repository currently holds the design and project skeleton. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) exist and an outside security review has taken place.
+> **Early development: this is not secure yet.** You can install and run an agent on a Mac or Linux computer, but agents can't do much more than use their own files. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) are finished and an outside security review has taken place.
 
 ## Why
 
@@ -46,7 +46,7 @@ Planned guarantees:
 |---|---|
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
-| Mac core, broker and secrets | In progress: an agent can run through Wasmtime and use files in its home, within time and memory limits |
+| Mac core, broker and secrets | In progress: you can install and run an agent from the command line, and it can use files in its home, within time and memory limits. There's no broker yet, so it can't reach anything else |
 | Attack tests | Not started |
 | Android app | Not started |
 
@@ -94,6 +94,78 @@ cargo build --workspace
 ```bash
 cargo test --workspace
 ```
+
+## Getting started
+
+This installs and runs [`file-agent`](examples/file-agent/src/lib.rs), a sample agent that does what each message tells it to with the files in its home. It only exists for testing, and a friendlier example is [on the way](https://github.com/kashmithnisakya/habitat/issues/13).
+
+As well as the things listed under [Build](#build), you need `wasm-tools` to turn the agent into a WebAssembly component:
+
+```bash
+cargo install wasm-tools --locked
+```
+
+Build Habitat and the agent:
+
+```bash
+cargo build --release -p habitat-cli
+```
+
+```bash
+cargo build --release -p habitat-file-agent --target wasm32-unknown-unknown
+```
+
+```bash
+wasm-tools component new target/wasm32-unknown-unknown/release/habitat_file_agent.wasm -o file-agent.wasm
+```
+
+Put the agent and its [manifest](examples/file-agent/agent.toml) into a package, and install it:
+
+```bash
+target/release/habitat pack examples/file-agent/agent.toml file-agent.wasm -o file-agent.habitat
+```
+
+```bash
+target/release/habitat install file-agent.habitat
+```
+
+Run it, and tell it to save a file:
+
+```bash
+target/release/habitat run file-agent "write hello.txt hi there"
+```
+
+Each run is a new start, and only the agent's files carry over. This one fails unless the file is still there:
+
+```bash
+target/release/habitat run file-agent "expect hello.txt hi there"
+```
+
+See what's installed, and how each agent's last run went:
+
+```bash
+target/release/habitat list
+```
+
+Delete the agent and all its files. This asks you to confirm first:
+
+```bash
+target/release/habitat remove file-agent
+```
+
+Agents are kept in `~/Library/Application Support/habitat` on a Mac, and `~/.local/share/habitat` on Linux. To use another folder, pass `--root` or set `HABITAT_HOME`.
+
+`habitat --help` lists every command, and these exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | It worked |
+| 1 | It failed, or was cancelled |
+| 2 | The command line was wrong |
+| 3 | The agent ran, and failed, crashed or hit a limit |
+| 4 | The agent's code never started |
+| 5 | The agent is already running |
+| 130 | The agent was stopped by Ctrl-C or a request to stop |
 
 ## Contributing
 
