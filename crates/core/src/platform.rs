@@ -325,13 +325,10 @@ mod windows_tests {
         for path in [folder.clone(), folder.join("file"), folder.join("child")] {
             let list = access_list(&path);
             assert!(list.contains("OWNER RIGHTS"), "{list}");
-            // These hold a backslash, or the path itself could look like one, such as C:\Users.
-            for other in [
-                "Everyone",
-                "BUILTIN\\Users",
-                "Authenticated Users",
-                "BUILTIN\\Administrators",
-            ] {
+            // These hold a backslash, or the path itself could look like one, such as C:\\Users. An
+            // elevated process makes Administrators the owner of what it creates, which is what CI
+            // does, and they could override any of this anyway, so that isn't checked for.
+            for other in ["Everyone", "BUILTIN\\Users", "Authenticated Users"] {
                 assert!(!list.contains(other), "{other} in {list}");
             }
         }
