@@ -24,6 +24,8 @@
 use std::fmt;
 
 pub mod files;
+pub mod model;
+pub mod net;
 pub mod state;
 
 /// The agent API, as generated from `wit/agent-home.wit`. Use this for anything that the rest of

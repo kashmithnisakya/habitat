@@ -38,3 +38,28 @@ pub fn remove(path: &str) -> Result<(), Error> {
 pub fn list(path: &str) -> Result<Vec<DirEntry>, Error> {
     Ok(api::list_dir(path)?)
 }
+
+/// A file that the user chose. The agent gets its name and what's in it, and never where it is.
+#[derive(Debug)]
+pub struct UserFile {
+    pub name: String,
+    pub contents: Vec<u8>,
+}
+
+/// Asks the user to choose a file, and reads all of it. The manifest has to say `files = "ask"`. The
+/// reason is shown to the user, marked as this agent's own claim. After this, anywhere this agent
+/// wants to reach in this run needs a fresh approval, as `docs/permissions.md` explains.
+pub fn pick_user_file(reason: &str) -> Result<UserFile, Error> {
+    let file = api::pick_user_file(reason)?;
+    let mut contents = Vec::new();
+    loop {
+        let piece = file.read(contents.len() as u64, READ_SIZE)?;
+        if piece.is_empty() {
+            return Ok(UserFile {
+                name: file.name(),
+                contents,
+            });
+        }
+        contents.extend_from_slice(&piece);
+    }
+}

@@ -79,6 +79,14 @@ jobs:
         run: |
           cargo build -p habitat-api-check --target wasm32-unknown-unknown --release
           wasm-tools component new target/wasm32-unknown-unknown/release/habitat_api_check.wasm -o api-check.wasm
+      - name: Build the research helper
+        run: |
+          cargo build -p habitat-research-helper --target wasm32-unknown-unknown --release
+          wasm-tools component new target/wasm32-unknown-unknown/release/habitat_research_helper.wasm -o research-helper.wasm
+          if wasm-tools component wit research-helper.wasm | grep -E '^\s*import ' | grep -v 'habitat:host/'; then
+            echo "The research helper imports something other than the agent API"
+            exit 1
+          fi
       - name: Check that the agent imports only the API
         run: |
           imports=$(wasm-tools component wit api-check.wasm | grep -E '^\s*import ')
