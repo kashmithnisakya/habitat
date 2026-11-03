@@ -176,6 +176,17 @@ fn a_saved_value_that_cant_be_read_is_an_error_and_isnt_lost() {
 }
 
 #[test]
+fn a_host_error_while_loading_isnt_mistaken_for_nothing_saved() {
+    let folder = installed(CHECK_MANIFEST, check_code());
+    let folder = folder.path();
+    // A folder where the value's file should be, so that reading it fails with something else.
+    check(folder, "write-file state/note.json/inside x");
+    let said = check_fails(folder, "expect-nothing note");
+    assert!(said.contains("the agent said:"), "{said}");
+    assert!(!said.contains("holds"), "{said}");
+}
+
+#[test]
 fn state_names_cant_lead_out_of_the_state_folder() {
     let folder = installed(CHECK_MANIFEST, check_code());
     let folder = folder.path();

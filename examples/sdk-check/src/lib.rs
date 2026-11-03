@@ -34,6 +34,7 @@ impl Agent for Check {
             }
             "save-big" => state::save(first, &"x".repeat(rest.parse()?))?,
             "clear" => state::clear(first)?,
+            "write-file" => files::write(first, rest.as_bytes())?,
             "corrupt" => files::write(&format!("state/{first}.json"), b"{not json")?,
             "load-as-number" => {
                 let _: Option<u64> = state::load(first)?;
