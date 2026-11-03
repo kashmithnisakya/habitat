@@ -61,7 +61,7 @@ Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/ha
 - [Roadmap](docs/roadmap.md)
 - [Design decisions](docs/decisions/README.md)
 - [Android feasibility report (draft)](docs/feasibility-android.md)
-- [Agent API draft](wit/agent-home.wit)
+- [Agent API](docs/agent-api.md)
 
 ## Repository layout
 

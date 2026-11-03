@@ -71,7 +71,7 @@ Network hosts must be lowercase and contain a dot. Schemes, ports, paths and wil
 | Read or write inside the agent's home | Always allowed, within the disk limit |
 | Reach a network destination that isn't granted | Asks the user if declared in the manifest, otherwise denied |
 | Use an AI model | Allowed if granted, within the token budget |
-| Read a user file outside the home | Always asks, unless a grant covers it |
+| Read a user file outside the home | Always asks, and the user chooses one file for the current run |
 | Read a raw secret | Never allowed |
 
 ## Grant lifetimes

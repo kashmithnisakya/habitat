@@ -30,7 +30,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
       - run: wasm-tools component wit wit/
+      - name: Build an agent against the API
+        run: |
+          cargo build -p habitat-api-check --target wasm32-unknown-unknown --release
+          wasm-tools component new target/wasm32-unknown-unknown/release/habitat_api_check.wasm -o api-check.wasm
+      - name: Check that the agent imports only the API
+        run: |
+          imports=$(wasm-tools component wit api-check.wasm | grep -E '^\s*import ')
+          echo "$imports"
+          echo "$imports" | grep -q 'habitat:host/agent-home@'
+          if echo "$imports" | grep -v 'habitat:host/'; then
+            echo "The agent imports something other than the agent API"
+            exit 1
+          fi
