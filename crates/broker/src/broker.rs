@@ -133,7 +133,7 @@ struct ForRun {
     network: Arc<dyn Network>,
     /// Whether this run has read the user's private data, which only ever goes from no to yes.
     private_read: bool,
-    /// Everywhere that this run has reached, or the user has approved since it read private data.
+    /// What the user has approved since this run read private data.
     reached: HashSet<Target>,
     messages_sent: u32,
     limit: PromptLimit,
@@ -300,7 +300,6 @@ impl ForRun {
         }
         // A grant for one request is used up from here, whatever happens next.
         self.grants.used(&target);
-        self.reached.insert(target.clone());
 
         let wait = self
             .deadline
