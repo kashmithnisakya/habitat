@@ -82,7 +82,7 @@ pub struct Context<'a> {
 pub enum LeakCheck<'a> {
     /// The run hasn't read anything private.
     NothingPrivateRead,
-    /// It has, and it's reached these so far, or the user has approved them since.
+    /// It has, and the user has approved these since.
     PrivateRead { reached: &'a HashSet<Target> },
 }
 
