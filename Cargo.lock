@@ -729,10 +729,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "habitat-hello"
+version = "0.0.0"
+dependencies = [
+ "habitat-sdk",
+ "serde",
+]
+
+[[package]]
 name = "habitat-sdk"
 version = "0.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "wit-bindgen",
+]
+
+[[package]]
+name = "habitat-sdk-check"
+version = "0.0.0"
+dependencies = [
+ "habitat-sdk",
 ]
 
 [[package]]

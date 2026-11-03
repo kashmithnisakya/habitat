@@ -57,11 +57,18 @@ jobs:
           HABITAT_HOME: ${{ runner.temp }}/habitat
         run: |
           cargo build --release -p habitat-cli
-          cargo build --release -p habitat-file-agent --target wasm32-unknown-unknown
-          wasm-tools component new target/wasm32-unknown-unknown/release/habitat_file_agent.wasm -o file-agent.wasm
-          target/release/habitat pack examples/file-agent/agent.toml file-agent.wasm -o file-agent.habitat
-          target/release/habitat install file-agent.habitat
-          target/release/habitat run file-agent "write hello.txt hi there"
-          target/release/habitat run file-agent "expect hello.txt hi there"
+          cargo build --release -p habitat-hello --target wasm32-unknown-unknown
+          wasm-tools component new target/wasm32-unknown-unknown/release/habitat_hello.wasm -o hello.wasm
+          target/release/habitat pack examples/hello/agent.toml hello.wasm -o hello.habitat
+          target/release/habitat install hello.habitat
+          target/release/habitat run hello "Ada"
+          target/release/habitat run hello "Grace"
           target/release/habitat list
-          target/release/habitat remove file-agent --yes
+          grep -q '"count":2' "$HABITAT_HOME/agents/hello/home/state/visits.json"
+          imports=$(wasm-tools component wit hello.wasm | grep -E '^\s*import ')
+          echo "$imports"
+          if echo "$imports" | grep -v 'habitat:host/'; then
+            echo "The hello agent imports something other than the agent API"
+            exit 1
+          fi
+          target/release/habitat remove hello --yes

@@ -1,0 +1,14 @@
+[package]
+name = "habitat-sdk-check"
+description = "An agent that does what each message tells it to with the SDK, for testing the SDK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+habitat-sdk = { path = "../../crates/sdk" }
