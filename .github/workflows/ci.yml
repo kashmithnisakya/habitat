@@ -42,21 +42,21 @@ jobs:
       - name: Follow the getting started steps
         shell: pwsh
         env:
-          HABITAT_HOME: ${{ runner.temp }}\\habitat
+          HABITAT_HOME: ${{ runner.temp }}\habitat
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           cargo build --release -p habitat-cli
           cargo build --release -p habitat-hello --target wasm32-unknown-unknown
           wasm-tools component new target/wasm32-unknown-unknown/release/habitat_hello.wasm -o hello.wasm
-          target\\release\\habitat.exe pack examples/hello/agent.toml hello.wasm -o hello.habitat
-          target\\release\\habitat.exe install hello.habitat
-          target\\release\\habitat.exe run hello "Ada"
-          target\\release\\habitat.exe run hello "Grace"
-          target\\release\\habitat.exe list
-          $saved = Get-Content "$env:HABITAT_HOME\\agents\\hello\\home\\state\\visits.json"
+          target\release\habitat.exe pack examples/hello/agent.toml hello.wasm -o hello.habitat
+          target\release\habitat.exe install hello.habitat
+          target\release\habitat.exe run hello "Ada"
+          target\release\habitat.exe run hello "Grace"
+          target\release\habitat.exe list
+          $saved = Get-Content "$env:HABITAT_HOME\agents\hello\home\state\visits.json"
           if ($saved -notmatch '"count":2') { throw "It didn't remember: $saved" }
-          "y" | target\\release\\habitat.exe remove hello
+          "y" | target\release\habitat.exe remove hello
 
   wit:
     name: Validate agent API
