@@ -826,21 +826,41 @@ fn removing_a_secret_that_isnt_there_says_so() {
 fn real_keystore_secrets_can_be_added_listed_and_removed() {
     const VALUE: &str = "sk-THE-REAL-SECRET-VALUE";
     let fixture = Fixture::new();
+    // The fake home folder that tests use is where a Mac would look for the keychain.
+    let real = |command: &mut Command| {
+        if let Some(home) = std::env::var_os("HOME") {
+            command.env("HOME", home);
+        }
+    };
+    let run = |args: &[&str]| {
+        let mut command = fixture.command();
+        real(&mut command);
+        command.args(args).output().unwrap()
+    };
     let name = format!("habitat-cli-test-{}", std::process::id());
-    let added = add_secret(
-        &fixture,
-        &[
+    let mut command = fixture.command();
+    real(&mut command);
+    let mut child = command
+        .args(["secret", "add"])
+        .args([
             name.as_str(),
             "--host",
             "api.example.com",
             "--header",
             "x-api-key",
-        ],
-        &format!("{VALUE}\n"),
-    );
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(format!("{VALUE}\n").as_bytes()).unwrap();
+    drop(stdin);
+    let added = child.wait_with_output().unwrap();
     succeeds(&added);
     assert!(!stdout(&added).contains(VALUE));
-    let listed = fixture.run(&["secret", "list"]);
+    let listed = run(&["secret", "list"]);
     assert!(stdout(&listed).contains(&name), "{}", stdout(&listed));
     assert!(stdout(&listed).contains("api.example.com"));
     assert!(!stdout(&listed).contains(VALUE));
@@ -851,8 +871,8 @@ fn real_keystore_secrets_can_be_added_listed_and_removed() {
             assert!(!String::from_utf8_lossy(&fs::read(&path).unwrap()).contains(VALUE));
         }
     }
-    succeeds(&fixture.run(&["secret", "remove", &name]));
-    assert!(stdout(&fixture.run(&["secret", "list"])).contains("no secrets"));
+    succeeds(&run(&["secret", "remove", &name]));
+    assert!(stdout(&run(&["secret", "list"])).contains("no secrets"));
 }
 
 #[test]

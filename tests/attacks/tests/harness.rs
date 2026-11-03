@@ -42,6 +42,22 @@ fn a_host_that_changes_files_outside_the_home_is_caught() {
 }
 
 #[test]
+fn a_snapshot_really_holds_what_it_should_wherever_the_temporary_folder_is() {
+    // On Linux, temporary folders are under `/tmp`. A check that skipped everything with that in
+    // its path once passed there by looking at nothing.
+    let snapshot = Arena::new().snapshot();
+    for expected in [
+        "secret.txt",
+        "agent.wasm",
+        "agent.toml",
+        "package.sha256",
+        "secrets.toml",
+    ] {
+        assert!(snapshot.holds(expected), "{expected} isn't in {snapshot:?}");
+    }
+}
+
+#[test]
 fn a_changed_or_removed_file_is_caught() {
     let arena = Arena::new();
     let before = arena.snapshot();
