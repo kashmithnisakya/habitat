@@ -91,6 +91,10 @@ pub enum AuditEvent {
         /// 0 if nothing came back.
         status: u16,
     },
+    /// The run was given a file that the user chose. Its name isn't recorded, as it can be private.
+    UserFilePicked,
+    /// The run asked for a file, and didn't get one.
+    UserFileRefused,
     /// The run has hit [`MAX_ENTRIES_PER_RUN`], so nothing else it asks for will be allowed.
     LimitReached,
     /// The run ended. This is one of a few words chosen by the supervisor.
@@ -335,6 +339,8 @@ pub fn describe(entry: &AuditEntry) -> String {
             method,
             status,
         } => format!("{} to {} gave {status}", printable(method), target(asked)),
+        AuditEvent::UserFilePicked => "given a file that the user chose".to_string(),
+        AuditEvent::UserFileRefused => "asked for a file, and didn't get one".to_string(),
         AuditEvent::LimitReached => "reached the limit on requests".to_string(),
         AuditEvent::RunEnded { how } => format!("run ended: {}", printable(how)),
     };

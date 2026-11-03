@@ -660,6 +660,74 @@ fn a_fetch_needs_a_grant_and_everything_is_logged() {
     succeeds(&fixture.run(&["log", AGENT, "--verify"]));
 }
 
+fn installed_file_reader() -> Fixture {
+    let fixture = Fixture::new();
+    let mut manifest = fs::read_to_string(fixture.path("agent.toml")).unwrap();
+    manifest.push_str("\n[requests]\nfiles = \"ask\"\nnetwork = [\"allowed.example\"]\n");
+    fs::write(fixture.path("agent.toml"), manifest).unwrap();
+    fixture.install();
+    fixture
+}
+
+#[test]
+fn an_agent_can_read_only_the_file_the_user_chooses() {
+    let fixture = installed_file_reader();
+    let secret = fixture.path("diary.txt");
+    fs::write(&secret, "private words").unwrap();
+    fs::write(fixture.path("other.txt"), "other words").unwrap();
+    let answer = format!("{}\n", secret.display());
+
+    let picked = run_answering(&fixture, "pick-file diary.txt private words", &answer);
+    succeeds(&picked);
+    assert!(stderr(&picked).contains("is asking you to choose a file"));
+
+    // It doesn't carry over to the next run, or to any other file.
+    fails_with(
+        &fixture.run(&["run", AGENT, "pick-file diary.txt private words"]),
+        3,
+        "didn't choose",
+    );
+    fails_with(
+        &run_answering(&fixture, "pick-file diary.txt private words", "\n"),
+        3,
+        "didn't choose",
+    );
+
+    // Its name and path don't go in the log.
+    let log = stdout(&fixture.run(&["log", AGENT]));
+    assert!(log.contains("given a file that the user chose"), "{log}");
+    assert!(!log.contains("diary"), "{log}");
+}
+
+#[test]
+fn a_file_that_cant_be_read_doesnt_reveal_its_path() {
+    let fixture = installed_file_reader();
+    let refused = run_answering(
+        &fixture,
+        "pick-file x y",
+        "/no/such/place/secret-name.txt\n",
+    );
+    assert_eq!(refused.status.code(), Some(3));
+    assert!(
+        !stderr(&refused).contains("secret-name"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
+#[test]
+fn asking_for_a_file_is_refused_if_the_manifest_doesnt_ask() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let refused = run_answering(&fixture, "pick-file x y", "/etc/hosts\n");
+    assert_eq!(refused.status.code(), Some(3));
+    assert!(
+        !stderr(&refused).contains("is asking"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
 #[test]
 fn with_nobody_to_answer_it_means_no() {
     let fixture = installed_asking_agent();

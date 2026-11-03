@@ -4,7 +4,7 @@
 //! backend could implement them later. See `docs/architecture.md`.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -65,6 +65,19 @@ pub enum AccessRefused {
     Internal,
 }
 
+/// Something that can be read from anywhere.
+pub trait ReadAnywhere: Read + Seek + Send {}
+
+impl<T: Read + Seek + Send> ReadAnywhere for T {}
+
+/// One file that the user chose. An agent gets its name and what's in it, but never where it is.
+pub struct PickedFile {
+    /// The name without its folder, made safe to show.
+    pub name: String,
+    pub size: u64,
+    pub file: Box<dyn ReadAnywhere>,
+}
+
 /// An HTTP method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchMethod {
@@ -115,6 +128,11 @@ pub trait RunBroker {
     /// Makes a network request.
     fn http_fetch(&mut self, _request: FetchRequest) -> Result<FetchResponse, FetchError> {
         Err(FetchError::Denied("this isn't available".to_string()))
+    }
+
+    /// Asks the user to choose a file. The reason is the agent's own claim, and it's untrusted.
+    fn pick_user_file(&mut self, _reason: &str) -> Result<PickedFile, AccessRefused> {
+        Err(AccessRefused::Denied("this isn't available".to_string()))
     }
 }
 

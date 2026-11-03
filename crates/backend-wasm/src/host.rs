@@ -3,11 +3,11 @@
 //! Everything here takes untrusted input from the agent. Calls that need the broker are denied
 //! until the broker exists.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use habitat_core::backend::{
-    AccessRefused, FetchError, FetchMethod, FetchRequest, Lifetime, RunBroker, Target,
+    AccessRefused, FetchError, FetchMethod, FetchRequest, Lifetime, ReadAnywhere, RunBroker, Target,
 };
 use habitat_core::home::{EntryKind as HomeEntryKind, Home, HomeError as StoreError};
 use wasmtime::component::{Resource, ResourceTable};
@@ -17,13 +17,15 @@ use crate::bindings::habitat::host::agent_home;
 use crate::bindings::habitat::host::types::{
     self, AccessTarget, DirEntry, EntryKind, Grant, GrantLifetime, Header, HomeError,
     HostByteStream, HostModelStream, HostUserFile, HttpMethod, HttpRequest, HttpResponse, LogLevel,
-    ModelRequest, ModelStream, TokenUsage, UserFile,
+    ModelRequest, ModelStream, TokenUsage,
 };
 
 /// The most that one read returns. Agents read larger files in pieces.
 const MAX_READ_BYTES: u32 = 1024 * 1024;
 /// How many response bodies one run can have open at once, since each can hold a connection.
 const MAX_OPEN_BODIES: usize = 16;
+/// How many files the user can choose in one run. It's limited by prompts too.
+const MAX_OPEN_USER_FILES: usize = 16;
 /// The most random bytes that one call returns.
 const MAX_RANDOM_BYTES: u32 = 1024;
 
@@ -95,6 +97,14 @@ impl ResourceLimiter for Limiter {
 /// A response body that an agent is reading, and can stop reading by dropping it.
 pub struct OpenBody(Box<dyn Read + Send>);
 
+/// A file that the user chose. This holds it open, so the agent can't reach any other, and it only
+/// ever gets its name and contents.
+pub struct OpenUserFile {
+    name: String,
+    size: u64,
+    file: Box<dyn ReadAnywhere>,
+}
+
 /// What one run of an agent can reach.
 pub(crate) struct HostState {
     home: Home,
@@ -102,6 +112,7 @@ pub(crate) struct HostState {
     broker: Box<dyn RunBroker + Send>,
     table: ResourceTable,
     open_bodies: usize,
+    open_user_files: usize,
 }
 
 impl HostState {
@@ -111,6 +122,7 @@ impl HostState {
             broker,
             table: ResourceTable::new(),
             open_bodies: 0,
+            open_user_files: 0,
             limiter: Limiter {
                 limit: memory_bytes,
                 used: 0,
@@ -140,6 +152,14 @@ fn from_store(error: StoreError) -> HomeError {
             HomeError::LimitExceeded(error.to_string())
         }
         StoreError::Io(_) => HomeError::Internal,
+    }
+}
+
+fn from_refused(refused: AccessRefused) -> HomeError {
+    match refused {
+        AccessRefused::Denied(why) => HomeError::Denied(why),
+        AccessRefused::LimitExceeded(why) => HomeError::LimitExceeded(why),
+        AccessRefused::Internal => HomeError::Internal,
     }
 }
 
@@ -280,14 +300,25 @@ impl agent_home::Host for HostState {
                     Lifetime::UntilRevoked => GrantLifetime::UntilRevoked,
                 },
             }),
-            Err(AccessRefused::Denied(why)) => Err(HomeError::Denied(why)),
-            Err(AccessRefused::LimitExceeded(why)) => Err(HomeError::LimitExceeded(why)),
-            Err(AccessRefused::Internal) => Err(HomeError::Internal),
+            Err(refused) => Err(from_refused(refused)),
         }
     }
 
-    fn pick_user_file(&mut self, _reason: String) -> Result<Resource<UserFile>, HomeError> {
-        needs_broker()
+    fn pick_user_file(&mut self, reason: String) -> Result<Resource<OpenUserFile>, HomeError> {
+        if self.open_user_files >= MAX_OPEN_USER_FILES {
+            return Err(HomeError::LimitExceeded(format!(
+                "the limit is {MAX_OPEN_USER_FILES} files in one run"
+            )));
+        }
+        let picked = self.broker.pick_user_file(&reason).map_err(from_refused)?;
+        self.open_user_files += 1;
+        self.table
+            .push(OpenUserFile {
+                name: picked.name,
+                size: picked.size,
+                file: picked.file,
+            })
+            .map_err(|_| HomeError::Internal)
     }
 }
 
@@ -330,7 +361,7 @@ impl HostByteStream for HostState {
     }
 }
 
-// Nothing can create these resources yet, so an agent can never hold one to call these with.
+// Nothing can create this resource yet, so an agent can never hold one to call these with.
 
 impl HostModelStream for HostState {
     fn next(&mut self, _stream: Resource<ModelStream>) -> Result<Option<String>, HomeError> {
@@ -347,24 +378,34 @@ impl HostModelStream for HostState {
 }
 
 impl HostUserFile for HostState {
-    fn name(&mut self, _file: Resource<UserFile>) -> String {
-        String::new()
+    fn name(&mut self, file: Resource<OpenUserFile>) -> String {
+        self.table
+            .get(&file)
+            .map_or_else(|_| String::new(), |file| file.name.clone())
     }
 
-    fn size(&mut self, _file: Resource<UserFile>) -> u64 {
-        0
+    fn size(&mut self, file: Resource<OpenUserFile>) -> u64 {
+        self.table.get(&file).map_or(0, |file| file.size)
     }
 
     fn read(
         &mut self,
-        _file: Resource<UserFile>,
-        _offset: u64,
-        _max_bytes: u32,
+        file: Resource<OpenUserFile>,
+        offset: u64,
+        max_bytes: u32,
     ) -> Result<Vec<u8>, HomeError> {
-        needs_broker()
+        let open = self.table.get_mut(&file).map_err(|_| HomeError::Internal)?;
+        let failed = |_| HomeError::Unavailable("reading the file failed".to_string());
+        open.file.seek(SeekFrom::Start(offset)).map_err(failed)?;
+        let mut data = Vec::new();
+        Read::take(&mut open.file, u64::from(max_bytes.min(MAX_READ_BYTES)))
+            .read_to_end(&mut data)
+            .map_err(failed)?;
+        Ok(data)
     }
 
-    fn drop(&mut self, _file: Resource<UserFile>) -> Result<()> {
+    fn drop(&mut self, file: Resource<OpenUserFile>) -> Result<()> {
+        self.table.delete(file)?;
         Ok(())
     }
 }

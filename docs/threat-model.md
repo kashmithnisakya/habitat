@@ -46,4 +46,9 @@ The trusted parts are the Rust core, the shell and the operating system.
 - Wasmtime's Android and iOS targets are [Tier 3](https://docs.wasmtime.dev/stability-tiers.html), which it describes as not production ready.
 - Everything here has only been tested on Unix. Windows ([#56](https://github.com/kashmithnisakya/habitat/issues/56)) has different links, paths, permissions and locks, so none of the file system defences can be assumed there yet.
 - Approval prompts depend on people reading them.
+- The data-leak rule only reduces the risk of private data being sent somewhere:
+  - The user can approve the destination, because the prompt can't tell what's going to be sent.
+  - It starts from the moment an agent is given a file, so it can't help with what's already in the agent's home. An agent can save private data in its home and send it in a later run, when the rule has started fresh.
+  - It knows nothing about what's private in the agent's own files, or in what comes back from the network.
+  - An agent can read a file, ask for approval for a destination it had a reason to reach, and hide what it read in an ordinary-looking request.
 - The audit log can't detect full replacement by someone who controls the device.
