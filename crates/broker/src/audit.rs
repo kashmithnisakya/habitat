@@ -91,6 +91,8 @@ pub enum AuditEvent {
         /// 0 if nothing came back.
         status: u16,
     },
+    /// The agent showed the user a message. What it said isn't recorded, as it can be private.
+    MessageSent,
     /// The run was given a file that the user chose. Its name isn't recorded, as it can be private.
     UserFilePicked,
     /// The run asked for a file, and didn't get one.
@@ -339,6 +341,7 @@ pub fn describe(entry: &AuditEntry) -> String {
             method,
             status,
         } => format!("{} to {} gave {status}", printable(method), target(asked)),
+        AuditEvent::MessageSent => "showed the user a message".to_string(),
         AuditEvent::UserFilePicked => "given a file that the user chose".to_string(),
         AuditEvent::UserFileRefused => "asked for a file, and didn't get one".to_string(),
         AuditEvent::LimitReached => "reached the limit on requests".to_string(),

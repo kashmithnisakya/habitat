@@ -8,8 +8,6 @@ Follow [getting started](../README.md#getting-started) first, so that you have t
 
 An agent wakes up, handles one event and exits. Nothing in its memory carries over, so anything it needs next time has to be saved in its home. Its home is the only place it can reach, and there's no way for it to touch your other files.
 
-An agent can't show you anything yet, because `send-message` needs the [broker](architecture.md), which doesn't exist yet. For now, you can see what an agent did by how its run ended, and by looking at the files in its home.
-
 ## The code
 
 Make a library that builds for WebAssembly, with this in `Cargo.toml`:
@@ -26,7 +24,7 @@ serde = { version = "1", features = ["derive"] }
 Then the agent itself:
 
 ```rust
-use habitat_sdk::{Agent, BoxError, Event, state};
+use habitat_sdk::{Agent, BoxError, Event, send_message, state};
 use serde::{Deserialize, Serialize};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -49,8 +47,17 @@ impl Agent for Hello {
         // The agent starts from nothing on each run, so this is the only thing it remembers.
         let mut visits: Visits = state::load("visits")?.unwrap_or_default();
         visits.count += 1;
-        visits.last_visitor = name;
+        let last_visitor = std::mem::replace(&mut visits.last_visitor, name.clone());
         state::save("visits", &visits)?;
+
+        if last_visitor.is_empty() {
+            send_message(&format!("Hello, {name}! You're my first visitor."))?;
+        } else {
+            send_message(&format!(
+                "Hello, {name}! You're visitor number {}. The last one was {last_visitor}.",
+                visits.count
+            ))?;
+        }
         Ok(())
     }
 }
@@ -60,6 +67,7 @@ habitat_sdk::agent!(Hello);
 
 - **`Agent`** is what an agent implements. Returning an error counts as the run failing, and its text is shown as the agent's own claim.
 - **`state`** saves and loads values as JSON files in `state/` in its home.
+- **`send_message`** shows the user a message, marked as coming from this agent. Each run can send 100 of them.
 - **`habitat_sdk::agent!`** makes this type the package's agent.
 
 The library also has [`files`](../crates/sdk/src/files.rs) for plain files, plus the clock, random bytes and a log. For everything else, such as asking for network access, use `habitat_sdk::bindings`, which has the whole [agent API](agent-api.md).
@@ -129,19 +137,16 @@ target/release/habitat run hello "Ada"
 target/release/habitat run hello "Grace"
 ```
 
-Both print `completed`. To see that it remembered, look at the file it saved. On a Mac:
+You'll see that it remembered:
 
-```bash
-cat "$HOME/Library/Application Support/habitat/agents/hello/home/state/visits.json"
+```text
+[hello] Hello, Ada! You're my first visitor.
+completed (run 01a1a31bb840656a82ab3d05f288630c)
+[hello] Hello, Grace! You're visitor number 2. The last one was Ada.
+completed (run 01a1a31bb8adfaae5df11948af0db1f6)
 ```
 
-On Linux:
-
-```bash
-cat "$HOME/.local/share/habitat/agents/hello/home/state/visits.json"
-```
-
-It holds `{"count":2,"last_visitor":"Grace"}`.
+The `[hello]` is added by Habitat, on every line, so that an agent's message can't pass for anything that Habitat says.
 
 A run that fails shows the agent's message, and leaves what it saved alone:
 

@@ -115,6 +115,10 @@ impl fmt::Display for FilePrompt {
 pub trait Approver: Send + Sync {
     fn ask(&self, prompt: &Prompt, wait: Duration) -> Answer;
 
+    /// Shows the user a message from an agent. It's been made safe to show, and whatever shows it
+    /// has to mark it as coming from that agent.
+    fn show_message(&self, _agent: &str, _text: &str) {}
+
     /// Asks the user to choose one file, such as with the system's file picker. Nothing chosen,
     /// in time or at all, means no.
     fn pick_file(&self, _prompt: &FilePrompt, _wait: Duration) -> Option<PathBuf> {

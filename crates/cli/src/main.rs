@@ -351,6 +351,14 @@ fn parse_answer(line: &str) -> Answer {
 }
 
 impl Approver for Terminal {
+    /// Marks every line, so that a message can't pass for anything that Habitat said. These go to
+    /// stdout, as they're what the agent's output is.
+    fn show_message(&self, agent: &str, text: &str) {
+        for line in text.split('\n') {
+            say(format_args!("[{agent}] {line}"));
+        }
+    }
+
     fn pick_file(&self, prompt: &FilePrompt, wait: Duration) -> Option<PathBuf> {
         let _ = writeln!(
             io::stderr(),

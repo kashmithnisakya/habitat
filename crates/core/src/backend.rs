@@ -130,6 +130,11 @@ pub trait RunBroker {
         Err(FetchError::Denied("this isn't available".to_string()))
     }
 
+    /// Shows the user a message from the agent, which is untrusted.
+    fn send_message(&mut self, _text: &str) -> Result<(), AccessRefused> {
+        Err(AccessRefused::Denied("this isn't available".to_string()))
+    }
+
     /// Asks the user to choose a file. The reason is the agent's own claim, and it's untrusted.
     fn pick_user_file(&mut self, _reason: &str) -> Result<PickedFile, AccessRefused> {
         Err(AccessRefused::Denied("this isn't available".to_string()))

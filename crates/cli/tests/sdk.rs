@@ -92,13 +92,25 @@ fn the_hello_agent_remembers_between_runs_and_restarts() {
 
     let first = run(folder, &["run", "hello", "Ada"]);
     succeeds(&first);
-    assert!(String::from_utf8_lossy(&first.stdout).starts_with("completed"));
     assert_eq!(
         fs::read_to_string(saved_visits(folder)).unwrap(),
         r#"{"count":1,"last_visitor":"Ada"}"#
     );
+    assert!(
+        String::from_utf8_lossy(&first.stdout)
+            .starts_with("[hello] Hello, Ada! You're my first visitor.\ncompleted"),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
 
-    succeeds(&run(folder, &["run", "hello", "Grace"]));
+    let second = run(folder, &["run", "hello", "Grace"]);
+    succeeds(&second);
+    assert!(
+        String::from_utf8_lossy(&second.stdout)
+            .contains("[hello] Hello, Grace! You're visitor number 2. The last one was Ada."),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
     assert_eq!(
         fs::read_to_string(saved_visits(folder)).unwrap(),
         r#"{"count":2,"last_visitor":"Grace"}"#

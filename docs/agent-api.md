@@ -4,7 +4,7 @@
 
 The bindings for both sides are generated from this file. CI builds a [test agent](../examples/api-check/src/lib.rs) that uses every call, and checks what it imports.
 
-The file calls, `now-ms`, `random-bytes`, `request-access`, `http-fetch` and `pick-user-file` work. Everything else that needs the broker returns `denied` until it's built, and that includes `send-message`. `log` currently drops its messages. The version rule below has only been checked by hand, on Wasmtime 50.
+The file calls, `now-ms`, `random-bytes`, `send-message`, `request-access`, `http-fetch` and `pick-user-file` work. `model-complete` returns `denied` until it's built. `send-message` can be used 100 times in a run, and shows up to 4,096 characters of each, with anything that a terminal would act on replaced, and each line marked as coming from the agent. `log` currently drops its messages. The version rule below has only been checked by hand, on Wasmtime 50.
 
 ## What agents can do
 

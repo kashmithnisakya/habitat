@@ -231,8 +231,8 @@ impl agent_home::Host for HostState {
         Ok(bytes)
     }
 
-    fn send_message(&mut self, _text: String) -> Result<(), HomeError> {
-        needs_broker()
+    fn send_message(&mut self, text: String) -> Result<(), HomeError> {
+        self.broker.send_message(&text).map_err(from_refused)
     }
 
     fn log(&mut self, _level: LogLevel, _message: String) {}
