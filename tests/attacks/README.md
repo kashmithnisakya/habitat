@@ -13,5 +13,6 @@ These tests act like a hostile agent and confirm that each attack fails. Most ar
 | A package that's costly to compile | Refused, or abandoned after a time limit, and the host stays healthy |
 | Prompt spam | Rate limited |
 | Tampering with grants or logs | Not reachable from the agent, and log edits are detected |
+| Tampering with run records, or filling them with hostile text | Not reachable from the agent, and its text is made safe and cut short, as tested in [`supervisor.rs`](../../crates/backend-wasm/tests/supervisor.rs) |
 
 Every security fix should add a test here.

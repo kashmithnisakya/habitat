@@ -75,7 +75,23 @@ Agents are event-based. Each run follows the same steps:
 3. The agent handles the event and saves any state to its home.
 4. The agent exits.
 
-This fits phones, which can pause or stop apps at any time. If a run crashes or hits a limit, the supervisor stops it, logs what happened and keeps the last saved state. Writes must be atomic, so a crash can't leave half-written state.
+This fits phones, which can pause or stop apps at any time. If a run crashes or hits a limit, the supervisor stops it, records what happened and keeps the last saved state. Each write is atomic, so a crash can't leave a half-written file.
+
+The [supervisor](../crates/core/src/supervisor.rs) does this as follows:
+
+- **One run at a time:** a run holds a lock on its agent, and a second run is refused straight away. The operating system holds the lock for the process, so it works across processes, and a killed host can't leave an agent locked. Different agents can run at the same time.
+- **Records:** each run has an ID and a [record](../crates/core/src/run_log.rs), which is on disk before the agent starts. If it can't be saved, the agent doesn't start. A record holds the kind of event and how the run ended, but not the event's text, which can be private. Each agent keeps its latest 1,000 records.
+- **Failures:** every kind of failure ends up in the record, including a package that won't load, and the next run starts as normal. A panic in the host is recorded too, as an internal error.
+- **Shutting down:** `Supervisor::shut_down` tells running agents to stop, refuses new runs and waits for a time the host chooses. A run that's compiling can't be interrupted, so it doesn't start the agent once it's finished, and the host can exit without waiting for it.
+- **Being killed:** a killed host leaves a record with no ending, and the supervisor marks it as interrupted once the agent's lock is free.
+
+These have some limits:
+
+- **Saving isn't all or nothing.** "Saved state" means every write that finished. An agent that's stopped between writing two related files keeps the first, so the agent has to write in an order it can recover from. There's no way yet to save several files at once.
+- **Nothing retries.** A run that fails or is refused stays that way, and it's up to the shell to ask again. That includes a run refused because the history was being read at that moment.
+- **The shell has to call `shut_down`.** Nothing handles signals yet, or Android's lifecycle events. Without that, stopping the host counts as being killed, which is safe but gives the agent no chance to stop first.
+- **Records aren't the audit log.** They say that a run happened and how it ended. They aren't protected against tampering by someone with access to the device, and old ones get removed. The audit log can use the run ID to link its entries to a run.
+- **The lock needs a local file system.** File locks may not work on a network drive, and Habitat doesn't check for that.
 
 ## Backends
 
@@ -93,6 +109,8 @@ agents/<agent-id>/
 ├── package.sha256  # Hash of the installed package, used to detect changes to it
 ├── home/           # Agent's files
 ├── tmp/            # Files being written, which are moved into home/ when complete
+├── runs/           # A record of each recent run, only the core can write to this
+├── run.lock        # Locked for as long as the agent is running
 ├── grants.db       # Permissions, only the core can write to this
 └── audit.db        # Tamper-evident log, only the core can write to this
 ```

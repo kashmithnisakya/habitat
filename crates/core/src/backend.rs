@@ -4,6 +4,8 @@
 //! backend could implement them later. See `docs/architecture.md`.
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::home::Home;
@@ -15,6 +17,20 @@ use crate::package::Package;
 pub enum Event {
     UserMessage(String),
     Scheduled(String),
+}
+
+/// Tells running agents to stop, because the host is shutting down. Clones share the same signal.
+#[derive(Debug, Clone, Default)]
+pub struct StopSignal(Arc<AtomicBool>);
+
+impl StopSignal {
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 /// The most this host lets any agent use, whatever its manifest asks for.
@@ -127,6 +143,8 @@ pub enum RunOutcome {
     TimeLimit,
     /// The agent needed more memory than its limit allows, and crashed because of it.
     MemoryLimit,
+    /// The host told the agent to stop, because it's shutting down.
+    Stopped,
     /// The agent crashed.
     Crashed(String),
     /// The backend failed, through no fault of the agent.
@@ -141,15 +159,16 @@ impl RunOutcome {
 }
 
 /// Something that can run agents.
-pub trait Backend {
+pub trait Backend: Send + Sync {
     /// Checks a package's code and prepares it to run. This runs none of the agent's code.
     fn load(&self, package: &Package) -> Result<Box<dyn LoadedAgent>, LoadError>;
 }
 
 /// An agent that's ready to run.
 pub trait LoadedAgent {
-    /// Runs the agent for one event, starting from nothing but what's in its home.
-    fn run(&self, event: &Event, home: Home, limits: &RunLimits) -> RunOutcome;
+    /// Runs the agent for one event, starting from nothing but what's in its home. It has to stop
+    /// soon after `stop` is set, and report that as [`RunOutcome::Stopped`].
+    fn run(&self, event: &Event, home: Home, limits: &RunLimits, stop: &StopSignal) -> RunOutcome;
 }
 
 #[cfg(test)]

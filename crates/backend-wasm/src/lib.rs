@@ -12,7 +12,9 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use habitat_core::backend::{Backend, Event, LoadError, LoadedAgent, RunLimits, RunOutcome};
+use habitat_core::backend::{
+    Backend, Event, LoadError, LoadedAgent, RunLimits, RunOutcome, StopSignal,
+};
 use habitat_core::home::Home;
 use habitat_core::package::Package;
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -180,7 +182,7 @@ impl Ticker {
 }
 
 impl LoadedAgent for WasmAgent {
-    fn run(&self, event: &Event, home: Home, limits: &RunLimits) -> RunOutcome {
+    fn run(&self, event: &Event, home: Home, limits: &RunLimits, stop: &StopSignal) -> RunOutcome {
         // A new store each time, so that nothing in memory carries over between runs, even after
         // a crash.
         let mut store = Store::new(&self.engine, HostState::new(home, limits.memory_bytes));
@@ -188,9 +190,10 @@ impl LoadedAgent for WasmAgent {
 
         // Other runs can make the same engine tick, so each tick only means it's time to check.
         let deadline = Instant::now() + limits.run_time;
+        let stop_signal = stop.clone();
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(move |_| {
-            if Instant::now() >= deadline {
+            if stop_signal.is_stopped() || Instant::now() >= deadline {
                 Err(Trap::Interrupt.into())
             } else {
                 Ok(UpdateDeadline::Continue(1))
@@ -210,7 +213,11 @@ impl LoadedAgent for WasmAgent {
             Err(error) => {
                 let trap = error.downcast_ref::<Trap>();
                 if trap == Some(&Trap::Interrupt) {
-                    RunOutcome::TimeLimit
+                    if stop.is_stopped() {
+                        RunOutcome::Stopped
+                    } else {
+                        RunOutcome::TimeLimit
+                    }
                 } else if store.data().hit_memory_limit() {
                     RunOutcome::MemoryLimit
                 } else {

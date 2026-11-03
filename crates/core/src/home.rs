@@ -22,6 +22,8 @@ const HOME_DIR: &str = "home";
 const TEMP_DIR: &str = "tmp";
 const GRANTS_FILE: &str = "grants.db";
 const AUDIT_FILE: &str = "audit.db";
+const RUNS_DIR: &str = "runs";
+const RUN_LOCK_FILE: &str = "run.lock";
 const PACKAGE_HASH_FILE: &str = "package.sha256";
 
 const MAX_PATH_BYTES: usize = 1024;
@@ -101,13 +103,24 @@ impl AgentStorage {
         let path = root.join(AGENTS_DIR).join(agent_name);
         let mut builder = DirBuilder::new();
         builder.recursive(true).mode(0o700);
-        for dir in [PACKAGE_DIR, HOME_DIR, TEMP_DIR] {
+        for dir in [PACKAGE_DIR, HOME_DIR, TEMP_DIR, RUNS_DIR] {
             builder.create(path.join(dir))?;
         }
         Ok(Self {
             name: agent_name.to_string(),
             path,
         })
+    }
+
+    /// Opens an agent's folder under `root`, but only if it's already there.
+    pub fn open_existing(root: &Path, agent_name: &str) -> Result<Self, HomeError> {
+        if !is_agent_name(agent_name) {
+            return Err(HomeError::InvalidPath("not a valid agent name"));
+        }
+        if !root.join(AGENTS_DIR).join(agent_name).is_dir() {
+            return Err(HomeError::NotFound);
+        }
+        Self::open(root, agent_name)
     }
 
     /// The name of the agent this folder belongs to.
@@ -130,6 +143,16 @@ impl AgentStorage {
     /// outside the package folder, so that a change to the package can't also change the record.
     pub fn package_hash_path(&self) -> PathBuf {
         self.path.join(PACKAGE_HASH_FILE)
+    }
+
+    /// The folder of records of the agent's runs, which only the core can write to.
+    pub(crate) fn runs_dir(&self) -> io::Result<Dir> {
+        Dir::open_ambient_dir(self.path.join(RUNS_DIR), ambient_authority())
+    }
+
+    /// The file that's locked for as long as the agent is running.
+    pub(crate) fn run_lock_path(&self) -> PathBuf {
+        self.path.join(RUN_LOCK_FILE)
     }
 
     /// The agent's permissions, which only the core can write to.
@@ -426,7 +449,7 @@ fn file_cost(metadata: &Metadata) -> Result<u64, HomeError> {
 
 /// Saves a directory's entries to disk. On Linux and Android, `Dir` holds a handle that can't be
 /// synced, so this opens the directory again for reading.
-fn sync_dir(dir: &Dir) -> Result<(), HomeError> {
+pub(crate) fn sync_dir(dir: &Dir) -> Result<(), HomeError> {
     dir.open(".")?.sync_all()?;
     Ok(())
 }
