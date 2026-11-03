@@ -571,14 +571,16 @@ impl Snapshot {
     }
 }
 
-/// Things that change on every run, and that a run is supposed to change.
-fn changes_every_run(path: &Path) -> bool {
-    let text = path.to_string_lossy().replace('\\', "/");
-    text.contains("/runs/")
-        || text.contains("/locks/")
-        || text.contains("/tmp/")
-        || text.ends_with("audit.db")
-        || text.ends_with("audit.head")
+/// Things that change on every run, and that a run is supposed to change. This only looks at where
+/// something is inside what's being walked, as a whole temporary folder can be under `/tmp`, and
+/// then everything would look like it can change.
+fn changes_every_run(relative: &Path) -> bool {
+    let text = relative.to_string_lossy().replace('\\', "/");
+    let parts: Vec<&str> = text.split('/').collect();
+    parts
+        .iter()
+        .any(|part| matches!(*part, "runs" | "locks" | "tmp"))
+        || matches!(parts.last(), Some(&"audit.db" | &"audit.head"))
 }
 
 fn walk(base: &Path, dir: &Path, label: &str, skip: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
@@ -587,7 +589,8 @@ fn walk(base: &Path, dir: &Path, label: &str, skip: &Path, files: &mut BTreeMap<
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == skip || changes_every_run(&path) {
+        let relative = path.strip_prefix(base).unwrap_or(&path);
+        if path == skip || changes_every_run(relative) {
             continue;
         }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -596,9 +599,8 @@ fn walk(base: &Path, dir: &Path, label: &str, skip: &Path, files: &mut BTreeMap<
         if metadata.is_dir() {
             walk(base, &path, label, skip, files);
         } else if metadata.is_file() {
-            let relative = path.strip_prefix(base).unwrap_or(&path).display();
             files.insert(
-                format!("{label}/{relative}"),
+                format!("{label}/{}", relative.display()),
                 fs::read(&path).unwrap_or_default(),
             );
         }
