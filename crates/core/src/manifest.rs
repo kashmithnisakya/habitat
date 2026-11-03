@@ -399,7 +399,7 @@ mod tests {
                 model_budget_tokens: 50_000,
             }
         );
-        assert_eq!(manifest.requested_hosts(), ["api.github.com"]);
+        assert_eq!(manifest.requested_hosts(), ["en.wikipedia.org"]);
         assert_eq!(manifest.requested_models(), ["default"]);
         assert_eq!(manifest.requested_files(), FileRequest::Ask);
     }
