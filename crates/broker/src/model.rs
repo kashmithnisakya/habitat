@@ -43,12 +43,10 @@ pub(crate) struct RunShared {
 
 impl RunShared {
     fn spend(&self, tokens: u64) {
-        // Only this run spends from this, and a saturating subtraction can't go wrong if it races.
-        let _ = self
-            .tokens_left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                Some(left.saturating_sub(tokens))
-            });
+        // One run only makes one call at a time, so nothing can change this in between.
+        let left = self.tokens_left.load(Ordering::SeqCst);
+        self.tokens_left
+            .store(left.saturating_sub(tokens), Ordering::SeqCst);
     }
 
     fn log(&self, event: &AuditEvent) {
