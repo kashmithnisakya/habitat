@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use habitat_backend_wasm::WasmBackend;
 use habitat_core::backend::{
-    Backend, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome,
+    Backend, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome, RunOutput,
 };
 use habitat_core::home::{AgentStorage, Home};
 use habitat_core::package::Package;
@@ -158,10 +158,20 @@ impl Fixture {
     }
 
     fn run_limited(&self, message: &str, limits: &RunLimits) -> RunOutcome {
+        self.agent
+            .run(
+                &Event::UserMessage(message.to_string()),
+                self.home(),
+                limits,
+            )
+            .outcome
+    }
+
+    fn run_output(&self, message: &str) -> RunOutput {
         self.agent.run(
             &Event::UserMessage(message.to_string()),
             self.home(),
-            limits,
+            &roomy_limits(),
         )
     }
 
@@ -215,9 +225,64 @@ fn files_persist_between_runs_but_memory_does_not() {
 }
 
 #[test]
+fn an_agent_can_send_the_user_messages() {
+    let output = Fixture::file_agent().run_output("say - hello there");
+    assert_eq!(output.outcome, RunOutcome::Completed);
+    assert_eq!(output.messages, ["hello there"]);
+}
+
+#[test]
+fn messages_cant_hide_or_reorder_what_the_user_reads() {
+    let output = Fixture::file_agent().run_output("say - safe\u{202e}txt.exe\x1b[31m\u{200b}");
+    assert_eq!(output.messages, ["safetxt.exe[31m"]);
+}
+
+#[test]
+fn messages_sent_before_a_crash_are_kept() {
+    let output = Fixture::file_agent().run_output("say-then-panic - last words");
+    assert!(matches!(output.outcome, RunOutcome::Crashed(_)));
+    assert_eq!(output.messages, ["last words"]);
+}
+
+#[test]
+fn a_run_can_only_send_so_many_messages() {
+    let fixture = Fixture::file_agent();
+    let allowed = fixture.run_output("say-many 32");
+    assert_eq!(allowed.outcome, RunOutcome::Completed);
+    assert_eq!(allowed.messages.len(), 32);
+
+    let over = fixture.run_output("say-many 33");
+    let RunOutcome::Failed(reason) = over.outcome else {
+        panic!("the limit wasn't applied: {:?}", over.outcome);
+    };
+    assert!(reason.contains("at most 32"), "{reason}");
+    assert_eq!(over.messages.len(), 32);
+}
+
+#[test]
+fn a_message_can_only_be_so_long() {
+    let fixture = Fixture::file_agent();
+    let allowed = fixture.run_output(&format!("say-big {}", 64 * 1024));
+    assert_eq!(allowed.outcome, RunOutcome::Completed);
+    assert_eq!(allowed.messages[0].len(), 64 * 1024);
+
+    let over = fixture.run_output(&format!("say-big {}", 64 * 1024 + 1));
+    let RunOutcome::Failed(reason) = over.outcome else {
+        panic!("the limit wasn't applied: {:?}", over.outcome);
+    };
+    assert!(reason.contains("at most"), "{reason}");
+    assert!(over.messages.is_empty());
+}
+
+#[test]
 fn the_agent_is_told_what_kind_of_event_it_is() {
     let fixture = Fixture::file_agent();
-    let run = |event: Event| fixture.agent.run(&event, fixture.home(), &roomy_limits());
+    let run = |event: Event| {
+        fixture
+            .agent
+            .run(&event, fixture.home(), &roomy_limits())
+            .outcome
+    };
     let scheduled = |name: &str| Event::Scheduled(name.to_string());
     assert_eq!(run(scheduled("expect-scheduled")), RunOutcome::Completed);
     assert_ne!(run(scheduled("expect-user-message")), RunOutcome::Completed);
@@ -256,11 +321,14 @@ fn an_agent_cant_leave_its_home() {
 fn the_disk_limit_applies_to_agents() {
     let fixture = Fixture::file_agent();
     let small_home = fixture.storage.home(100).unwrap();
-    let outcome = fixture.agent.run(
-        &Event::UserMessage("write a.txt hello".to_string()),
-        small_home,
-        &roomy_limits(),
-    );
+    let outcome = fixture
+        .agent
+        .run(
+            &Event::UserMessage("write a.txt hello".to_string()),
+            small_home,
+            &roomy_limits(),
+        )
+        .outcome;
     let RunOutcome::Failed(message) = outcome else {
         panic!("the write wasn't refused: {outcome:?}");
     };
@@ -789,7 +857,8 @@ fn a_manifest_cant_raise_its_limits_above_the_hosts() {
         let too_big = format!("expect-big big.bin {}", 2 * MB);
         let outcome = fixture
             .agent
-            .run(&Event::UserMessage(too_big), small_home, &limits);
+            .run(&Event::UserMessage(too_big), small_home, &limits)
+            .outcome;
         let RunOutcome::Failed(message) = outcome else {
             panic!("the disk limit wasn't applied: {outcome:?}");
         };

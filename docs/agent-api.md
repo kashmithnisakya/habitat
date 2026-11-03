@@ -4,7 +4,7 @@
 
 The bindings for both sides are generated from this file. CI builds a [test agent](../examples/api-check/src/lib.rs) that uses every call, and checks what it imports.
 
-The file calls, `now-ms` and `random-bytes` work. Everything that needs the broker returns `denied` until the broker exists, and that includes `send-message`. `log` currently drops its messages. The version rule below has only been checked by hand, on Wasmtime 50.
+The file calls, `now-ms`, `random-bytes` and `send-message` work. Everything else that needs the broker returns `denied` until the broker exists. `log` currently drops its messages. The version rule below has only been checked by hand, on Wasmtime 50.
 
 ## What agents can do
 
@@ -12,7 +12,7 @@ The file calls, `now-ms` and `random-bytes` work. Everything that needs the brok
 |---|---|---|
 | `read-file`, `write-file`, `remove-file`, `list-dir` | Use files in the agent's home | Home store, within the disk limit |
 | `now-ms`, `random-bytes` | Get the time and random bytes | Nothing, because they reach nothing outside |
-| `send-message` | Show the user a message | Rate limit |
+| `send-message` | Show the user a message | The host. Until the broker adds a rate limit, a run can send at most 32 messages of up to 64 KB each. Characters that could hide or reorder text are removed |
 | `log` | Add to the agent's own log | The host can drop messages |
 | `model-complete`, `http-fetch` | Use an AI model or the network | Broker |
 | `request-access` | Ask for a network host or model | Broker, which draws the prompt |

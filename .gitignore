@@ -1,12 +1,7 @@
 target/
 *.wasm
 *.cwasm
-
-# Android
-android/.gradle/
-android/build/
-android/feasibility/build/
-android/local.properties
+*.habitat
 
 # Editors and OS
 .idea/

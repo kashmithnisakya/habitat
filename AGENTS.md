@@ -24,9 +24,9 @@ Read these before making design changes:
 | `crates/backend-wasm` | Wasmtime backend |
 | `crates/sdk` | Rust library for agent authors |
 | `crates/cli` | Command line |
+| `crates/mobile` | What the phone app calls in the core, through UniFFI |
 | `wit/` | The agent API |
 | `app/` | Flutter app for Android and iPhone, with its Kotlin and Swift layers |
-| `android/` | Android feasibility test |
 | `examples/` | Sample agents |
 | `tests/attacks/` | Attack tests |
 
@@ -53,6 +53,8 @@ To validate changes to the agent API:
 ```bash
 wasm-tools component wit wit/
 ```
+
+If you change the phone app, also run the checks in [app/README.md](app/README.md).
 
 ## Security rules
 

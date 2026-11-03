@@ -5,7 +5,7 @@
 Habitat gives an agent its own persistent space to live in. The agent keeps its files, memory and tools there, but it can't touch your settings, personal data or other apps unless you allow it.
 
 > [!WARNING]
-> **Early development: nothing works yet, and this is not secure.** The repository currently holds the design and project skeleton. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) exist and an outside security review has taken place.
+> **Early development: most of this doesn't work yet, and this is not secure.** An agent can run and use its own files, but the broker, secrets and approvals don't exist yet. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) exist and an outside security review has taken place.
 
 ## Why
 
@@ -47,9 +47,9 @@ Planned guarantees:
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
 | iPhone and Flutter feasibility test | Not started |
-| Mac core, broker and secrets | In progress: an agent can run through Wasmtime and use files in its home, within time and memory limits |
+| Mac core, broker and secrets | In progress: from the command line, an agent can be installed and run, use files in its home and reply, within time and memory limits. The broker and secrets don't exist yet |
 | Attack tests | Not started |
-| Phone app (Flutter) | Not started |
+| Phone app (Flutter) | In progress: the [Android app](app/README.md) builds, but hasn't been run on a device yet. iPhone isn't connected to the core |
 
 Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41). The next step is to run the Android feasibility test on a real phone. See the [draft feasibility report](docs/feasibility-android.md).
 
@@ -72,10 +72,10 @@ crates/
 ├── broker/          # Policy, vault, gateway and audit log
 ├── backend-wasm/    # Wasmtime backend
 ├── sdk/             # Rust library for agent authors
-└── cli/             # Mac and Linux command line
+├── cli/             # Mac and Linux command line
+└── mobile/          # What the phone app calls in the core
 wit/                 # The agent-home API
 app/                 # Flutter app for Android and iPhone
-android/             # Android feasibility test
 examples/            # Sample agents
 tests/attacks/       # Attack tests
 docs/                # Design documents
@@ -96,6 +96,30 @@ cargo build --workspace
 ```bash
 cargo test --workspace
 ```
+
+The phone app is built separately. See [app/README.md](app/README.md).
+
+## Try it
+
+This builds the example agent, packs it, installs it and sends it a message. Agents are stored in `~/.habitat`, or in `$HABITAT_DATA` if you set it.
+
+```bash
+cargo build -p habitat-hello-agent --release --target wasm32-unknown-unknown
+```
+
+```bash
+cargo run -p habitat-cli -- pack examples/hello-agent/agent.toml target/wasm32-unknown-unknown/release/habitat_hello_agent.wasm hello.habitat
+```
+
+```bash
+cargo run -p habitat-cli -- install hello.habitat
+```
+
+```bash
+cargo run -p habitat-cli -- run hello-agent good morning
+```
+
+Run `cargo run -p habitat-cli -- help` to see the other commands.
 
 ## Contributing
 

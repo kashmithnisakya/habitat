@@ -130,6 +130,38 @@ impl RunOutcome {
     }
 }
 
+/// What one run produced. Messages sent before a crash are kept, because the user may need them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOutput {
+    pub outcome: RunOutcome,
+    /// What the agent asked to show the user, cleaned by [`plain_text`]. It's the agent's own claim.
+    pub messages: Vec<String>,
+}
+
+/// Removes characters that could reorder, hide or disguise an agent's text when it's displayed.
+pub fn plain_text(text: &str) -> String {
+    text.chars().filter(|c| !is_hidden(*c)).collect()
+}
+
+fn is_hidden(c: char) -> bool {
+    match c {
+        '\n' | '\t' => false,
+        // Zero-width joiners are kept, because many scripts and emoji can't be written without them.
+        '\u{ad}'
+        | '\u{61c}'
+        | '\u{180e}'
+        | '\u{200b}'
+        | '\u{200e}'
+        | '\u{200f}'
+        | '\u{2028}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}'
+        | '\u{feff}'
+        | '\u{fff9}'..='\u{fffb}'
+        | '\u{e0000}'..='\u{e007f}' => true,
+        c => c.is_control(),
+    }
+}
+
 /// Something that can run agents.
 pub trait Backend {
     /// Checks a package's code and prepares it to run. This runs none of the agent's code.
@@ -139,7 +171,7 @@ pub trait Backend {
 /// An agent that's ready to run.
 pub trait LoadedAgent {
     /// Runs the agent for one event, starting from nothing but what's in its home.
-    fn run(&self, event: &Event, home: Home, limits: &RunLimits) -> RunOutcome;
+    fn run(&self, event: &Event, home: Home, limits: &RunLimits) -> RunOutput;
 }
 
 #[cfg(test)]
@@ -210,6 +242,32 @@ mod tests {
         let limits = host.limits_for(&requested(u32::MAX, u32::MAX, u32::MAX));
         assert_eq!(limits.memory_bytes, u64::from(u32::MAX) * MB);
         assert_eq!(limits.disk_bytes, u64::from(u32::MAX) * MB);
+    }
+
+    #[test]
+    fn plain_text_removes_what_could_disguise_a_message() {
+        assert_eq!(
+            plain_text("safe\u{202e}txt.exe\x1b[31m\r\u{200b}"),
+            "safetxt.exe[31m"
+        );
+        assert_eq!(
+            plain_text("a\u{2066}b\u{2069}c\u{feff}\u{e0041}\u{ad}"),
+            "abc"
+        );
+        assert_eq!(plain_text("one\u{2028}two\u{2029}three"), "onetwothree");
+    }
+
+    #[test]
+    fn plain_text_keeps_what_people_actually_write() {
+        for text in [
+            "line one\nline two\ttabbed",
+            "ශ්‍රී ලංකාව",
+            "مرحبا بالعالم",
+            "👨‍👩‍👧‍👦 ❤️",
+            "<b>not markup</b> **really**",
+        ] {
+            assert_eq!(plain_text(text), text);
+        }
     }
 
     #[test]

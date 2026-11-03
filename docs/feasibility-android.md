@@ -2,6 +2,8 @@
 
 **Status: draft.** The decision below is provisional, because all of the evidence comes from an emulator. [#4](https://github.com/kashmithnisakya/habitat/issues/4) stays open until the [phone tests](#before-this-report-is-final) are done, and decision records 0001 to 0003 stay **Proposed** until then.
 
+The [test app](https://github.com/kashmithnisakya/habitat/tree/a4f298bb04686c3984abf66d3f378ed3e96c63ed/android/feasibility) behind these results is no longer in the repository, because the [Flutter app](decisions/0006-flutter-phone-app.md) replaced the `android/` folder. It's kept at that link, and the phone tests below can use it from there.
+
 ## Decision
 
 **Continue with Wasmtime on Android. Don't switch runtime, and don't change the core design.**
@@ -41,7 +43,7 @@ These figures are for a generated 2.7 MB test agent, and each is the median of 1
 - **Pulley is about 6 times slower on CPU-heavy work:** this comes from one workload, so the gap will differ on others.
 - **Waiting costs little in either mode:** Pulley used about 4 ms of CPU per second of waiting, and Cranelift used about 0.5 ms.
 
-The [feasibility README](../android/feasibility/README.md#measurements) has the full tables, the method and the limits of these numbers. The most important limit is that a phone could be much slower than an emulator on a fast Mac. The large agent also never runs most of its code, so a real precompiled agent would use more memory.
+The [feasibility README](https://github.com/kashmithnisakya/habitat/blob/a4f298bb04686c3984abf66d3f378ed3e96c63ed/android/feasibility/README.md#measurements) has the full tables, the method and the limits of these numbers. The most important limit is that a phone could be much slower than an emulator on a fast Mac. The large agent also never runs most of its code, so a real precompiled agent would use more memory.
 
 ## How agents should run on Android
 
@@ -64,7 +66,7 @@ Agent packages are untrusted, so loading precompiled code from them would break 
 | Later starts: load the saved file | 2.7 ms, 6.6 MB | 1.1 ms, 3.0 MB |
 | Saved file | 5.0 MB | 4.0 MB |
 
-Later starts cost about the same as loading code compiled at build time. The [feasibility README](../android/feasibility/README.md#compile-once) has the full comparison.
+Later starts cost about the same as loading code compiled at build time. The [feasibility README](https://github.com/kashmithnisakya/habitat/blob/a4f298bb04686c3984abf66d3f378ed3e96c63ed/android/feasibility/README.md#compile-once) has the full comparison.
 
 **Saved code needs protecting.** Wasmtime rejected a file saved for the other engine and a file that was cut short, but it doesn't check the code inside a saved file, so a changed byte wouldn't be detected. The design relies on nothing else being able to write to the app's private storage. The real app also needs to recompile after an upgrade, which wasn't tested, and to decide when compiling happens, because the first start is the most memory-hungry step and could be a problem on low-end phones.
 
@@ -89,7 +91,7 @@ These were checked on 2 November 2026. They can change, and this is our reading 
 ## Before this report is final
 
 - [ ] Run [#1](https://github.com/kashmithnisakya/habitat/issues/1) and [#2](https://github.com/kashmithnisakya/habitat/issues/2) on a real arm64 phone.
-- [ ] Test compiling, saving and reloading an agent on a real phone. This passes on the emulator, and the app's checks and `measure.sh` already include it.
+- [ ] Test compiling, saving and reloading an agent on a real phone. This passes on the emulator, and the test app's checks and `measure.sh` already include it.
 - [ ] Repeat [#3](https://github.com/kashmithnisakya/habitat/issues/3) on a recent phone and, if possible, an older one, including battery use.
 - [ ] Run on a device or emulator with 16 KB memory pages.
 - [ ] Update this report with those results, and state the final decision.

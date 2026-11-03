@@ -10,3 +10,11 @@ publish.workspace = true
 [[bin]]
 name = "habitat"
 path = "src/main.rs"
+
+[dependencies]
+habitat-backend-wasm = { path = "../backend-wasm" }
+habitat-core = { path = "../core" }
+wit-component = "0.263.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
