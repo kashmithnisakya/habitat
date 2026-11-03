@@ -10,6 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use habitat_backend_wasm::WasmBackend;
+use habitat_backend_wasm::code_shape::CodeShape;
+use habitat_backend_wasm::compile_limits::CompileLimits;
 use habitat_core::backend::{
     Backend, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome,
 };
@@ -141,6 +143,27 @@ impl Fixture {
         }
     }
 
+    /// For testing that the limits on a run hold even for a component that gets past the limits
+    /// on compiling, or that a host has chosen to allow.
+    fn past_the_compile_limits(code: Vec<u8>) -> Self {
+        let root = TempDir::new().unwrap();
+        let storage = AgentStorage::open(root.path(), "file-agent").unwrap();
+        let mut backend = WasmBackend::new().unwrap();
+        backend.set_compile_limits(CompileLimits {
+            memories: u64::MAX,
+            table_entries: u64::MAX,
+            ..CompileLimits::default()
+        });
+        let agent = backend
+            .load(&Package::new(MANIFEST, code).unwrap())
+            .unwrap();
+        Self {
+            _root: root,
+            storage,
+            agent,
+        }
+    }
+
     fn file_agent() -> Self {
         Self::new(file_agent_code().to_vec())
     }
@@ -181,6 +204,36 @@ fn load_error(code: Vec<u8>) -> LoadError {
         Ok(_) => panic!("the component loaded"),
         Err(error) => error,
     }
+}
+
+#[test]
+fn the_sample_agent_is_far_within_the_compile_limits() {
+    let limits = CompileLimits::default();
+    let shape = CodeShape::of(file_agent_code()).unwrap();
+    assert_eq!(limits.broken_by(&shape), None);
+
+    // None of its limits should be close, or a real agent would soon run into them.
+    let far_tighter = CompileLimits {
+        time: limits.time,
+        nested_components: 0,
+        modules: limits.modules / 4,
+        functions: limits.functions / 4,
+        code_bytes: limits.code_bytes / 4,
+        function_bytes: limits.function_bytes / 4,
+        work: limits.work / 4,
+        nested_loops: limits.nested_loops / 4,
+        function_loops: limits.function_loops / 4,
+        function_branch_points: limits.function_branch_points / 4,
+        function_block_values: limits.function_block_values / 4,
+        instance_imports: limits.instance_imports / 4,
+        memories: limits.memories / 4,
+        table_entries: limits.table_entries / 4,
+        canonical_functions: limits.canonical_functions / 4,
+        declarations: limits.declarations / 4,
+        declaration_bytes: limits.declaration_bytes / 4,
+        signature_values: limits.signature_values / 4,
+    };
+    assert_eq!(far_tighter.broken_by(&shape), None, "{shape:?}");
 }
 
 #[test]
@@ -670,7 +723,7 @@ fn several_memories_share_one_limit() {
 fn large_tables_count_towards_the_limit() {
     // 5 million elements take 40 MB, because each counts for 8 bytes.
     let table = "(table 5000000 funcref)";
-    let fixture = Fixture::new(component_exporting("i32.const 0", table));
+    let fixture = Fixture::past_the_compile_limits(component_exporting("i32.const 0", table));
     assert_eq!(
         fixture.run_limited("x", &tiny_memory()),
         RunOutcome::MemoryLimit
@@ -708,8 +761,11 @@ fn component_with_instances(contents: &str, count: usize) -> Vec<u8> {
 
 /// Checks that a component runs when it's under a cap, and is refused when it's over.
 fn expect_cap(under: Vec<u8>, over: Vec<u8>) {
-    assert_eq!(Fixture::new(under).run("x"), RunOutcome::Completed);
-    let outcome = Fixture::new(over).run("x");
+    assert_eq!(
+        Fixture::past_the_compile_limits(under).run("x"),
+        RunOutcome::Completed
+    );
+    let outcome = Fixture::past_the_compile_limits(over).run("x");
     assert!(matches!(outcome, RunOutcome::Crashed(_)), "{outcome:?}");
 }
 

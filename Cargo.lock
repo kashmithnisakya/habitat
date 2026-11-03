@@ -585,6 +585,7 @@ dependencies = [
  "getrandom",
  "habitat-core",
  "tempfile",
+ "wasm-encoder 0.263.0",
  "wasmtime",
  "wat",
  "wit-component 0.263.0",

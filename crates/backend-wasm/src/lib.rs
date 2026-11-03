@@ -1,10 +1,13 @@
 //! Wasmtime backend for running Habitat agents.
 //!
 //! Agents are untrusted, and they can only reach what's linked here, which is the agent API. Each
-//! run is limited in how much time and memory it can use.
+//! run is limited in how much time and memory it can use, and so is compiling a package beforehand.
 
+pub mod code_shape;
+pub mod compile_limits;
 mod host;
 
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,6 +19,8 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, Trap, UpdateDeadline};
 
 use crate::bindings::{Agent, AgentPre};
+use crate::code_shape::CodeShape;
+use crate::compile_limits::{CompileLimits, CompileSlot};
 use crate::host::HostState;
 
 /// The agent API, as generated from `wit/agent-home.wit`.
@@ -32,21 +37,43 @@ const ALLOWED_IMPORTS: [&str; 2] = ["habitat:host/agent-home@", "habitat:host/ty
 /// How often a running agent stops to check the time, and so how late it can be stopped.
 const TICK: Duration = Duration::from_millis(50);
 
+/// The stack for compiling. A thread gets less than this by default, while the compiler is used to
+/// the main thread's, and running out would end the whole process rather than fail one load.
+const COMPILE_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// How large a memory image can be with much less data than that in it. Wasmtime's default of
+/// 16 MB would let a few bytes of data ask for 16 MB of the host's memory while compiling.
+const SPARSE_MEMORY_IMAGE_BYTES: u64 = 1024 * 1024;
+
 /// Runs agents as WebAssembly components with Wasmtime.
 pub struct WasmBackend {
     engine: Engine,
-    linker: Linker<HostState>,
+    linker: Arc<Linker<HostState>>,
+    limits: CompileLimits,
+    compile_slot: Arc<CompileSlot>,
 }
 
 impl WasmBackend {
     pub fn new() -> Result<Self, LoadError> {
         let mut config = Config::new();
         config.epoch_interruption(true);
+        // A compile only takes up one core, because Wasmtime's `parallel-compilation` is left out.
+        config.memory_guaranteed_dense_image_size(SPARSE_MEMORY_IMAGE_BYTES);
         let engine = Engine::new(&config).map_err(internal)?;
         let mut linker = Linker::new(&engine);
         Agent::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |state| state)
             .map_err(internal)?;
-        Ok(Self { engine, linker })
+        Ok(Self {
+            engine,
+            linker: Arc::new(linker),
+            limits: CompileLimits::default(),
+            compile_slot: Arc::default(),
+        })
+    }
+
+    /// Sets the limits for packages loaded from now on, in place of the defaults.
+    pub fn set_compile_limits(&mut self, limits: CompileLimits) {
+        self.limits = limits;
     }
 }
 
@@ -55,32 +82,76 @@ fn internal(error: wasmtime::Error) -> LoadError {
 }
 
 impl Backend for WasmBackend {
+    /// Checks and compiles a package on a thread of its own, because a compile can't be stopped
+    /// and this must return in the end. Takes up to twice the time limit, if it has to wait for an
+    /// earlier compile first.
     fn load(&self, package: &Package) -> Result<Box<dyn LoadedAgent>, LoadError> {
-        let component = Component::new(&self.engine, package.component())
-            .map_err(|error| LoadError::invalid_code(&format!("{error:#}")))?;
+        let time = self.limits.time;
+        let slot = self.compile_slot.claim(time).ok_or(LoadError::Busy)?;
 
-        // The linker would refuse these too, but this gives a clearer reason.
-        let component_type = component.component_type();
-        for (name, _) in component_type.imports(&self.engine) {
-            if !ALLOWED_IMPORTS
-                .iter()
-                .any(|allowed| name.starts_with(allowed))
-            {
-                return Err(LoadError::forbidden_import(name));
+        let engine = self.engine.clone();
+        let linker = Arc::clone(&self.linker);
+        let limits = self.limits;
+        let component = package.shared_component();
+        let (result, compiled) = mpsc::channel();
+        thread::Builder::new()
+            .name("habitat-compile".to_string())
+            .stack_size(COMPILE_STACK_BYTES)
+            .spawn(move || {
+                // Only freed once the compile is over, even if nobody's waiting for it any more.
+                let _slot = slot;
+                let _ = result.send(prepare(&engine, &linker, &limits, &component));
+            })
+            .map_err(|_| LoadError::Internal("the compile couldn't be started".to_string()))?;
+
+        match compiled.recv_timeout(time) {
+            Ok(agent) => Ok(Box::new(agent?)),
+            Err(RecvTimeoutError::Timeout) => Err(LoadError::TooCostly(format!(
+                "it didn't compile within the limit of {} ms",
+                time.as_millis()
+            ))),
+            // A panic isn't something that valid code should be able to cause.
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(LoadError::invalid_code("the compiler couldn't handle it"))
             }
         }
-
-        let incompatible = |error: wasmtime::Error| LoadError::incompatible(&format!("{error:#}"));
-        let instance = self
-            .linker
-            .instantiate_pre(&component)
-            .map_err(incompatible)?;
-        let agent = AgentPre::new(instance).map_err(incompatible)?;
-        Ok(Box::new(WasmAgent {
-            engine: self.engine.clone(),
-            agent,
-        }))
     }
+}
+
+/// Everything that a package's code can make expensive, which is why it's all on the same thread.
+fn prepare(
+    engine: &Engine,
+    linker: &Linker<HostState>,
+    limits: &CompileLimits,
+    code: &[u8],
+) -> Result<WasmAgent, LoadError> {
+    let shape = CodeShape::read(code, |shape| limits.broken_by(shape).is_none())
+        .map_err(|error| LoadError::invalid_code(&error.to_string()))?;
+    if let Some(reason) = limits.broken_by(&shape) {
+        return Err(LoadError::TooCostly(reason));
+    }
+
+    let component = Component::new(engine, code)
+        .map_err(|error| LoadError::invalid_code(&format!("{error:#}")))?;
+
+    // The linker would refuse these too, but this gives a clearer reason.
+    let component_type = component.component_type();
+    for (name, _) in component_type.imports(engine) {
+        if !ALLOWED_IMPORTS
+            .iter()
+            .any(|allowed| name.starts_with(allowed))
+        {
+            return Err(LoadError::forbidden_import(name));
+        }
+    }
+
+    let incompatible = |error: wasmtime::Error| LoadError::incompatible(&format!("{error:#}"));
+    let instance = linker.instantiate_pre(&component).map_err(incompatible)?;
+    let agent = AgentPre::new(instance).map_err(incompatible)?;
+    Ok(WasmAgent {
+        engine: engine.clone(),
+        agent,
+    })
 }
 
 struct WasmAgent {
@@ -170,6 +241,23 @@ mod tests {
     use std::path::Path;
 
     use wit_parser::{Resolve, WorldItem, WorldKey};
+
+    use super::*;
+
+    /// A few bytes of data shouldn't make Wasmtime prepare much more than that in memory.
+    #[test]
+    fn a_sparse_memory_image_isnt_built_while_compiling() {
+        let code = wat::parse_str(
+            r#"(component (core module
+                (memory 1024)
+                (data (i32.const 0) "x")
+                (data (i32.const 16000000) "x")))"#,
+        )
+        .unwrap();
+        let backend = WasmBackend::new().unwrap();
+        let compiled = backend.engine.precompile_component(&code).unwrap();
+        assert!(compiled.len() < 1024 * 1024, "{}", compiled.len());
+    }
 
     /// Everything an agent can reach. Adding to this list gives every agent a new way to affect
     /// the outside world, so check it against `docs/threat-model.md` first.

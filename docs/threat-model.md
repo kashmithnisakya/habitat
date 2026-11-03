@@ -27,6 +27,7 @@ The trusted parts are the Rust core, the shell and the operating system.
 | Faking an approval prompt | The core draws prompts, and the agent's reason is labelled as its own claim |
 | Wearing the user down with prompts | Rate limits on repeated requests |
 | Exhausting CPU, memory, disk or model budget | Limits per run and per agent |
+| Making the compiler use up CPU or memory, with a package that's cheap to send | [Limits checked before compiling](compile-costs.md), a time limit, and one compile at a time. Memory isn't enforced once compiling has started |
 | Changing grants or logs | Stored outside the agent's home, and the log is hash-chained |
 | Attacking the broker with malformed input | Safe Rust, strict validation and fuzzing |
 | Hostile agent packages | A [strict package format](packages.md) with size limits and no paths taken from the archive, and packages contain only WebAssembly |
