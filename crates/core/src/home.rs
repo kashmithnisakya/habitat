@@ -4,7 +4,7 @@
 //! down from an open directory, one name at a time, without following symlinks. Swapping a
 //! directory for a symlink during an operation therefore can't lead outside the home.
 
-use std::fs::DirBuilder;
+use std::fs::{self, DirBuilder};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,8 @@ const GRANTS_FILE: &str = "grants.db";
 const AUDIT_FILE: &str = "audit.db";
 const RUNS_DIR: &str = "runs";
 const RUN_LOCK_FILE: &str = "run.lock";
+/// Where an agent's folder goes while it's being deleted.
+const REMOVED_DIR: &str = "removed";
 const PACKAGE_HASH_FILE: &str = "package.sha256";
 
 const MAX_PATH_BYTES: usize = 1024;
@@ -121,6 +123,56 @@ impl AgentStorage {
             return Err(HomeError::NotFound);
         }
         Self::open(root, agent_name)
+    }
+
+    /// The names of all the agents with a folder under `root`, sorted. Anything else there is left
+    /// out, including anything that couldn't have been made by [`AgentStorage::open`].
+    pub(crate) fn names(root: &Path) -> io::Result<Vec<String>> {
+        let entries = match fs::read_dir(root.join(AGENTS_DIR)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            other => other?,
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if let Some(name) = entry.file_name().to_str()
+                && is_agent_name(name)
+                && entry.path().is_dir()
+            {
+                names.push(name.to_string());
+            }
+        }
+        names.sort_unstable();
+        Ok(names)
+    }
+
+    /// Deletes this agent's folder and everything in it, without following any symlinks.
+    ///
+    /// The folder is moved away first, so the agent is gone in one step. If the host dies part way
+    /// through, a later install can't inherit what's left of the old agent's home. What's left is
+    /// cleared out the next time an agent is removed.
+    pub(crate) fn remove(self) -> io::Result<()> {
+        let agents = self.path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        let root = agents.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        let removed = root.join(REMOVED_DIR);
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&removed)?;
+        // Each is deleted by whatever moved it there, so this only matters after a crash. Another
+        // process could be deleting one at the same time, so errors here don't matter either.
+        for entry in fs::read_dir(&removed)?.flatten() {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+
+        let mut random = [0; 8];
+        getrandom::fill(&mut random).map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+        let id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let target = removed.join(format!("{}-{id}", self.name));
+        fs::rename(&self.path, &target)?;
+        fs::File::open(agents)?.sync_all()?;
+        fs::File::open(&removed)?.sync_all()?;
+        fs::remove_dir_all(target)
     }
 
     /// The name of the agent this folder belongs to.
@@ -990,6 +1042,22 @@ mod tests {
             fs::read_to_string(fixture.storage.package_path().join("agent.toml")).unwrap(),
             "x"
         );
+    }
+
+    #[test]
+    fn only_real_agent_folders_count_as_agents() {
+        let root = TempDir::new().unwrap();
+        assert_eq!(
+            AgentStorage::names(root.path()).unwrap(),
+            Vec::<String>::new()
+        );
+        AgentStorage::open(root.path(), "zebra").unwrap();
+        AgentStorage::open(root.path(), "ant").unwrap();
+        let agents = root.path().join(AGENTS_DIR);
+        fs::write(agents.join("a-file"), "x").unwrap();
+        fs::create_dir(agents.join("Not-A-Name")).unwrap();
+        fs::create_dir(agents.join(".hidden")).unwrap();
+        assert_eq!(AgentStorage::names(root.path()).unwrap(), ["ant", "zebra"]);
     }
 
     #[test]

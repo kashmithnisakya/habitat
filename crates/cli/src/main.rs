@@ -1,6 +1,421 @@
 //! Command line for Habitat.
 
-fn main() {
-    eprintln!("habitat is not implemented yet. See the project roadmap.");
-    std::process::exit(1);
+use std::env;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{self, ExitCode};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use clap::{Parser, Subcommand};
+use habitat_backend_wasm::WasmBackend;
+use habitat_core::backend::{Event, HostLimits, RunOutcome};
+use habitat_core::manifest::MAX_MANIFEST_BYTES;
+use habitat_core::package::{MAX_COMPONENT_BYTES, Package};
+use habitat_core::run_log::{RunEnding, RunRecord};
+use habitat_core::supervisor::{Supervisor, SupervisorError};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
+
+const FAILURE: u8 = 1;
+const AGENT_FAILED: u8 = 3;
+const AGENT_NOT_STARTED: u8 = 4;
+const AGENT_BUSY: u8 = 5;
+const STOPPED: u8 = 130;
+
+/// How long a running agent gets to stop, after Ctrl-C or a request to stop. An agent stops within
+/// a moment, but a compile can't be interrupted, so this doesn't wait for the end of one.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+
+const EXIT_CODES: &str = "\
+Exit codes:
+  0    It worked
+  1    It failed, or was cancelled
+  2    The command line was wrong
+  3    The agent ran, and failed, crashed or hit a limit
+  4    The agent's code never started
+  5    The agent is already running
+  130  The agent was stopped by Ctrl-C or a request to stop";
+
+/// Runs AI agents in a secure home of their own.
+///
+/// Early development: don't rely on this to protect anything yet.
+#[derive(Parser)]
+#[command(name = "habitat", version, after_help = EXIT_CODES)]
+struct Cli {
+    /// The folder that holds all agents and their files
+    #[arg(long, global = true, env = "HABITAT_HOME", value_name = "FOLDER")]
+    root: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Makes a package file from a manifest and a WebAssembly component
+    Pack {
+        /// The agent's agent.toml
+        manifest: PathBuf,
+        /// The agent's WebAssembly component
+        component: PathBuf,
+        /// The package file to make, which can't exist yet
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Installs an agent from a package file
+    Install {
+        /// The package file
+        package: PathBuf,
+    },
+    /// Runs an agent for one message, and waits for it to end
+    Run {
+        /// The agent's name
+        agent: String,
+        /// The message for the agent to handle
+        message: String,
+    },
+    /// Lists the installed agents
+    List,
+    /// Deletes an agent and all its files
+    Remove {
+        /// The agent's name
+        agent: String,
+        /// Doesn't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+/// Why a command failed, and the exit code to show for it.
+struct Failure {
+    code: u8,
+    message: String,
+}
+
+impl Failure {
+    fn new(code: u8, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn general(message: impl Into<String>) -> Self {
+        Self::new(FAILURE, message)
+    }
+}
+
+impl From<SupervisorError> for Failure {
+    fn from(error: SupervisorError) -> Self {
+        let code = match error {
+            SupervisorError::AlreadyRunning => AGENT_BUSY,
+            SupervisorError::ShuttingDown => STOPPED,
+            _ => FAILURE,
+        };
+        Self::new(code, error.to_string())
+    }
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run_command(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            eprintln!("error: {}", failure.message);
+            ExitCode::from(failure.code)
+        }
+    }
+}
+
+fn run_command(cli: Cli) -> Result<(), Failure> {
+    // This one doesn't touch any agents, so it doesn't need to know where they are.
+    if let Command::Pack {
+        manifest,
+        component,
+        output,
+    } = &cli.command
+    {
+        return pack(manifest, component, output);
+    }
+
+    let root = match cli.root {
+        Some(root) => root,
+        None => default_root().map_err(Failure::general)?,
+    };
+    let backend = WasmBackend::new().map_err(|error| Failure::general(error.to_string()))?;
+    let supervisor = Supervisor::new(&root, backend, HostLimits::default());
+    match cli.command {
+        Command::Pack { .. } => unreachable!("handled above"),
+        Command::Install { package } => install(&supervisor, &package),
+        Command::Run { agent, message } => run(supervisor, &agent, message),
+        Command::List => list(&supervisor),
+        Command::Remove { agent, yes } => remove(&supervisor, &agent, yes),
+    }
+}
+
+/// Where agents are kept unless told otherwise, following each platform's convention.
+fn default_root() -> Result<PathBuf, String> {
+    let home = env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or("HOME isn't set, so use --root to say where agents are kept")?;
+    if cfg!(target_os = "macos") {
+        return Ok(home.join("Library/Application Support/habitat"));
+    }
+    let data = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|data| data.is_absolute())
+        .unwrap_or_else(|| home.join(".local/share"));
+    Ok(data.join("habitat"))
+}
+
+/// Printing to something that's gone away, as in `habitat list | head -1`, shouldn't be an error.
+fn say(text: impl std::fmt::Display) {
+    let _ = writeln!(io::stdout(), "{text}");
+}
+
+fn describe_path(path: &Path, error: &io::Error) -> String {
+    format!("{}: {}", path.display(), error.kind())
+}
+
+/// Reads a file that could be anything, stopping as soon as it's over its limit.
+fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, Failure> {
+    let file = File::open(path).map_err(|error| Failure::general(describe_path(path, &error)))?;
+    let mut data = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut data)
+        .map_err(|error| Failure::general(describe_path(path, &error)))?;
+    if data.len() as u64 > limit {
+        return Err(Failure::general(format!(
+            "{} is over the limit of {limit} bytes",
+            path.display()
+        )));
+    }
+    Ok(data)
+}
+
+fn pack(manifest: &Path, component: &Path, output: &Path) -> Result<(), Failure> {
+    let manifest_text = read_limited(manifest, MAX_MANIFEST_BYTES as u64)?;
+    let manifest_text = String::from_utf8(manifest_text)
+        .map_err(|_| Failure::general(format!("{} isn't UTF-8", manifest.display())))?;
+    let code = read_limited(component, MAX_COMPONENT_BYTES)?;
+    let package =
+        Package::new(&manifest_text, code).map_err(|error| Failure::general(error.to_string()))?;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .map_err(|error| Failure::general(describe_path(output, &error)))?;
+    let written = package.write(&mut file).and_then(|()| {
+        file.sync_all()?;
+        Ok(())
+    });
+    if let Err(error) = written {
+        let _ = fs::remove_file(output);
+        return Err(Failure::general(error.to_string()));
+    }
+    say(format_args!(
+        "Packed {} {} into {}",
+        package.manifest().name(),
+        package.manifest().version(),
+        output.display()
+    ));
+    say(format_args!("Package hash: {}", package.hash()));
+    Ok(())
+}
+
+fn install(supervisor: &Supervisor, path: &Path) -> Result<(), Failure> {
+    let file = File::open(path).map_err(|error| Failure::general(describe_path(path, &error)))?;
+    let package = Package::read(file).map_err(|error| Failure::general(error.to_string()))?;
+    supervisor.install(&package)?;
+    say(format_args!(
+        "Installed {} {}",
+        package.manifest().name(),
+        package.manifest().version()
+    ));
+    say(format_args!("Package hash: {}", package.hash()));
+    Ok(())
+}
+
+fn run(supervisor: Supervisor, agent: &str, message: String) -> Result<(), Failure> {
+    let supervisor = Arc::new(supervisor);
+    stop_on_signals(Arc::clone(&supervisor))?;
+
+    let record = match supervisor.run(agent, &Event::UserMessage(message)) {
+        Ok(record) => record,
+        Err(SupervisorError::EndingNotSaved(record)) => {
+            let saying = format!("{}, but that couldn't be saved", describe_ending(&record));
+            return Err(Failure::new(code_for(&record, &supervisor), saying));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match code_for(&record, &supervisor) {
+        0 => {
+            say(format_args!(
+                "{} (run {})",
+                describe_ending(&record),
+                record.id
+            ));
+            Ok(())
+        }
+        code => Err(Failure::new(
+            code,
+            format!("{} (run {})", describe_ending(&record), record.id),
+        )),
+    }
+}
+
+/// Stops the agent on Ctrl-C or a request to stop. Exiting without waiting is safe, because the
+/// agent's files are always saved whole, and its run will show as interrupted.
+fn stop_on_signals(supervisor: Arc<Supervisor>) -> Result<(), Failure> {
+    let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|error| {
+        Failure::general(format!("couldn't prepare to be stopped: {}", error.kind()))
+    })?;
+    thread::Builder::new()
+        .name("habitat-signals".to_string())
+        .spawn(move || {
+            if signals.forever().next().is_some() && !supervisor.shut_down(STOP_WAIT) {
+                eprintln!("error: stopped while the agent's code was still compiling");
+                process::exit(i32::from(STOPPED));
+            }
+        })
+        .map_err(|error| {
+            Failure::general(format!("couldn't prepare to be stopped: {}", error.kind()))
+        })?;
+    Ok(())
+}
+
+fn code_for(record: &RunRecord, supervisor: &Supervisor) -> u8 {
+    match &record.ending {
+        Some(RunEnding::Ran(RunOutcome::Completed)) => 0,
+        Some(RunEnding::Ran(RunOutcome::Stopped)) => STOPPED,
+        Some(RunEnding::NotStarted(_)) if supervisor.is_shutting_down() => STOPPED,
+        Some(RunEnding::NotStarted(_)) => AGENT_NOT_STARTED,
+        _ => AGENT_FAILED,
+    }
+}
+
+/// Says how a run went. All the text in a record is safe to print.
+fn describe_ending(record: &RunRecord) -> String {
+    let Some(ending) = &record.ending else {
+        return "running".to_string();
+    };
+    match ending {
+        RunEnding::Interrupted => "interrupted when the host stopped".to_string(),
+        RunEnding::NotStarted(reason) => format!("didn't start: {reason}"),
+        RunEnding::Ran(outcome) => match outcome {
+            RunOutcome::Completed => "completed".to_string(),
+            RunOutcome::Failed(message) => format!("failed, and the agent said: {message}"),
+            RunOutcome::TimeLimit => "stopped at its time limit".to_string(),
+            RunOutcome::MemoryLimit => "crashed at its memory limit".to_string(),
+            RunOutcome::Stopped => "stopped".to_string(),
+            RunOutcome::Crashed(reason) => format!("crashed: {reason}"),
+            RunOutcome::Internal(reason) => format!("the host failed: {reason}"),
+        },
+    }
+}
+
+fn list(supervisor: &Supervisor) -> Result<(), Failure> {
+    let agents = supervisor.list()?;
+    if agents.is_empty() {
+        say("No agents are installed.");
+        return Ok(());
+    }
+    let width = agents
+        .iter()
+        .map(|agent| agent.name.len())
+        .max()
+        .unwrap_or_default();
+    let versions: Vec<String> = agents
+        .iter()
+        .map(|agent| {
+            agent
+                .version
+                .as_ref()
+                .map_or("unknown".to_string(), ToString::to_string)
+        })
+        .collect();
+    let version_width = versions.iter().map(String::len).max().unwrap_or_default();
+    say(format_args!(
+        "{:width$}  {:version_width$}  LAST RUN",
+        "NAME",
+        "VERSION",
+        width = width.max(4),
+        version_width = version_width.max(7)
+    ));
+    for (agent, version) in agents.iter().zip(&versions) {
+        let last_run = agent
+            .last_run
+            .as_ref()
+            .map_or("never".to_string(), describe_ending);
+        say(format_args!(
+            "{:width$}  {:version_width$}  {last_run}",
+            agent.name,
+            version,
+            width = width.max(4),
+            version_width = version_width.max(7)
+        ));
+    }
+    Ok(())
+}
+
+fn remove(supervisor: &Supervisor, agent: &str, yes: bool) -> Result<(), Failure> {
+    // Checked first, so that nobody is asked about an agent that can't be removed anyway.
+    supervisor.history(agent)?;
+    if !yes && !confirmed(agent)? {
+        return Err(Failure::general("cancelled, and nothing was removed"));
+    }
+    supervisor.remove(agent)?;
+    say(format_args!("Removed {agent} and all its files"));
+    Ok(())
+}
+
+/// Asks for confirmation. Only a clear yes counts, so no answer at all means no.
+fn confirmed(agent: &str) -> Result<bool, Failure> {
+    let _ = write!(
+        io::stderr(),
+        "This deletes {agent} and all its files, and it can't be undone. Continue? [y/N] "
+    );
+    let mut answer = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut answer)
+        .map_err(|error| Failure::general(format!("couldn't read an answer: {}", error.kind())))?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use habitat_core::run_log::{EventKind, RunId};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn record(ending: RunEnding) -> RunRecord {
+        RunRecord {
+            id: RunId::parse(&"0".repeat(32)).unwrap(),
+            event: EventKind::UserMessage,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            ending: Some(ending),
+        }
+    }
+
+    #[test]
+    fn a_run_that_didnt_start_because_of_stopping_counts_as_stopped() {
+        let root = TempDir::new().unwrap();
+        let backend = WasmBackend::new().unwrap();
+        let supervisor = Supervisor::new(root.path(), backend, HostLimits::default());
+        let not_started = record(RunEnding::NotStarted("a reason".to_string()));
+        assert_eq!(code_for(&not_started, &supervisor), AGENT_NOT_STARTED);
+        assert!(supervisor.shut_down(Duration::ZERO));
+        assert_eq!(code_for(&not_started, &supervisor), STOPPED);
+    }
 }
