@@ -62,6 +62,10 @@ impl Guest for Agent {
                     std::hint::black_box(api::now_ms());
                 }
             }
+            "say" => {
+                let message = text.strip_prefix("say ").unwrap_or_default();
+                api::send_message(message).map_err(|error| error.to_string())
+            }
             "fetch" => fetch(first, rest),
             "pick-file" => pick_file(first, rest),
             "fetch-and-hold" => fetch_and_hold(first),
@@ -302,8 +306,7 @@ fn expect_denied_outside() -> Result<(), String> {
     )?;
     let file = api::pick_user_file("testing");
     denied(file.err().ok_or("pick-user-file worked")?, "pick-user-file")?;
-    let message = api::send_message("hello");
-    denied(message.err().ok_or("send-message worked")?, "send-message")
+    Ok(())
 }
 
 fn check_clock_and_random() -> Result<(), String> {

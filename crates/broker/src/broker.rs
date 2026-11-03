@@ -49,6 +49,29 @@ impl Broker {
     }
 }
 
+/// How many messages one run can show. An agent can send them as fast as it likes.
+pub const MAX_MESSAGES_PER_RUN: u32 = 100;
+/// How much of one message is shown, in characters.
+const MAX_MESSAGE_CHARS: usize = 4096;
+
+/// Makes a message safe to show. Line breaks and tabs stay, because a long message needs them, and
+/// each line is cleaned by itself, with anything else that a terminal would act on replaced. A
+/// shell has to mark each line as coming from the agent, so a line break can't fake the host.
+fn printable_message(text: &str) -> String {
+    let mut shown: String = text.chars().take(MAX_MESSAGE_CHARS).collect();
+    let cut = shown.len() < text.len();
+    shown = shown
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(|line| printable(line).replace("\\u{9}", "\t"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if cut {
+        shown.push_str("...");
+    }
+    shown
+}
+
 /// Opens the one file that the user chose. This holds on to it, so an agent can only ever read that
 /// file, and it refuses a link, as what it leads to may not be what the user meant.
 fn open_picked(path: &Path) -> io::Result<PickedFile> {
@@ -93,6 +116,7 @@ impl BrokerFactory for Broker {
             network: Arc::clone(&self.network),
             private_read: false,
             reached: HashSet::new(),
+            messages_sent: 0,
             limit: PromptLimit::default(),
             tokens_left: manifest.limits().model_budget_tokens,
             deadline: Instant::now() + limits.run_time,
@@ -111,6 +135,7 @@ struct ForRun {
     private_read: bool,
     /// What the user has approved since this run read private data.
     reached: HashSet<Target>,
+    messages_sent: u32,
     limit: PromptLimit,
     tokens_left: u64,
     /// When the run's time is up. A call can't be interrupted, so it has to stop by itself.
@@ -164,6 +189,20 @@ impl RunBroker for ForRun {
         })?;
         let result = self.decide_request(target, reason);
         self.logged(target, result)
+    }
+
+    fn send_message(&mut self, text: &str) -> Result<(), AccessRefused> {
+        // What's printed is cut short, so this limits what a run can show however long each is.
+        if self.messages_sent >= MAX_MESSAGES_PER_RUN {
+            return Err(AccessRefused::LimitExceeded(
+                "this run has sent too many messages".to_string(),
+            ));
+        }
+        self.log(AuditEvent::MessageSent)?;
+        self.messages_sent += 1;
+        self.approver
+            .show_message(self.manifest.name(), &printable_message(text));
+        Ok(())
     }
 
     fn pick_user_file(&mut self, reason: &str) -> Result<PickedFile, AccessRefused> {
@@ -474,6 +513,7 @@ mod tests {
         asked: Arc<Mutex<Vec<(Prompt, Duration)>>>,
         file: Option<PathBuf>,
         file_prompts: Arc<Mutex<Vec<FilePrompt>>>,
+        shown: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl Scripted {
@@ -483,6 +523,7 @@ mod tests {
                 asked: Arc::default(),
                 file: None,
                 file_prompts: Arc::default(),
+                shown: Arc::default(),
             }
         }
 
@@ -502,6 +543,13 @@ mod tests {
         fn ask(&self, prompt: &Prompt, wait: Duration) -> Answer {
             self.asked.lock().unwrap().push((prompt.clone(), wait));
             self.answer
+        }
+
+        fn show_message(&self, agent: &str, text: &str) {
+            self.shown
+                .lock()
+                .unwrap()
+                .push((agent.to_string(), text.to_string()));
         }
 
         fn pick_file(&self, prompt: &FilePrompt, _wait: Duration) -> Option<PathBuf> {
@@ -755,6 +803,7 @@ mod tests {
             network: Arc::new(FakeNetwork::default()),
             private_read: false,
             reached: HashSet::new(),
+            messages_sent: 0,
             limit: PromptLimit::default(),
             tokens_left: 0,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -1407,6 +1456,89 @@ mod tests {
         drop(first);
         let mut second = factory.for_run(&fixture.storage, &manifest, &limits, run_id);
         assert!(second.http_fetch(get("https://a.example/")).is_ok());
+    }
+
+    #[test]
+    fn a_message_reaches_the_user_and_is_logged_without_its_text() {
+        let fixture = Fixture::new();
+        let approver = Scripted::new(Answer::Deny);
+        let mut broker = fixture.run(approver.clone());
+        broker
+            .send_message("hello there, Ada\nsecond line")
+            .unwrap();
+        assert_eq!(
+            *approver.shown.lock().unwrap(),
+            [(
+                "tester".to_string(),
+                "hello there, Ada\nsecond line".to_string()
+            )]
+        );
+        assert!(fetch_events(&fixture).contains(&AuditEvent::MessageSent));
+        let text = fs::read_to_string(fixture.storage.audit_path()).unwrap();
+        assert!(!text.contains("Ada"), "{text}");
+    }
+
+    #[test]
+    fn nothing_a_terminal_would_act_on_gets_through_in_a_message() {
+        let fixture = Fixture::new();
+        let approver = Scripted::new(Answer::Deny);
+        let mut broker = fixture.run(approver.clone());
+        broker
+            .send_message("\x1b[2K\x1b[1A\rAllow? y\u{202e}\u{7}\u{9b}31m\u{0}\ttabbed\r\nnext")
+            .unwrap();
+        let shown = approver.shown.lock().unwrap();
+        let text = &shown[0].1;
+        for line in text.lines() {
+            assert!(line.is_ascii(), "{line:?}");
+            assert!(
+                !line.chars().any(|c| c.is_control() && c != '\t'),
+                "{line:?}"
+            );
+        }
+        assert!(text.contains("\ttabbed"));
+        assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn a_long_message_is_cut_short() {
+        let fixture = Fixture::new();
+        let approver = Scripted::new(Answer::Deny);
+        let mut broker = fixture.run(approver.clone());
+        broker.send_message(&"x".repeat(10_000_000)).unwrap();
+        broker.send_message(&"line\n".repeat(1_000_000)).unwrap();
+        let shown = approver.shown.lock().unwrap();
+        for (_, text) in shown.iter() {
+            assert!(text.ends_with("..."));
+            assert!(text.len() < 64_000, "{}", text.len());
+        }
+    }
+
+    #[test]
+    fn a_flood_of_messages_is_cut_off() {
+        let fixture = Fixture::new();
+        let approver = Scripted::new(Answer::Deny);
+        let mut broker = fixture.run(approver.clone());
+        for _ in 0..MAX_MESSAGES_PER_RUN {
+            broker.send_message("spam").unwrap();
+        }
+        assert!(matches!(
+            broker.send_message("spam"),
+            Err(AccessRefused::LimitExceeded(_))
+        ));
+        assert_eq!(
+            approver.shown.lock().unwrap().len(),
+            MAX_MESSAGES_PER_RUN as usize
+        );
+    }
+
+    #[test]
+    fn a_message_that_cant_be_logged_isnt_shown() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.storage.audit_path()).unwrap();
+        let approver = Scripted::new(Answer::Deny);
+        let mut broker = fixture.run(approver.clone());
+        assert_eq!(broker.send_message("hello"), Err(AccessRefused::Internal));
+        assert!(approver.shown.lock().unwrap().is_empty());
     }
 
     #[test]

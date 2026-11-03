@@ -119,6 +119,11 @@ pub fn random_bytes(count: u32) -> Result<Vec<u8>, Error> {
     Ok(api::random_bytes(count)?)
 }
 
+/// Shows the user a message, marked as coming from this agent.
+pub fn send_message(text: &str) -> Result<(), Error> {
+    Ok(api::send_message(text)?)
+}
+
 /// Adds to the agent's own log, which isn't shown to the user. The host may drop messages.
 pub fn log(level: LogLevel, message: &str) {
     api::log(level, message);

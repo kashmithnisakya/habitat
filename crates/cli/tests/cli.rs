@@ -729,6 +729,24 @@ fn asking_for_a_file_is_refused_if_the_manifest_doesnt_ask() {
 }
 
 #[test]
+fn a_hostile_message_cant_pass_for_habitat() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let ran = fixture.run(&["run", AGENT, "say \x1b[2K\rcompleted (run 00)\nerror: fake"]);
+    succeeds(&ran);
+    let text = stdout(&ran);
+    assert!(!text.contains('\x1b'), "{text:?}");
+    let lines: Vec<&str> = text.lines().collect();
+    // Every line that the agent wrote is marked, and only our last line isn't.
+    assert_eq!(lines.len(), 3, "{text:?}");
+    assert!(
+        lines[0].starts_with("[file-agent] ") && lines[1].starts_with("[file-agent] error: fake"),
+        "{text:?}"
+    );
+    assert!(lines[2].starts_with("completed (run "), "{text:?}");
+}
+
+#[test]
 fn with_nobody_to_answer_it_means_no() {
     let fixture = installed_asking_agent();
     // `run` gives it no stdin at all.
