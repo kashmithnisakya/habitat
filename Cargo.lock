@@ -1147,6 +1147,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "habitat-research-helper"
+version = "0.0.0"
+dependencies = [
+ "habitat-sdk",
+ "serde",
+]
+
+[[package]]
 name = "habitat-sdk"
 version = "0.0.0"
 dependencies = [
