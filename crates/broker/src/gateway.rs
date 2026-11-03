@@ -448,10 +448,8 @@ impl Network for RealNetwork {
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
+    use std::env;
+    use std::process::{Command, Stdio};
 
     use super::*;
 
@@ -837,21 +835,40 @@ mod tests {
         }
     }
 
+    const PROXY_VAR: &str = "HABITAT_TEST_PROXY_CHECK";
+
+    /// Runs in a process of its own with a proxy set, as changing the environment isn't safe in a
+    /// test that shares a process with others.
+    #[test]
+    #[ignore = "run by the_real_client_doesnt_use_a_proxy_from_the_environment"]
+    fn proxy_check() {
+        assert!(
+            env::var(PROXY_VAR).is_ok(),
+            "only for the test that runs this"
+        );
+        let network = RealNetwork::new();
+        assert!(network.agent.config().proxy().is_none());
+    }
+
     #[test]
     fn the_real_client_doesnt_use_a_proxy_from_the_environment() {
-        // If it did, this listener would hear about the request.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let heard = Arc::new(AtomicBool::new(false));
-        let network = RealNetwork::with_lookup(Answers(vec!["127.0.0.1".parse().unwrap()]));
-        // `Agent` reads this when it's built, and building it here turned that off, whatever it's
-        // set to. Changing the environment isn't safe in a test, so check the setting directly.
-        assert!(network.agent.config().proxy().is_none(), "{address}");
+        for variable in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+            let status = Command::new(env::current_exe().unwrap())
+                .args(["--exact", "gateway::tests::proxy_check", "--ignored"])
+                .env(PROXY_VAR, "1")
+                .env(variable, "http://127.0.0.1:9")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{variable}");
+        }
+    }
+
+    #[test]
+    fn the_real_client_only_does_https_and_follows_no_redirects() {
+        let network = RealNetwork::new();
         assert_eq!(network.agent.config().max_redirects(), 0);
         assert!(network.agent.config().https_only());
-        thread::yield_now();
-        assert!(listener.accept().is_err());
-        assert!(!heard.load(Ordering::SeqCst));
     }
 }

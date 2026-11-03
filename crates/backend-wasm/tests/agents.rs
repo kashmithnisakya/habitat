@@ -912,3 +912,19 @@ fn an_agent_gets_the_reason_a_fetch_was_refused() {
         assert!(message.contains(expected), "{message}");
     }
 }
+
+#[test]
+fn a_run_can_only_hold_so_many_responses_open() {
+    let fetcher = || FakeFetcher {
+        body_size: 0,
+        refuses_with: None,
+    };
+    assert_eq!(
+        run_with_fetcher("fetch-and-hold 16", fetcher()),
+        RunOutcome::Completed
+    );
+    let RunOutcome::Failed(message) = run_with_fetcher("fetch-and-hold 17", fetcher()) else {
+        panic!("this should have failed");
+    };
+    assert!(message.contains("LimitExceeded"), "{message}");
+}

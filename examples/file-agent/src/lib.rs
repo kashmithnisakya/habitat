@@ -63,6 +63,7 @@ impl Guest for Agent {
                 }
             }
             "fetch" => fetch(first, rest),
+            "fetch-and-hold" => fetch_and_hold(first),
             "ask-model" => {
                 let target = AccessTarget::Model(first.to_string());
                 api::request_access(&target, rest)
@@ -83,6 +84,34 @@ impl Guest for Agent {
 }
 
 static mut MEMORY: u32 = 0;
+
+/// Opens this many responses at once, keeping them all open.
+fn fetch_and_hold(count: &str) -> Result<(), String> {
+    use habitat_sdk::bindings::habitat::host::types::{HttpMethod, HttpRequest};
+
+    let count: usize = count.parse().map_err(|_| "bad count".to_string())?;
+    let mut held = Vec::new();
+    for _ in 0..count {
+        let response = api::http_fetch(&HttpRequest {
+            method: HttpMethod::Get,
+            url: "https://a.example/".to_string(),
+            headers: Vec::new(),
+            body: None,
+        })
+        .map_err(|error| error.to_string())?;
+        held.push(response);
+    }
+    // Closing them all makes room for more.
+    held.clear();
+    api::http_fetch(&HttpRequest {
+        method: HttpMethod::Get,
+        url: "https://a.example/".to_string(),
+        headers: Vec::new(),
+        body: None,
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
 
 /// Fetches a URL, reads all of it a little at a time, and checks how much there was, with the
 /// status at the start. For example, `fetch https://a.example/ 200:5`.
