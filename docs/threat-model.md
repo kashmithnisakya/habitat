@@ -42,5 +42,6 @@ The trusted parts are the Rust core, the shell and the operating system.
 ## Known weak spots
 
 - Wasmtime's Android and iOS targets are [Tier 3](https://docs.wasmtime.dev/stability-tiers.html), which it describes as not production ready.
+- The shell is trusted, and on phones it's [planned to include](decisions/0006-flutter-phone-app.md) the Flutter engine and every Dart package in the app. A bug or hostile package there could misreport the answer to a prompt.
 - Approval prompts depend on people reading them.
 - The audit log can't detect full replacement by someone who controls the device.

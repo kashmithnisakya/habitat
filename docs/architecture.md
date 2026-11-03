@@ -6,7 +6,7 @@ This is a design document. None of it is implemented yet, and it will change as 
 
 The first version must:
 
-- Run the same agent package on Mac and Android.
+- Run the same agent package on Mac, Android and iPhone.
 - Keep the agent's files and memory between runs.
 - Block access to anything outside its home unless permission is granted.
 - Keep API keys out of the agent's reach.
@@ -18,10 +18,10 @@ See the [threat model](threat-model.md) for what this does and doesn't protect a
 
 ```text
 ┌──────────────────────────────────────────────┐
-│ Shell: CLI (Mac) or Kotlin app (Android)     │
+│ Shell: CLI (Mac) or Flutter app (phones)     │
 │ Shows approvals, activity log and controls   │
 └──────────────────────┬───────────────────────┘
-                       │ UniFFI on Android
+                       │ UniFFI on phones
 ┌──────────────────────▼───────────────────────┐
 │ Rust core (trusted)                          │
 │                                              │
@@ -44,12 +44,16 @@ See the [threat model](threat-model.md) for what this does and doesn't protect a
 
 | Component | Crate | Responsibility |
 |---|---|---|
-| Shell | `cli`, `android/` | Starts agents, shows approval prompts and displays the activity log |
+| Shell | `cli`, `app/` | Starts agents, shows approval prompts and displays the activity log |
 | Supervisor | `core` | Manages each run's lifecycle and enforces limits |
 | Home store | `core` | Stores agent packages, files and state |
 | Broker | `broker` | Decides on and carries out every request that leaves the agent's home |
 | Backend | `backend-wasm` | Runs the untrusted agent |
 | SDK | `sdk` | Helps authors build agents against the agent API |
+
+## Phone app
+
+The plan is one [Flutter app](decisions/0006-flutter-phone-app.md) for Android and iPhone. The Flutter UI talks to a small layer of Kotlin or Swift, which calls the core through UniFFI. That layer also holds what only the phone can do: the OS keystore, background work and the file picker. The core still makes every decision, and the UI only shows what the core sends and returns the user's answer.
 
 ## Request flow
 
@@ -122,7 +126,7 @@ These limits have gaps:
 |---|---|---|
 | Mac and Linux | Wasmtime | First targets for development |
 | Android | Wasmtime | [Tier 3](https://docs.wasmtime.dev/stability-tiers.html) in Wasmtime, which it describes as not production ready |
-| iPhone (later) | Wasmtime's [Pulley interpreter](https://docs.wasmtime.dev/examples-pulley.html) | Android's Tier 3 caveat also applies, and Pulley is roughly 10x slower than native code |
+| iPhone | Wasmtime's [Pulley interpreter](https://docs.wasmtime.dev/examples-pulley.html) | Android's Tier 3 caveat also applies, and Pulley is roughly 10x slower than native code |
 | Desktop microVM (later) | Second backend, possibly [libkrun](https://github.com/libkrun/libkrun) | The broker API has to work outside WebAssembly too |
 
 ## Biggest risks
@@ -133,7 +137,9 @@ These limits have gaps:
 | A bug in the broker breaks everything | Keep it small, use safe Rust, fuzz its inputs and get an outside security review |
 | Not enough agents can run on it | Ship useful example agents, and make Python an early follow-up |
 | Too many approval prompts | Use narrow, reusable grants, and test with real people |
-| Phones stop background work | Use the event-based design and Android's normal background APIs |
+| Phones stop background work | Use the event-based design and each phone's normal background APIs, and treat iPhone wake-ups as best effort |
+| Wasmtime next to Flutter is untested | Test on both phones before building the app, and run agents in a separate process on Android if they interfere |
+| The App Store may not allow agents that users install | Get an answer early, because [guideline 2.5.2](https://developer.apple.com/app-store/review/guidelines/) restricts downloaded code and the exception in 4.7 doesn't name WebAssembly |
 
 ## What to revisit
 

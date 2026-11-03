@@ -17,7 +17,7 @@ The agent runs inside WebAssembly and starts with no outside access. Every reque
 
 ```text
 ┌──────────────────────────────────────────────┐
-│ Shell: CLI (Mac) or Kotlin app (Android)     │
+│ Shell: CLI (Mac) or Flutter app (phones)     │
 │ Shows approvals, activity log and controls   │
 └──────────────────────┬───────────────────────┘
                        │
@@ -38,7 +38,7 @@ Planned guarantees:
 - **Approvals the agent can't fake:** the trusted core draws every permission prompt.
 - **Secrets stay outside:** API keys never enter the agent's space.
 - **A full record:** every action, approval and denial goes into a tamper-evident log.
-- **Same package everywhere:** one agent package runs on Mac and Android.
+- **Same package everywhere:** one agent package runs on Mac, Android and iPhone.
 
 ## Project status
 
@@ -46,9 +46,10 @@ Planned guarantees:
 |---|---|
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
+| iPhone and Flutter feasibility test | Not started |
 | Mac core, broker and secrets | In progress: an agent can run through Wasmtime and use files in its home, within time and memory limits |
 | Attack tests | Not started |
-| Android app | Not started |
+| Phone app (Flutter) | Not started |
 
 Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41). The next step is to run the Android feasibility test on a real phone. See the [draft feasibility report](docs/feasibility-android.md).
 
@@ -73,7 +74,8 @@ crates/
 ├── sdk/             # Rust library for agent authors
 └── cli/             # Mac and Linux command line
 wit/                 # The agent-home API
-android/             # Kotlin app and UniFFI bindings
+app/                 # Flutter app for Android and iPhone
+android/             # Android feasibility test
 examples/            # Sample agents
 tests/attacks/       # Attack tests
 docs/                # Design documents

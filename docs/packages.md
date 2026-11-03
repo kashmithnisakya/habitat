@@ -1,6 +1,6 @@
 # Agent packages
 
-A package is one file that holds an agent's code and manifest. The same file is meant to run on Mac and Android, because it holds WebAssembly and nothing built for a specific device.
+A package is one file that holds an agent's code and manifest. The same file is meant to run on Mac, Android and iPhone, because it holds WebAssembly and nothing built for a specific device.
 
 Packages are untrusted. Installing one checks everything in it first, and nothing in the package decides where its files go.
 
