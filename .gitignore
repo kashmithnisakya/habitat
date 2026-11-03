@@ -15,3 +15,8 @@ android/local.properties
 
 # Local secrets
 .env
+
+# Fuzzing
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/

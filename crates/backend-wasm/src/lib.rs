@@ -3,6 +3,8 @@
 //! Agents are untrusted, and they can only reach what's linked here, which is the agent API. Each
 //! run is limited in how much time and memory it can use, and so is compiling a package beforehand.
 
+#![forbid(unsafe_code)]
+
 pub mod code_shape;
 pub mod compile_limits;
 mod host;

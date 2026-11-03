@@ -1,0 +1,36 @@
+name: Fuzz
+
+on:
+  pull_request:
+  schedule:
+    # Every Monday, for longer.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [manifest, package, home_path, url, policy, code_shape, saved_files]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Run it
+        env:
+          SECONDS_TO_RUN: ${{ github.event_name == 'pull_request' && '30' || '1800' }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=$SECONDS_TO_RUN
+      - name: Keep what crashed it
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/

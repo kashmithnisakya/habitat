@@ -1,5 +1,7 @@
 //! Command line for Habitat.
 
+#![forbid(unsafe_code)]
+
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Read, Write};

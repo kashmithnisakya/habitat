@@ -1,0 +1,68 @@
+[package]
+name = "habitat-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+habitat-backend-wasm = { path = "../crates/backend-wasm" }
+habitat-broker = { path = "../crates/broker" }
+habitat-core = { path = "../crates/core" }
+libfuzzer-sys = "0.4"
+tempfile = "3.27.0"
+
+# Not part of the workspace, because it needs a nightly compiler.
+[workspace]
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "package"
+path = "fuzz_targets/package.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "home_path"
+path = "fuzz_targets/home_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url"
+path = "fuzz_targets/url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy"
+path = "fuzz_targets/policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "code_shape"
+path = "fuzz_targets/code_shape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "saved_files"
+path = "fuzz_targets/saved_files.rs"
+test = false
+doc = false
+bench = false

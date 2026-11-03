@@ -1273,6 +1273,7 @@ mod tests {
         target_os = "android",
         ignore = "Android's security policy stops this test from creating a named pipe"
     )]
+    #[allow(unsafe_code, reason = "making a named pipe, for this test")]
     fn a_named_pipe_in_the_package_folder_is_denied_without_hanging() {
         let fixture = Fixture::installed();
         let path = fixture.storage.package_path().join("agent.wasm");
