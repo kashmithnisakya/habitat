@@ -256,7 +256,10 @@ fn an_agent_cant_leave_its_home() {
     let fixture = Fixture::file_agent();
     let outside = fixture.home_path().with_file_name("grants.db");
     fs::write(&outside, "secret").unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, fixture.home_path().join("link")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&outside, fixture.home_path().join("link")).unwrap();
 
     fixture.ok("expect-error ../grants.db invalid-request");
     fixture.ok("expect-error ../../../../../etc/passwd invalid-request");

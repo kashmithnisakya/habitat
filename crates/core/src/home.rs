@@ -4,16 +4,16 @@
 //! down from an open directory, one name at a time, without following symlinks. Swapping a
 //! directory for a symlink during an operation therefore can't lead outside the home.
 
-use std::fs::{self, DirBuilder};
+use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, File, Metadata, OpenOptions, OpenOptionsExt};
+use cap_std::fs::{Dir, File, Metadata, OpenOptions};
 
 use crate::manifest::is_agent_name;
+use crate::platform;
 
 const AGENTS_DIR: &str = "agents";
 const PACKAGE_DIR: &str = "package";
@@ -23,7 +23,8 @@ const TEMP_DIR: &str = "tmp";
 const GRANTS_FILE: &str = "grants.db";
 const AUDIT_FILE: &str = "audit.db";
 const RUNS_DIR: &str = "runs";
-const RUN_LOCK_FILE: &str = "run.lock";
+/// Outside each agent's folder, because Windows can't move a folder with an open file in it.
+const LOCKS_DIR: &str = "locks";
 /// Where an agent's folder goes while it's being deleted.
 const REMOVED_DIR: &str = "removed";
 const PACKAGE_HASH_FILE: &str = "package.sha256";
@@ -81,7 +82,7 @@ impl From<io::Error> for HomeError {
         match (error.kind(), error.raw_os_error()) {
             (io::ErrorKind::NotFound, _) => Self::NotFound,
             (io::ErrorKind::PermissionDenied, _) => Self::Denied,
-            (_, Some(libc::ELOOP)) => Self::Denied,
+            _ if platform::is_link_refused(&error) => Self::Denied,
             (io::ErrorKind::NotADirectory | io::ErrorKind::IsADirectory, _) => Self::NotAFile,
             (kind, _) => Self::Io(kind),
         }
@@ -103,10 +104,10 @@ impl AgentStorage {
             return Err(HomeError::InvalidPath("not a valid agent name"));
         }
         let path = root.join(AGENTS_DIR).join(agent_name);
-        let mut builder = DirBuilder::new();
-        builder.recursive(true).mode(0o700);
+        platform::create_private_dirs(&path)?;
+        platform::create_private_dirs(&root.join(LOCKS_DIR))?;
         for dir in [PACKAGE_DIR, HOME_DIR, TEMP_DIR, RUNS_DIR] {
-            builder.create(path.join(dir))?;
+            platform::create_private_dirs(&path.join(dir))?;
         }
         Ok(Self {
             name: agent_name.to_string(),
@@ -155,10 +156,7 @@ impl AgentStorage {
         let agents = self.path.parent().ok_or(io::ErrorKind::InvalidInput)?;
         let root = agents.parent().ok_or(io::ErrorKind::InvalidInput)?;
         let removed = root.join(REMOVED_DIR);
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&removed)?;
+        platform::create_private_dirs(&removed)?;
         // Each is deleted by whatever moved it there, so this only matters after a crash. Another
         // process could be deleting one at the same time, so errors here don't matter either.
         for entry in fs::read_dir(&removed)?.flatten() {
@@ -170,8 +168,8 @@ impl AgentStorage {
         let id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         let target = removed.join(format!("{}-{id}", self.name));
         fs::rename(&self.path, &target)?;
-        fs::File::open(agents)?.sync_all()?;
-        fs::File::open(&removed)?.sync_all()?;
+        platform::sync_dir_path(agents)?;
+        platform::sync_dir_path(&removed)?;
         fs::remove_dir_all(target)
     }
 
@@ -202,9 +200,12 @@ impl AgentStorage {
         Dir::open_ambient_dir(self.path.join(RUNS_DIR), ambient_authority())
     }
 
-    /// The file that's locked for as long as the agent is running.
+    /// The file that's locked for as long as the agent is running. It stays when the agent is
+    /// removed, so that the lock means the same thing for a later agent with the same name.
     pub(crate) fn run_lock_path(&self) -> PathBuf {
-        self.path.join(RUN_LOCK_FILE)
+        let agents = self.path.parent().unwrap_or(&self.path);
+        let root = agents.parent().unwrap_or(agents);
+        root.join(LOCKS_DIR).join(format!("{}.lock", self.name))
     }
 
     /// The agent's permissions, which only the core can write to.
@@ -308,11 +309,19 @@ impl Home {
 
         // Non-blocking, so that opening a named pipe can't hang the host.
         let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .follow(FollowSymlinks::No)
-            .custom_flags(libc::O_NONBLOCK);
-        let file = dir.open_with(name, &options)?;
+        options.read(true).follow(FollowSymlinks::No);
+        platform::dont_block(&mut options);
+        let file = dir.open_with(name, &options).map_err(|error| {
+            // Windows says access is denied when asked to open a directory as a file.
+            let is_dir = dir
+                .symlink_metadata(name)
+                .is_ok_and(|metadata| metadata.is_dir());
+            if is_dir {
+                HomeError::NotAFile
+            } else {
+                HomeError::from(error)
+            }
+        })?;
         let metadata = file.metadata()?;
         if metadata.is_dir() {
             return Err(HomeError::NotAFile);
@@ -454,12 +463,15 @@ impl Home {
         sync_dir(&dir)?;
         self.used = self.used.saturating_sub(cost);
 
-        for (parent_dir, parent_name) in dirs.iter().zip(&parents).rev() {
+        // Each directory is closed before its parent removes it, because Windows can't remove a
+        // directory that's still open.
+        drop(dir);
+        while let Some(parent_dir) = dirs.pop() {
             // Stops at the first directory that still has something in it.
-            if parent_dir.remove_dir(parent_name).is_err() {
+            if parent_dir.remove_dir(parents[dirs.len()]).is_err() {
                 break;
             }
-            sync_dir(parent_dir)?;
+            sync_dir(&parent_dir)?;
             self.used = self.used.saturating_sub(ENTRY_COST);
         }
         Ok(())
@@ -499,10 +511,9 @@ fn file_cost(metadata: &Metadata) -> Result<u64, HomeError> {
     Ok(metadata.len().saturating_add(ENTRY_COST))
 }
 
-/// Saves a directory's entries to disk. On Linux and Android, `Dir` holds a handle that can't be
-/// synced, so this opens the directory again for reading.
-pub(crate) fn sync_dir(dir: &Dir) -> Result<(), HomeError> {
-    dir.open(".")?.sync_all()?;
+/// Saves a directory's entries to disk, as far as the system allows.
+fn sync_dir(dir: &Dir) -> Result<(), HomeError> {
+    platform::sync_dir(dir)?;
     Ok(())
 }
 
@@ -544,6 +555,38 @@ fn parse_path(path: &str) -> Result<(Vec<&str>, &str), HomeError> {
     Ok((parts, name))
 }
 
+/// Whether Windows would treat a name as a device instead of a file, with or without an extension.
+/// This applies on every system, so that an agent's files mean the same thing everywhere.
+fn is_device_name(part: &str) -> bool {
+    let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    match upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    {
+        // Windows also counts these superscript digits.
+        Some(rest) => matches!(
+            rest,
+            "0" | "1"
+                | "2"
+                | "3"
+                | "4"
+                | "5"
+                | "6"
+                | "7"
+                | "8"
+                | "9"
+                | "\u{b9}"
+                | "\u{b2}"
+                | "\u{b3}"
+        ),
+        None => false,
+    }
+}
+
 /// Allows letters and digits from any language, and a few common symbols. This rules out control
 /// characters, invisible characters, right-to-left overrides, and lookalikes of `/` and `.`,
 /// some of which file systems have ignored or changed in the past.
@@ -561,6 +604,11 @@ fn check_path_part(part: &str) -> Result<(), HomeError> {
             "a name can't end with '.', which also rules out '.' and '..', or start or end with a space",
         ));
     }
+    if is_device_name(part) {
+        return Err(HomeError::InvalidPath(
+            "a name can't be one that Windows keeps for a device, such as NUL",
+        ));
+    }
     let allowed =
         |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ' | '+' | '=' | '@' | ',');
     if !part.chars().all(allowed) {
@@ -573,12 +621,16 @@ fn check_path_part(part: &str) -> Result<(), HomeError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::ffi::CString;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(unix)]
     use std::sync::mpsc;
     use std::time::Duration;
     use std::{env, fs, thread};
@@ -586,6 +638,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::platform::test_support::symlink;
 
     const LIMIT: u64 = 1024 * 1024;
     const CRASH_DIR_VAR: &str = "HABITAT_TEST_CRASH_DIR";
@@ -823,6 +876,129 @@ mod tests {
     }
 
     #[test]
+    fn names_that_mean_something_else_on_windows_are_rejected_everywhere() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        for path in [
+            "NUL",
+            "nul",
+            "Nul.txt",
+            "nul.tar.gz",
+            "NUL .txt",
+            "CON",
+            "con.log",
+            "PRN",
+            "AUX",
+            "COM0",
+            "COM1",
+            "com9.txt",
+            "LPT1",
+            "lpt9.dat",
+            "COM\u{b9}",
+            "lpt\u{b2}.txt",
+            "COM\u{b3}",
+            "folder/NUL",
+            "NUL/file",
+            "a/con/b",
+            // Alternate data streams, which hide data inside a file.
+            "file.txt:hidden",
+            "file.txt::$DATA",
+            // Short names, trailing dots and spaces, and other ways to name the same file.
+            "PROGRA~1",
+            "name.",
+            "name ",
+            "name...",
+            "folder./file",
+            // A drive, a device path and a backslash.
+            "C:",
+            "C:/Windows",
+            "//./NUL",
+            "a\\b",
+            "..\\outside",
+        ] {
+            assert!(
+                matches!(home.write(path, b"x"), Err(HomeError::InvalidPath(_))),
+                "{path:?}"
+            );
+            assert!(
+                matches!(home.read(path), Err(HomeError::InvalidPath(_))),
+                "{path:?}"
+            );
+            assert!(
+                matches!(home.remove(path), Err(HomeError::InvalidPath(_))),
+                "{path:?}"
+            );
+        }
+        assert_eq!(home.list("").unwrap(), []);
+    }
+
+    #[test]
+    fn names_that_only_look_like_devices_are_fine() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        for path in [
+            "console",
+            "nullable.txt",
+            "COM",
+            "COM10",
+            "LPT",
+            "auxiliary",
+            "my.con",
+        ] {
+            home.write(path, b"x").unwrap();
+            assert_eq!(home.read(path).unwrap(), b"x", "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    /// Junctions are a Windows kind of link that any user can make, without special rights.
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_denied() {
+        let fixture = Fixture::new();
+        fs::write(fixture.outside.join("secret"), "secret").unwrap();
+        make_junction(&fixture.home_path().join("link"), &fixture.outside);
+
+        let mut home = fixture.home();
+        assert!(home.read("link/secret").is_err());
+        assert!(home.read_at("link/secret", 0, 16).is_err());
+        assert!(home.write("link/new", b"x").is_err());
+        assert!(home.remove("link/secret").is_err());
+        assert!(home.list("link").is_err());
+        assert!(
+            home.list("")
+                .unwrap()
+                .iter()
+                .all(|entry| entry.name != "link")
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.outside.join("secret")).unwrap(),
+            "secret"
+        );
+        assert!(!fixture.outside.join("new").exists());
+    }
+
+    /// Only the link goes, and whatever it led to stays.
+    #[cfg(windows)]
+    #[test]
+    fn counting_space_doesnt_follow_junctions() {
+        let fixture = Fixture::new();
+        fs::write(fixture.outside.join("big"), vec![0; 1024 * 1024]).unwrap();
+        make_junction(&fixture.home_path().join("link"), &fixture.outside);
+        assert!(fixture.home().used_bytes() < 1024 * 1024);
+    }
+
+    #[test]
     fn tricky_unicode_is_rejected() {
         let fixture = Fixture::new();
         let mut home = fixture.home();
@@ -977,6 +1153,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     #[cfg_attr(
         target_os = "android",
@@ -1094,6 +1271,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_the_current_user_can_open_storage() {
         let fixture = Fixture::new();

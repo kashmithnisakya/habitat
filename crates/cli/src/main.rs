@@ -6,7 +6,6 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -16,8 +15,6 @@ use habitat_core::manifest::MAX_MANIFEST_BYTES;
 use habitat_core::package::{MAX_COMPONENT_BYTES, Package};
 use habitat_core::run_log::{RunEnding, RunRecord};
 use habitat_core::supervisor::{Supervisor, SupervisorError};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 const FAILURE: u8 = 1;
 const AGENT_FAILED: u8 = 3;
@@ -158,14 +155,17 @@ fn run_command(cli: Cli) -> Result<(), Failure> {
 
 /// Where agents are kept unless told otherwise, following each platform's convention.
 fn default_root() -> Result<PathBuf, String> {
-    let home = env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .ok_or("HOME isn't set, so use --root to say where agents are kept")?;
+    const NOT_SET: &str = "the home folder isn't known, so use --root to say where agents are kept";
+    let set = |name| env::var_os(name).filter(|value: &std::ffi::OsString| !value.is_empty());
+    if cfg!(windows) {
+        let data = set("LOCALAPPDATA").map(PathBuf::from).ok_or(NOT_SET)?;
+        return Ok(data.join("habitat"));
+    }
+    let home = set("HOME").map(PathBuf::from).ok_or(NOT_SET)?;
     if cfg!(target_os = "macos") {
         return Ok(home.join("Library/Application Support/habitat"));
     }
-    let data = env::var_os("XDG_DATA_HOME")
+    let data = set("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|data| data.is_absolute())
         .unwrap_or_else(|| home.join(".local/share"));
@@ -269,24 +269,17 @@ fn run(supervisor: Supervisor, agent: &str, message: String) -> Result<(), Failu
     }
 }
 
-/// Stops the agent on Ctrl-C or a request to stop. Exiting without waiting is safe, because the
-/// agent's files are always saved whole, and its run will show as interrupted.
+/// Stops the agent on Ctrl-C or a request to stop, which on Windows includes closing the console.
+/// Exiting without waiting is safe, because the agent's files are always saved whole, and its run
+/// will show as interrupted.
 fn stop_on_signals(supervisor: Arc<Supervisor>) -> Result<(), Failure> {
-    let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|error| {
-        Failure::general(format!("couldn't prepare to be stopped: {}", error.kind()))
-    })?;
-    thread::Builder::new()
-        .name("habitat-signals".to_string())
-        .spawn(move || {
-            if signals.forever().next().is_some() && !supervisor.shut_down(STOP_WAIT) {
-                eprintln!("error: stopped while the agent's code was still compiling");
-                process::exit(i32::from(STOPPED));
-            }
-        })
-        .map_err(|error| {
-            Failure::general(format!("couldn't prepare to be stopped: {}", error.kind()))
-        })?;
-    Ok(())
+    ctrlc::set_handler(move || {
+        if !supervisor.shut_down(STOP_WAIT) {
+            eprintln!("error: stopped while the agent's code was still compiling");
+            process::exit(i32::from(STOPPED));
+        }
+    })
+    .map_err(|error| Failure::general(format!("couldn't prepare to be stopped: {error}")))
 }
 
 fn code_for(record: &RunRecord, supervisor: &Supervisor) -> u8 {

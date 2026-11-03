@@ -44,6 +44,10 @@ The trusted parts are the Rust core, the shell and the operating system.
 ## Known weak spots
 
 - Wasmtime's Android and iOS targets are [Tier 3](https://docs.wasmtime.dev/stability-tiers.html), which it describes as not production ready.
-- Everything here has only been tested on Unix. Windows ([#56](https://github.com/kashmithnisakya/habitat/issues/56)) has different links, paths, permissions and locks, so none of the file system defences can be assumed there yet.
+- On Windows:
+  - An agent's folder has an access list that only lets its owner in. Administrators can override that, and if Habitat runs elevated, Windows makes the Administrators group the owner of what it creates. Don't run Habitat elevated.
+  - A power cut can lose the latest save, because a folder can't be synced there. It can't leave a mix of the old and new file, and being killed loses nothing.
+  - Only Windows on x86-64 is tested. Windows on Arm is Tier 3 in Wasmtime.
+  - Ctrl-C and closing the console aren't tested, because CI has no console to send them from.
 - Approval prompts depend on people reading them.
 - The audit log can't detect full replacement by someone who controls the device.

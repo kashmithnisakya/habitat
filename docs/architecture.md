@@ -88,7 +88,7 @@ The [supervisor](../crates/core/src/supervisor.rs) does this as follows:
 These have some limits:
 
 - **Saving isn't all or nothing.** "Saved state" means every write that finished. An agent that's stopped between writing two related files keeps the first, so the agent has to write in an order it can recover from. There's no way yet to save several files at once.
-- **Nothing retries.** A run that fails or is refused stays that way, and it's up to the shell to ask again. That includes a run refused because something else was using the agent's folder at that moment, such as `habitat list` reading its records.
+- **Nothing retries a run.** A run that fails or is refused stays that way, and it's up to the shell to ask again. A run does wait up to half a second for the agent's lock first, so something that only holds it for a moment, such as `habitat list` reading its records, doesn't get in the way.
 - **The shell has to call `shut_down`.** The CLI does this on Ctrl-C and `SIGTERM`, and gives a compile 5 seconds before exiting without it. Nothing handles Android's lifecycle events yet. Without that, stopping the host counts as being killed, which is safe but gives the agent no chance to stop first.
 - **Records aren't the audit log.** They say that a run happened and how it ended. They aren't protected against tampering by someone with access to the device, and old ones get removed. The audit log can use the run ID to link its entries to a run.
 - **The lock needs a local file system.** File locks may not work on a network drive, and Habitat doesn't check for that.
@@ -110,12 +110,13 @@ agents/<agent-id>/
 ├── home/           # Agent's files
 ├── tmp/            # Files being written, which are moved into home/ when complete
 ├── runs/           # A record of each recent run, only the core can write to this
-├── run.lock        # Locked for as long as the agent is running
 ├── grants.db       # Permissions, only the core can write to this
 └── audit.db        # Tamper-evident log, only the core can write to this
 ```
 
 Only `home/` is visible to the agent. See [Agent packages](packages.md) for the package format.
+
+Next to `agents/`, `locks/<agent-id>.lock` is locked for as long as an agent is running. It's outside the agent's folder because Windows can't move a folder with an open file in it, and it stays after an agent is removed, so that the lock always means the same thing.
 
 Removing an agent deletes this whole folder, and is refused while the agent is running. The folder is first moved to a `removed/` folder next to `agents/`, so the agent is gone in one step. If the host dies part way through, a later install under the same name can't inherit what's left of the old agent's home.
 
@@ -146,7 +147,7 @@ These limits have gaps:
 | Platform | Approach | Limitation |
 |---|---|---|
 | macOS and Linux | Wasmtime | First targets for development. Apple silicon and Arm Linux are Tier 2 in Wasmtime |
-| Windows (next) | Wasmtime | The code only builds on Unix today, and needs its safety measures replacing, not just porting ([#56](https://github.com/kashmithnisakya/habitat/issues/56)). Windows on Arm is Tier 3 |
+| Windows | Wasmtime | Tested on x86-64, which is Tier 1 in Wasmtime. Windows on Arm is Tier 3. Its safety measures are in [`platform.rs`](../crates/core/src/platform.rs), and what's weaker is in the [threat model](threat-model.md#known-weak-spots) |
 | Android | Wasmtime | [Tier 3](https://docs.wasmtime.dev/stability-tiers.html) in Wasmtime, which it describes as not production ready |
 | iPhone and iPad (later) | Wasmtime's [Pulley interpreter](https://docs.wasmtime.dev/examples-pulley.html) | Android's Tier 3 caveat also applies, and Pulley is roughly 10x slower than native code |
 | Desktop microVM (later) | Second backend, possibly [libkrun](https://github.com/libkrun/libkrun) | The broker API has to work outside WebAssembly too |
