@@ -7,6 +7,7 @@ These tests act like a hostile agent and confirm that each attack fails. Most ar
 | Attack | Expected result |
 |---|---|
 | Path traversal and symlink escape from the home | Denied |
+| Windows device names, alternate data streams, short names and junctions | Denied, on every system, and tested in [`home.rs`](../../crates/core/src/home.rs) |
 | Reading a secret | No API exists to do it, and no secret appears in agent-visible data |
 | Unapproved network access | Denied and logged |
 | Memory, CPU and disk exhaustion | Run stopped, and the host stays healthy |

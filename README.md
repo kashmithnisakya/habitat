@@ -5,7 +5,7 @@
 Habitat gives an agent its own persistent space to live in. The agent keeps its files, memory and tools there, but it can't touch your settings, personal data or other apps unless you allow it.
 
 > [!WARNING]
-> **Early development: this is not secure yet.** You can install and run an agent on a Mac or Linux computer, but agents can't do much more than use their own files. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) are finished and an outside security review has taken place.
+> **Early development: this is not secure yet.** You can install and run an agent on a Mac, Linux or Windows computer, but agents can't do much more than use their own files. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) are finished and an outside security review has taken place.
 
 ## Why
 
@@ -48,7 +48,7 @@ Planned guarantees:
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
 | Mac core, broker and secrets | In progress: you can install and run an agent from the command line, and it can use files in its home, within time and memory limits. There's no broker yet, so it can't reach anything else |
 | Attack tests | Not started |
-| Windows | Not started: the code only builds on macOS and Linux today ([#56](https://github.com/kashmithnisakya/habitat/issues/56)) |
+| Windows | Runs, and every test runs on it in CI |
 | Android app | Not started |
 | iPhone and iPad | Not started: [we need to check that it's possible](https://github.com/kashmithnisakya/habitat/issues/40) |
 
@@ -74,7 +74,7 @@ crates/
 ├── broker/          # Policy, vault, gateway and audit log
 ├── backend-wasm/    # Wasmtime backend
 ├── sdk/             # Rust library for agent authors
-└── cli/             # Mac and Linux command line
+└── cli/             # Command line for Mac, Linux and Windows
 wit/                 # The agent-home API
 android/             # Kotlin app and UniFFI bindings
 examples/            # Sample agents
@@ -154,7 +154,9 @@ Delete the agent and all its files. This asks you to confirm first:
 target/release/habitat remove hello
 ```
 
-Agents are kept in `~/Library/Application Support/habitat` on a Mac, and `~/.local/share/habitat` on Linux. To use another folder, pass `--root` or set `HABITAT_HOME`.
+Agents are kept in `~/Library/Application Support/habitat` on a Mac, `~/.local/share/habitat` on Linux and `%LOCALAPPDATA%\\habitat` on Windows. To use another folder, pass `--root` or set `HABITAT_HOME`.
+
+On Windows, the program is `target\\release\\habitat.exe`, and the same steps apply otherwise.
 
 `habitat --help` lists every command, and these exit codes:
 
