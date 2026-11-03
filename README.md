@@ -5,13 +5,13 @@
 Habitat gives an agent its own persistent space to live in. The agent keeps its files, memory and tools there, but it can't touch your settings, personal data or other apps unless you allow it.
 
 > [!WARNING]
-> **Early development: this is not secure yet.** You can install and run an agent on a Mac, Linux or Windows computer, but agents can't do much more than use their own files. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) are finished and an outside security review has taken place.
+> **Early development: don't rely on this to protect anything yet.** You can install and run an agent on a Mac, Linux or Windows computer, with approvals, an audit log and API keys kept out of its reach, and [attack tests](tests/attacks/README.md) run on every change. But no outside security review has taken place, and passing our own tests isn't the same as being secure. See [what's known to be weak](docs/security-review.md#known-weaknesses).
 
 ## Why
 
 Agent sandboxes are well served on servers and desktops, but they don't focus on phones. Agents that run on phones today often rely on broad device permissions rather than an isolated space. Habitat aims to provide one security model and one agent package across both.
 
-## How it will work
+## How it works
 
 The agent runs inside WebAssembly and starts with no outside access. Every request to reach the network, your files, an AI model or a secret goes through one trusted component: the **broker**.
 
@@ -32,7 +32,7 @@ The agent runs inside WebAssembly and starts with no outside access. Every reque
 └──────────────────────────────────────────────┘
 ```
 
-Planned guarantees:
+What it aims to guarantee, which [hasn't been reviewed from outside yet](docs/security-review.md):
 
 - **Nothing shared by default:** access outside the agent's home is denied unless granted.
 - **Approvals the agent can't fake:** the trusted core draws every permission prompt.
@@ -46,8 +46,8 @@ Planned guarantees:
 |---|---|
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
-| Mac core, broker and secrets | In progress: you can install and run an agent from the command line, and it can use files in its home, within time and memory limits. There's no broker yet, so it can't reach anything else |
-| Attack tests | Not started |
+| Core, broker and secrets on macOS, Linux and Windows | Working, from the command line. Using a real AI model needs your own API key, and hasn't been tried against the live service |
+| Attack tests and fuzzing | Running on every change. An outside review hasn't happened |
 | Windows | Runs, and every test runs on it in CI |
 | Android app | Not started |
 | iPhone and iPad | Not started: [we need to check that it's possible](https://github.com/kashmithnisakya/habitat/issues/40) |
@@ -64,6 +64,7 @@ Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/ha
 - [Design decisions](docs/decisions/README.md)
 - [Android feasibility report (draft)](docs/feasibility-android.md)
 - [Agent API](docs/agent-api.md)
+- [Security review package](docs/security-review.md)
 - [Writing an agent](docs/writing-an-agent.md)
 - [The research helper, with approvals and the log](docs/research-helper.md)
 

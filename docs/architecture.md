@@ -1,6 +1,6 @@
 # Architecture
 
-This is a design document. None of it is implemented yet, and it will change as the [Android feasibility test](roadmap.md) and first implementation teach us more.
+This says how Habitat is built. The core, broker and command line exist and are tested on macOS, Linux and Windows. The phone apps don't exist yet, so what's here about them is still a plan, and it could change with what the [real phone test](roadmap.md) shows.
 
 ## Goals
 
