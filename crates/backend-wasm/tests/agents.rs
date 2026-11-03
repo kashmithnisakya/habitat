@@ -13,7 +13,8 @@ use habitat_backend_wasm::WasmBackend;
 use habitat_backend_wasm::code_shape::CodeShape;
 use habitat_backend_wasm::compile_limits::CompileLimits;
 use habitat_core::backend::{
-    Backend, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome, StopSignal,
+    Backend, DenyEverything, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome,
+    StopSignal,
 };
 use habitat_core::home::{AgentStorage, Home};
 use habitat_core::package::Package;
@@ -145,6 +146,7 @@ impl Fixture {
             self.home(),
             limits,
             &StopSignal::default(),
+            Box::new(DenyEverything),
         )
     }
 
@@ -236,6 +238,7 @@ fn the_agent_is_told_what_kind_of_event_it_is() {
             fixture.home(),
             &roomy_limits(),
             &StopSignal::default(),
+            Box::new(DenyEverything),
         )
     };
     let scheduled = |name: &str| Event::Scheduled(name.to_string());
@@ -284,6 +287,7 @@ fn the_disk_limit_applies_to_agents() {
         small_home,
         &roomy_limits(),
         &StopSignal::default(),
+        Box::new(DenyEverything),
     );
     let RunOutcome::Failed(message) = outcome else {
         panic!("the write wasn't refused: {outcome:?}");
@@ -819,6 +823,7 @@ fn a_manifest_cant_raise_its_limits_above_the_hosts() {
             small_home,
             &limits,
             &StopSignal::default(),
+            Box::new(DenyEverything),
         );
         let RunOutcome::Failed(message) = outcome else {
             panic!("the disk limit wasn't applied: {outcome:?}");

@@ -3,7 +3,7 @@
 
 use habitat_sdk::bindings::Guest;
 use habitat_sdk::bindings::habitat::host::agent_home as api;
-use habitat_sdk::bindings::habitat::host::types::{EntryKind, Event, HomeError};
+use habitat_sdk::bindings::habitat::host::types::{AccessTarget, EntryKind, Event, HomeError};
 
 struct Agent;
 
@@ -61,6 +61,12 @@ impl Guest for Agent {
                 loop {
                     std::hint::black_box(api::now_ms());
                 }
+            }
+            "ask-network" => {
+                let target = AccessTarget::NetworkHost(first.to_string());
+                api::request_access(&target, rest)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             }
             "fail" => Err(rest.to_string()),
             "panic" => panic!("told to"),

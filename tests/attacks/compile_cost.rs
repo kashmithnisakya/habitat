@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use habitat_backend_wasm::WasmBackend;
 use habitat_backend_wasm::compile_limits::CompileLimits;
-use habitat_core::backend::{Backend, Event, LoadError, RunLimits, RunOutcome, StopSignal};
+use habitat_core::backend::{
+    Backend, DenyEverything, Event, LoadError, RunLimits, RunOutcome, StopSignal,
+};
 use habitat_core::home::AgentStorage;
 use habitat_core::package::Package;
 use hostile_code::*;
@@ -86,6 +88,7 @@ fn assert_runs(backend: &WasmBackend) {
         home,
         &limits,
         &StopSignal::default(),
+        Box::new(DenyEverything),
     );
     assert_eq!(outcome, RunOutcome::Completed);
 }
