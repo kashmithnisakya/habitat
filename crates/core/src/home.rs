@@ -507,12 +507,15 @@ impl Home {
         sync_dir(&dir)?;
         self.used = self.used.saturating_sub(cost);
 
-        for (parent_dir, parent_name) in dirs.iter().zip(&parents).rev() {
+        // Each directory is closed before its parent removes it, because Windows can't remove a
+        // directory that's still open.
+        drop(dir);
+        while let Some(parent_dir) = dirs.pop() {
             // Stops at the first directory that still has something in it.
-            if parent_dir.remove_dir(parent_name).is_err() {
+            if parent_dir.remove_dir(parents[dirs.len()]).is_err() {
                 break;
             }
-            sync_dir(parent_dir)?;
+            sync_dir(&parent_dir)?;
             self.used = self.used.saturating_sub(ENTRY_COST);
         }
         Ok(())
