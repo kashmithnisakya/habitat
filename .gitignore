@@ -3,12 +3,6 @@ target/
 *.cwasm
 *.habitat
 
-# Android
-android/.gradle/
-android/build/
-android/feasibility/build/
-android/local.properties
-
 # Editors and OS
 .idea/
 .vscode/

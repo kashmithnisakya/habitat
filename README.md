@@ -76,7 +76,6 @@ crates/
 └── mobile/          # What the phone app calls in the core
 wit/                 # The agent-home API
 app/                 # Flutter app for Android and iPhone
-android/             # Android feasibility test
 examples/            # Sample agents
 tests/attacks/       # Attack tests
 docs/                # Design documents
