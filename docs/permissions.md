@@ -87,3 +87,11 @@ The [policy engine](../crates/broker/src/policy.rs) makes these decisions, and i
 | Once | Covers a single request |
 | This run | Ends when the current run exits |
 | Until revoked | Lasts until the user removes it |
+
+The [grant store](../crates/broker/src/grants.rs) keeps these as follows:
+
+- **Once and this run are only ever in memory,** so no crash can make one outlive its run. A "once" grant is used up as soon as the request it covers is allowed.
+- **Until revoked is saved in `grants.db`,** which is outside the agent's home, and read again for every request. So revoking one takes effect on the next request, even from another process. If the file can't be read, nothing in it counts.
+- **A grant is for one exact name.** A grant for `api.github.com` doesn't cover `github.com` or `uploads.github.com`.
+- **`habitat grants <agent>` lists what's saved, and `habitat revoke <agent> --network <host>` or `--model <name>` removes it.** Once and this-run grants belong to a run in another process, so these commands can't see or revoke them. They end with the run anyway.
+- **Anyone who can write to the agent's folder can add a grant.** This keeps agents out, not other programs running as the same user.

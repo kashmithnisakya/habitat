@@ -499,6 +499,75 @@ fn a_package_is_the_same_each_time_and_the_hash_says_so() {
 }
 
 #[test]
+fn saved_grants_can_be_listed_and_revoked() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let grants = fixture.root().join("agents").join(AGENT).join("grants.db");
+
+    let none = fixture.run(&["grants", AGENT]);
+    succeeds(&none);
+    assert!(stdout(&none).contains("nothing allowed"));
+
+    fs::write(
+        &grants,
+        "format = 1\nnetwork = [\"api.github.com\", \"example.com\"]\nmodels = [\"default\"]\n",
+    )
+    .unwrap();
+    let listed = stdout(&fixture.run(&["grants", AGENT]));
+    assert!(listed.contains("network  api.github.com"), "{listed}");
+    assert!(listed.contains("network  example.com"), "{listed}");
+    assert!(listed.contains("model    default"), "{listed}");
+
+    succeeds(&fixture.run(&["revoke", AGENT, "--network", "api.github.com"]));
+    succeeds(&fixture.run(&["revoke", AGENT, "--model", "default"]));
+    let listed = stdout(&fixture.run(&["grants", AGENT]));
+    assert!(!listed.contains("api.github.com"), "{listed}");
+    assert!(!listed.contains("default"), "{listed}");
+    assert!(listed.contains("network  example.com"), "{listed}");
+
+    // A host and a model are different things, and nothing was removed by asking for the wrong one.
+    fails_with(
+        &fixture.run(&["revoke", AGENT, "--model", "example.com"]),
+        1,
+        "nothing to remove",
+    );
+    assert!(stdout(&fixture.run(&["grants", AGENT])).contains("example.com"));
+}
+
+#[test]
+fn grant_commands_refuse_what_they_cant_act_on() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fails_with(&fixture.run(&["grants", "nobody"]), 1, "isn't installed");
+    fails_with(
+        &fixture.run(&["revoke", "nobody", "--model", "x"]),
+        1,
+        "isn't installed",
+    );
+    fails_with(&fixture.run(&["grants", "../.."]), 1, "isn't a valid");
+    assert!(!fixture.root().join("agents/nobody").exists());
+    // It has to say exactly what to remove.
+    assert_eq!(fixture.run(&["revoke", AGENT]).status.code(), Some(2));
+    assert_eq!(
+        fixture
+            .run(&["revoke", AGENT, "--network", "a.com", "--model", "b"])
+            .status
+            .code(),
+        Some(2)
+    );
+
+    let grants = fixture.root().join("agents").join(AGENT).join("grants.db");
+    fs::write(&grants, "not valid").unwrap();
+    fails_with(&fixture.run(&["grants", AGENT]), 1, "aren't valid");
+    fails_with(
+        &fixture.run(&["revoke", AGENT, "--model", "x"]),
+        1,
+        "aren't valid",
+    );
+    assert_eq!(fs::read_to_string(&grants).unwrap(), "not valid");
+}
+
+#[test]
 fn the_command_line_says_how_to_use_it() {
     let fixture = Fixture::new();
     let help = fixture.run(&["--help"]);
@@ -514,7 +583,9 @@ fn the_command_line_says_how_to_use_it() {
     ] {
         assert!(stdout(&help).contains(word), "{word}");
     }
-    for command in ["pack", "install", "run", "list", "remove"] {
+    for command in [
+        "pack", "install", "run", "list", "grants", "revoke", "remove",
+    ] {
         succeeds(&fixture.run(&[command, "--help"]));
     }
     assert_eq!(fixture.run(&[]).status.code(), Some(2));

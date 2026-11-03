@@ -731,6 +731,9 @@ name = "habitat-broker"
 version = "0.0.0"
 dependencies = [
  "habitat-core",
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -740,6 +743,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "habitat-backend-wasm",
+ "habitat-broker",
  "habitat-core",
  "tempfile",
  "wat",

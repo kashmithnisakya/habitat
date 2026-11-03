@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use habitat_backend_wasm::WasmBackend;
+use habitat_broker::grants::{list_saved, revoke_saved};
+use habitat_broker::policy::Target;
 use habitat_core::backend::{Event, HostLimits, RunOutcome};
+use habitat_core::home::{AgentStorage, HomeError};
 use habitat_core::manifest::MAX_MANIFEST_BYTES;
 use habitat_core::package::{MAX_COMPONENT_BYTES, Package};
 use habitat_core::run_log::{RunEnding, RunRecord};
@@ -76,6 +79,23 @@ enum Command {
     },
     /// Lists the installed agents
     List,
+    /// Lists what an agent has been allowed until revoked
+    Grants {
+        /// The agent's name
+        agent: String,
+    },
+    /// Removes something that an agent has been allowed until revoked
+    #[command(group(clap::ArgGroup::new("target").required(true)))]
+    Revoke {
+        /// The agent's name
+        agent: String,
+        /// The network host to remove
+        #[arg(long, value_name = "HOST", group = "target")]
+        network: Option<String>,
+        /// The AI model to remove
+        #[arg(long, value_name = "NAME", group = "target")]
+        model: Option<String>,
+    },
     /// Deletes an agent and all its files
     Remove {
         /// The agent's name
@@ -149,6 +169,20 @@ fn run_command(cli: Cli) -> Result<(), Failure> {
         Command::Install { package } => install(&supervisor, &package),
         Command::Run { agent, message } => run(supervisor, &agent, message),
         Command::List => list(&supervisor),
+        Command::Grants { agent } => grants(&root, &agent),
+        Command::Revoke {
+            agent,
+            network,
+            model,
+        } => {
+            // The command line makes sure there's exactly one.
+            let target = match (network, model) {
+                (Some(host), _) => Target::NetworkHost(host),
+                (None, Some(model)) => Target::Model(model),
+                (None, None) => unreachable!("the command line requires one of these"),
+            };
+            revoke(&root, &agent, &target)
+        }
         Command::Remove { agent, yes } => remove(&supervisor, &agent, yes),
     }
 }
@@ -353,6 +387,44 @@ fn list(supervisor: &Supervisor) -> Result<(), Failure> {
             version_width = version_width.max(7)
         ));
     }
+    Ok(())
+}
+
+/// Opens an agent's folder, without creating it for a name that's just been mistyped.
+fn existing_agent(root: &Path, agent: &str) -> Result<AgentStorage, Failure> {
+    AgentStorage::open_existing(root, agent).map_err(|error| match error {
+        HomeError::InvalidPath(_) => SupervisorError::InvalidName.into(),
+        HomeError::NotFound => SupervisorError::NotInstalled.into(),
+        other => Failure::general(other.to_string()),
+    })
+}
+
+fn grants(root: &Path, agent: &str) -> Result<(), Failure> {
+    let storage = existing_agent(root, agent)?;
+    let saved = list_saved(&storage).map_err(|error| Failure::general(error.to_string()))?;
+    if saved.is_empty() {
+        say(format_args!("{agent} has nothing allowed until revoked."));
+    }
+    // Everything saved has been checked, so it's safe to print.
+    for target in saved {
+        match target {
+            Target::NetworkHost(host) => say(format_args!("network  {host}")),
+            Target::Model(model) => say(format_args!("model    {model}")),
+        }
+    }
+    Ok(())
+}
+
+fn revoke(root: &Path, agent: &str, target: &Target) -> Result<(), Failure> {
+    let storage = existing_agent(root, agent)?;
+    let removed =
+        revoke_saved(&storage, target).map_err(|error| Failure::general(error.to_string()))?;
+    if !removed {
+        return Err(Failure::general(format!(
+            "{agent} isn't allowed that until revoked, so there's nothing to remove"
+        )));
+    }
+    say("Revoked. This takes effect on the agent's next request.");
     Ok(())
 }
 
