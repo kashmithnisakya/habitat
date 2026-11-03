@@ -6,8 +6,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use habitat_core::home::{EntryKind as HomeEntryKind, Home, HomeError as StoreError};
-use wasmtime::Result;
 use wasmtime::component::Resource;
+use wasmtime::{ResourceLimiter, Result};
 
 use crate::bindings::habitat::host::agent_home;
 use crate::bindings::habitat::host::types::{
@@ -21,14 +21,96 @@ const MAX_READ_BYTES: u32 = 1024 * 1024;
 /// The most random bytes that one call returns.
 const MAX_RANDOM_BYTES: u32 = 1024;
 
+/// How much one element of a table counts for, since tables use the host's memory too.
+const TABLE_ELEMENT_BYTES: u64 = 8;
+// How many of each one run can create. Each uses some of the host's memory beyond what's counted.
+const MAX_INSTANCES: usize = 100;
+const MAX_TABLES: usize = 100;
+const MAX_MEMORIES: usize = 100;
+
+/// Keeps a run within its memory limit.
+///
+/// Wasmtime's own `StoreLimits` limits each memory separately, so an agent could get around it by
+/// creating many memories. This counts all of a run's memories and tables together.
+pub(crate) struct Limiter {
+    limit: u64,
+    used: u64,
+    hit_limit: bool,
+}
+
+impl Limiter {
+    fn grow(&mut self, by: u64) -> bool {
+        match self.used.checked_add(by) {
+            Some(used) if used <= self.limit => {
+                self.used = used;
+                true
+            }
+            _ => {
+                self.hit_limit = true;
+                false
+            }
+        }
+    }
+}
+
+impl ResourceLimiter for Limiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool> {
+        Ok(self.grow(desired.saturating_sub(current) as u64))
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool> {
+        let elements = desired.saturating_sub(current) as u64;
+        Ok(self.grow(elements.saturating_mul(TABLE_ELEMENT_BYTES)))
+    }
+
+    fn instances(&self) -> usize {
+        MAX_INSTANCES
+    }
+
+    fn tables(&self) -> usize {
+        MAX_TABLES
+    }
+
+    fn memories(&self) -> usize {
+        MAX_MEMORIES
+    }
+}
+
 /// What one run of an agent can reach.
 pub(crate) struct HostState {
     home: Home,
+    limiter: Limiter,
 }
 
 impl HostState {
-    pub(crate) fn new(home: Home) -> Self {
-        Self { home }
+    pub(crate) fn new(home: Home, memory_bytes: u64) -> Self {
+        Self {
+            home,
+            limiter: Limiter {
+                limit: memory_bytes,
+                used: 0,
+                hit_limit: false,
+            },
+        }
+    }
+
+    pub(crate) fn limiter(&mut self) -> &mut dyn ResourceLimiter {
+        &mut self.limiter
+    }
+
+    /// Whether the agent asked for more memory than its limit allows at any point in this run.
+    pub(crate) fn hit_memory_limit(&self) -> bool {
+        self.limiter.hit_limit
     }
 }
 

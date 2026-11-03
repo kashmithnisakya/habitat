@@ -83,7 +83,7 @@ The core talks to a backend through two small traits in [`crates/core/src/backen
 
 The Wasmtime backend links only the [agent API](agent-api.md), and refuses to load a component that imports anything else, such as WASI sockets. Each run starts with a new instance, so nothing in memory carries over, even after a crash. A crash is reported as the kind of trap only, because a full error can hold names chosen by the agent.
 
-Today the code is compiled every time it's loaded, and no limits are enforced on CPU or memory. Compiling once and saving the result comes later, as the [feasibility report](feasibility-android.md) recommends.
+Today the code is compiled every time it's loaded. Compiling once and saving the result comes later, as the [feasibility report](feasibility-android.md) recommends.
 
 ## Storage
 
@@ -103,10 +103,18 @@ The audit log includes a hash of the previous entry in each new entry, so edits 
 
 ## Resource limits
 
-- **CPU:** Wasmtime [epoch interruption](https://docs.wasmtime.dev/examples-interrupting-wasm.html) plus a time limit per run. Wasmtime documents around a 10% slowdown.
-- **Memory:** a cap per run. Wasmtime's `ResourceLimiter` is the expected mechanism, to be confirmed during implementation.
+Each limit comes from the agent's manifest, up to a maximum set by the host, so a manifest can't raise its own limits. A run that hits a limit is reported as a separate result, and later runs work as normal.
+
+- **Time:** a limit per run, using Wasmtime's [epoch interruption](https://docs.wasmtime.dev/examples-interrupting-wasm.html). Wasmtime documents around a 10% slowdown. Running agents check the clock every 50 ms, and a timer thread only exists during a run, so an idle phone isn't woken up. This limits elapsed time, not CPU time, so time spent waiting counts too.
+- **Memory:** a limit per run, using Wasmtime's `ResourceLimiter`. All of a run's memories and tables count towards one total, because Wasmtime's built-in limits apply to each memory separately. A run can also create at most 100 instances, 100 memories and 100 tables.
 - **Disk:** a cap on each agent's home, enforced by the home store.
 - **AI models:** a token budget per run, enforced by the gateway.
+
+These limits have gaps:
+
+- **Compiling isn't limited.** Loading a package compiles it before any of these limits apply, so a hostile package could use a lot of the host's CPU and memory at that point. The only protection today is the 128 MB limit on a package's code.
+- **Host calls can't be interrupted.** Epoch interruption only stops WebAssembly code, so a call that blocks inside the host has to enforce its own time limit. Today's calls are short file operations, but the network and model gateways will have to do this.
+- **The host's own overhead isn't counted.** The limit covers the agent's memories and tables, not compiled code, Wasmtime's bookkeeping or the host's temporary copies of data passed through the API.
 
 ## Platform support
 

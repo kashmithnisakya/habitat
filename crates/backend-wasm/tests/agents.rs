@@ -5,40 +5,79 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use habitat_backend_wasm::WasmBackend;
-use habitat_core::backend::{Backend, Event, LoadError, LoadedAgent, RunOutcome};
+use habitat_core::backend::{
+    Backend, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome,
+};
 use habitat_core::home::{AgentStorage, Home};
 use habitat_core::package::Package;
 use tempfile::TempDir;
 
 const MANIFEST: &str = "[agent]\nname = \"file-agent\"\nversion = \"0.1.0\"\n\n[limits]\nmemory_mb = 64\nrun_seconds = 10\ndisk_mb = 1\n";
-const DISK_LIMIT: u64 = 16 * 1024 * 1024;
+const MB: u64 = 1024 * 1024;
+const DISK_LIMIT: u64 = 16 * MB;
+
+/// Plenty of room, for tests that aren't about limits.
+fn roomy_limits() -> RunLimits {
+    RunLimits {
+        memory_bytes: 256 * MB,
+        run_time: Duration::from_secs(60),
+        disk_bytes: DISK_LIMIT,
+    }
+}
+
+// Turns the core module `$main` into an agent, by exporting its handle-event.
+const MAIN_INSTANCE_AND_EXPORT: &str = r#"
+    (core instance $i (instantiate $main))
+    (alias core export $i "memory" (core memory $memory))
+    (type $event (variant (case "user-message" string) (case "scheduled" string)))
+    (export $exported "event" (type $event))
+    (func (export "handle-event") (param "event" $exported) (result (result (error string)))
+        (canon lift (core func $i "handle-event")
+            (memory $memory)
+            (realloc (core func $i "cabi_realloc"))
+            string-encoding=utf8))
+"#;
+
+const REALLOC: &str =
+    r#"(func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 1024)"#;
+
+fn component_from_main(main: &str) -> Vec<u8> {
+    wat::parse_str(format!(
+        "(component (core module $main {main}) {MAIN_INSTANCE_AND_EXPORT})"
+    ))
+    .unwrap()
+}
 
 // A component with no imports. `body` is what handle-event does, and `extra` is anything else in
 // its core module.
 fn component_exporting(body: &str, extra: &str) -> Vec<u8> {
-    wat::parse_str(format!(
-        r#"(component
-            (core module $m
-                (memory (export "memory") 1)
-                (func (export "handle-event") (param i32 i32 i32) (result i32) {body})
-                (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 1024)
-                {extra}
-            )
-            (core instance $i (instantiate $m))
-            (alias core export $i "memory" (core memory $memory))
-            (type $event (variant (case "user-message" string) (case "scheduled" string)))
-            (export $exported "event" (type $event))
-            (func (export "handle-event") (param "event" $exported) (result (result (error string)))
-                (canon lift (core func $i "handle-event")
-                    (memory $memory)
-                    (realloc (core func $i "cabi_realloc"))
-                    string-encoding=utf8))
-        )"#
+    component_from_main(&format!(
+        r#"(memory (export "memory") 1)
+           (func (export "handle-event") (param i32 i32 i32) (result i32) {body})
+           {REALLOC}
+           {extra}"#
     ))
-    .unwrap()
+}
+
+fn component_with_realloc(realloc_body: &str) -> Vec<u8> {
+    component_from_main(&format!(
+        r#"(memory (export "memory") 1)
+           (func (export "handle-event") (param i32 i32 i32) (result i32) i32.const 0)
+           (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) {realloc_body})"#
+    ))
+}
+
+fn component_with_memory_pages(pages: u32) -> Vec<u8> {
+    component_from_main(&format!(
+        r#"(memory (export "memory") {pages})
+           (func (export "handle-event") (param i32 i32 i32) (result i32) i32.const 0)
+           {REALLOC}"#
+    ))
 }
 
 fn file_agent_code() -> &'static [u8] {
@@ -115,8 +154,15 @@ impl Fixture {
     }
 
     fn run(&self, message: &str) -> RunOutcome {
-        self.agent
-            .run(&Event::UserMessage(message.to_string()), self.home())
+        self.run_limited(message, &roomy_limits())
+    }
+
+    fn run_limited(&self, message: &str, limits: &RunLimits) -> RunOutcome {
+        self.agent.run(
+            &Event::UserMessage(message.to_string()),
+            self.home(),
+            limits,
+        )
     }
 
     /// Runs a command that has to succeed.
@@ -171,7 +217,7 @@ fn files_persist_between_runs_but_memory_does_not() {
 #[test]
 fn the_agent_is_told_what_kind_of_event_it_is() {
     let fixture = Fixture::file_agent();
-    let run = |event: Event| fixture.agent.run(&event, fixture.home());
+    let run = |event: Event| fixture.agent.run(&event, fixture.home(), &roomy_limits());
     let scheduled = |name: &str| Event::Scheduled(name.to_string());
     assert_eq!(run(scheduled("expect-scheduled")), RunOutcome::Completed);
     assert_ne!(run(scheduled("expect-user-message")), RunOutcome::Completed);
@@ -213,6 +259,7 @@ fn the_disk_limit_applies_to_agents() {
     let outcome = fixture.agent.run(
         &Event::UserMessage("write a.txt hello".to_string()),
         small_home,
+        &roomy_limits(),
     );
     let RunOutcome::Failed(message) = outcome else {
         panic!("the write wasn't refused: {outcome:?}");
@@ -398,4 +445,354 @@ fn a_hostile_import_name_is_made_safe_to_print() {
     let message = load_error(code).to_string();
     assert!(message.is_ascii(), "{message}");
     assert!(!message.chars().any(|c| c.is_control()), "{message}");
+}
+
+/// Fails a test instead of hanging it, if a limit doesn't work.
+fn within_a_minute<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || sender.send(work()));
+    receiver
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the agent wasn't stopped")
+}
+
+fn short_time() -> RunLimits {
+    RunLimits {
+        run_time: Duration::from_millis(300),
+        ..roomy_limits()
+    }
+}
+
+/// Runs an agent that should run out of time, and checks that it's stopped at about the right time.
+fn expect_stopped_on_time(code: Vec<u8>, message: &'static str) {
+    within_a_minute(move || {
+        let fixture = Fixture::new(code);
+        let start = Instant::now();
+        assert_eq!(
+            fixture.run_limited(message, &short_time()),
+            RunOutcome::TimeLimit
+        );
+        let elapsed = start.elapsed();
+        assert!(elapsed >= short_time().run_time, "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    });
+}
+
+#[test]
+fn an_infinite_loop_is_stopped_on_time() {
+    expect_stopped_on_time(file_agent_code().to_vec(), "loop-forever");
+}
+
+#[test]
+fn an_infinite_loop_calling_the_host_is_stopped_on_time() {
+    expect_stopped_on_time(file_agent_code().to_vec(), "call-host-forever");
+}
+
+#[test]
+fn a_loop_that_never_calls_anything_is_stopped_on_time() {
+    expect_stopped_on_time(component_exporting("(loop (br 0)) i32.const 0", ""), "x");
+}
+
+#[test]
+fn a_loop_while_starting_is_stopped_on_time() {
+    let code = component_exporting("i32.const 0", "(func $start (loop (br 0))) (start $start)");
+    expect_stopped_on_time(code, "x");
+}
+
+#[test]
+fn a_loop_while_receiving_the_event_is_stopped_on_time() {
+    // The host calls cabi_realloc to pass the event in, which runs before handle-event does.
+    let code = component_with_realloc("(loop (br 0)) i32.const 0");
+    expect_stopped_on_time(code, "x");
+}
+
+#[test]
+fn an_agent_that_finishes_in_time_is_not_stopped() {
+    let fixture = Fixture::file_agent();
+    // Long enough for several ticks, so that a tick alone doesn't stop a run.
+    let limits = RunLimits {
+        run_time: Duration::from_secs(30),
+        ..roomy_limits()
+    };
+    assert_eq!(
+        fixture.run_limited("allocate 1", &limits),
+        RunOutcome::Completed
+    );
+}
+
+#[test]
+fn each_run_gets_its_full_time() {
+    // The deadline starts when a run does, not when the agent was loaded.
+    let fixture = Fixture::file_agent();
+    thread::sleep(short_time().run_time * 2);
+    assert_eq!(
+        fixture.run_limited("expect-user-message", &short_time()),
+        RunOutcome::Completed
+    );
+}
+
+#[test]
+fn runs_at_the_same_time_keep_their_own_deadlines() {
+    within_a_minute(|| {
+        let long_run = thread::spawn(|| {
+            let fixture = Fixture::file_agent();
+            let limits = RunLimits {
+                run_time: Duration::from_secs(2),
+                ..roomy_limits()
+            };
+            let start = Instant::now();
+            assert_eq!(
+                fixture.run_limited("loop-forever", &limits),
+                RunOutcome::TimeLimit
+            );
+            start.elapsed()
+        });
+        // Another run ticks at the same time, and mustn't cut the long run short.
+        for _ in 0..3 {
+            expect_stopped_on_time(file_agent_code().to_vec(), "loop-forever");
+        }
+        let elapsed = long_run.join().unwrap();
+        assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    });
+}
+
+fn tiny_memory() -> RunLimits {
+    RunLimits {
+        memory_bytes: 32 * MB,
+        ..roomy_limits()
+    }
+}
+
+#[test]
+fn the_next_run_works_after_hitting_a_limit() {
+    within_a_minute(|| {
+        let fixture = Fixture::file_agent();
+        fixture.ok("write state.txt saved");
+        assert_eq!(
+            fixture.run_limited("loop-forever", &short_time()),
+            RunOutcome::TimeLimit
+        );
+        fixture.ok("expect state.txt saved");
+        assert_eq!(
+            fixture.run_limited("allocate-forever", &tiny_memory()),
+            RunOutcome::MemoryLimit
+        );
+        fixture.ok("expect state.txt saved");
+        fixture.ok("allocate 32");
+    });
+}
+
+#[test]
+fn an_allocation_loop_fails_without_harming_the_host() {
+    within_a_minute(|| {
+        let fixture = Fixture::file_agent();
+        assert_eq!(
+            fixture.run_limited("allocate-forever", &tiny_memory()),
+            RunOutcome::MemoryLimit
+        );
+    });
+}
+
+#[test]
+fn memory_within_the_limit_can_be_used() {
+    let fixture = Fixture::file_agent();
+    assert_eq!(
+        fixture.run_limited("allocate 16", &tiny_memory()),
+        RunOutcome::Completed
+    );
+}
+
+#[test]
+fn allocating_more_than_the_limit_fails() {
+    let fixture = Fixture::file_agent();
+    assert_eq!(
+        fixture.run_limited("allocate 64", &tiny_memory()),
+        RunOutcome::MemoryLimit
+    );
+}
+
+#[test]
+fn an_agent_can_notice_that_its_out_of_memory_and_carry_on() {
+    let fixture = Fixture::file_agent();
+    assert_eq!(
+        fixture.run_limited("try-allocate-too-much", &tiny_memory()),
+        RunOutcome::Completed
+    );
+}
+
+fn one_mb_of_memory() -> RunLimits {
+    RunLimits {
+        memory_bytes: MB,
+        ..roomy_limits()
+    }
+}
+
+#[test]
+fn growing_memory_directly_stops_at_the_limit() {
+    // 16 pages make 1 MB. The module starts with one page, so growing by 15 fits exactly.
+    let body = "(if (i32.ne (memory.grow (i32.const 15)) (i32.const 1)) (then unreachable)) \
+                (if (i32.ne (memory.grow (i32.const 1)) (i32.const -1)) (then unreachable)) \
+                (if (i32.ne (memory.size) (i32.const 16)) (then unreachable)) \
+                i32.const 0";
+    let fixture = Fixture::new(component_exporting(body, ""));
+    assert_eq!(
+        fixture.run_limited("x", &one_mb_of_memory()),
+        RunOutcome::Completed
+    );
+}
+
+#[test]
+fn a_memory_too_large_to_start_with_is_reported() {
+    let fixture = Fixture::new(component_with_memory_pages(17));
+    assert_eq!(
+        fixture.run_limited("x", &one_mb_of_memory()),
+        RunOutcome::MemoryLimit
+    );
+
+    let fixture = Fixture::new(component_with_memory_pages(16));
+    assert_eq!(
+        fixture.run_limited("x", &one_mb_of_memory()),
+        RunOutcome::Completed
+    );
+}
+
+#[test]
+fn several_memories_share_one_limit() {
+    // Each of these fits alone, but not together.
+    let fixture = Fixture::new(component_exporting("i32.const 0", "(memory 16)"));
+    assert_eq!(
+        fixture.run_limited("x", &one_mb_of_memory()),
+        RunOutcome::MemoryLimit
+    );
+}
+
+#[test]
+fn large_tables_count_towards_the_limit() {
+    // 5 million elements take 40 MB, because each counts for 8 bytes.
+    let table = "(table 5000000 funcref)";
+    let fixture = Fixture::new(component_exporting("i32.const 0", table));
+    assert_eq!(
+        fixture.run_limited("x", &tiny_memory()),
+        RunOutcome::MemoryLimit
+    );
+}
+
+#[test]
+fn growing_a_table_counts_towards_the_limit() {
+    let must_grow = "(if (i32.eq (table.grow $t (ref.null func) (i32.const 5000000)) \
+                     (i32.const -1)) (then unreachable)) i32.const 0";
+    let fixture = Fixture::new(component_exporting(must_grow, "(table $t 1 funcref)"));
+    assert_eq!(
+        fixture.run_limited("x", &tiny_memory()),
+        RunOutcome::MemoryLimit
+    );
+}
+
+/// An agent that also creates `count` instances of a module holding `contents`.
+fn component_with_instances(contents: &str, count: usize) -> Vec<u8> {
+    let instances = "(core instance (instantiate $extra))\n".repeat(count);
+    wat::parse_str(format!(
+        r#"(component
+            (core module $extra {contents})
+            {instances}
+            (core module $main
+                (memory (export "memory") 1)
+                (func (export "handle-event") (param i32 i32 i32) (result i32) i32.const 0)
+                {REALLOC}
+            )
+            {MAIN_INSTANCE_AND_EXPORT}
+        )"#
+    ))
+    .unwrap()
+}
+
+/// Checks that a component runs when it's under a cap, and is refused when it's over.
+fn expect_cap(under: Vec<u8>, over: Vec<u8>) {
+    assert_eq!(Fixture::new(under).run("x"), RunOutcome::Completed);
+    let outcome = Fixture::new(over).run("x");
+    assert!(matches!(outcome, RunOutcome::Crashed(_)), "{outcome:?}");
+}
+
+#[test]
+fn too_many_instances_are_refused() {
+    expect_cap(
+        component_with_instances("", 50),
+        component_with_instances("", 200),
+    );
+}
+
+#[test]
+fn too_many_memories_are_refused() {
+    // One module can only hold so many, so this takes several instances.
+    let memories = "(memory 0)".repeat(40);
+    expect_cap(
+        component_with_instances(&memories, 2),
+        component_with_instances(&memories, 3),
+    );
+}
+
+#[test]
+fn too_many_tables_are_refused() {
+    let tables = "(table 0 funcref)".repeat(40);
+    expect_cap(
+        component_with_instances(&tables, 2),
+        component_with_instances(&tables, 3),
+    );
+}
+
+#[test]
+fn endless_recursion_is_reported_without_harming_the_host() {
+    let code = component_exporting(
+        "(call $forever) i32.const 0",
+        "(func $forever (call $forever))",
+    );
+    let fixture = Fixture::new(code);
+    let RunOutcome::Crashed(reason) = fixture.run("x") else {
+        panic!("the crash wasn't reported");
+    };
+    assert!(reason.contains("call stack"), "{reason}");
+}
+
+#[test]
+fn a_nonsense_return_value_is_reported_as_a_crash() {
+    // The result is a pointer into memory, which is far past the end here.
+    let fixture = Fixture::new(component_exporting("i32.const 2000000", ""));
+    let outcome = fixture.run("x");
+    assert!(matches!(outcome, RunOutcome::Crashed(_)), "{outcome:?}");
+}
+
+#[test]
+fn a_manifest_cant_raise_its_limits_above_the_hosts() {
+    const GREEDY: &str = "[agent]\nname = \"file-agent\"\nversion = \"0.1.0\"\n\n[limits]\nmemory_mb = 4096\nrun_seconds = 3600\ndisk_mb = 10240\n";
+    let host = HostLimits {
+        memory_mb: 32,
+        run_seconds: 1,
+        disk_mb: 1,
+    };
+    let package = Package::new(GREEDY, file_agent_code().to_vec()).unwrap();
+    let limits = host.limits_for(&package.manifest().limits());
+
+    within_a_minute(move || {
+        let fixture = Fixture::file_agent();
+        let start = Instant::now();
+        assert_eq!(
+            fixture.run_limited("loop-forever", &limits),
+            RunOutcome::TimeLimit
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            fixture.run_limited("allocate-forever", &limits),
+            RunOutcome::MemoryLimit
+        );
+
+        let small_home = fixture.storage.home(limits.disk_bytes).unwrap();
+        let too_big = format!("expect-big big.bin {}", 2 * MB);
+        let outcome = fixture
+            .agent
+            .run(&Event::UserMessage(too_big), small_home, &limits);
+        let RunOutcome::Failed(message) = outcome else {
+            panic!("the disk limit wasn't applied: {outcome:?}");
+        };
+        assert!(message.contains("disk limit"), "{message}");
+    });
 }
