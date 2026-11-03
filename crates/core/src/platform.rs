@@ -127,6 +127,21 @@ pub(crate) fn is_link_refused(error: &io::Error) -> bool {
     }
 }
 
+/// Whether an open file also has another name, which could be somewhere outside where it was found.
+/// Agents can't make hard links, but one could be there, left by something else.
+pub(crate) fn has_other_names(file: &cap_std::fs::File) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+
+        Ok(file.metadata()?.nlink() > 1)
+    }
+    #[cfg(windows)]
+    {
+        windows::link_count(file).map(|links| links > 1)
+    }
+}
+
 /// Creates a file that's new, with its contents saved to disk. A read-only file can only be read.
 pub fn write_new_file(path: &Path, data: &[u8], read_only: bool) -> io::Result<()> {
     use std::io::Write;
@@ -243,6 +258,26 @@ mod windows {
 
     fn wide(text: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
         text.as_ref().encode_wide().chain(iter::once(0)).collect()
+    }
+
+    /// How many names a file has. Rust's own way of asking isn't stable on Windows yet.
+    pub(super) fn link_count(file: &cap_std::fs::File) -> io::Result<u32> {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        // SAFETY: an all-zero value is valid for this plain data, and it's only read if the call
+        // below succeeds, which fills it in.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is valid for as long as `file` is borrowed, which covers this call,
+        // and `info` is valid to write to.
+        let found = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) };
+        if found == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.nNumberOfLinks)
     }
 
     /// Replaces a folder's access list. Windows only has a C API for this, so this needs `unsafe`.

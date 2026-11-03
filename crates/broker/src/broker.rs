@@ -1807,10 +1807,18 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn an_answer_thats_given_up_on_still_counts_and_is_logged() {
-        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        // Long enough that some of it gets past what's held back to look for a key.
+        let long = "x".repeat(200);
+        let body = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n\n\
+data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{long}\"}}}}\n\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":7}}}}\n\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], body.as_bytes());
         let mut setup = model_setup(network, 1000, true);
         let mut answer = setup.broker.model_complete(ask(100)).ok().unwrap();
-        assert_eq!(answer.next().unwrap().as_deref(), Some("Hello"));
+        assert!(answer.next().unwrap().is_some());
         drop(answer);
         let events = fetch_events(&setup.fixture);
         assert!(
@@ -1962,6 +1970,101 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             // It stays finished after that.
             assert_eq!(answer.next().unwrap(), None);
         }
+    }
+
+    #[test]
+    fn an_error_in_the_stream_ends_it_even_with_text_after_it() {
+        let body = "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"more\"}}\n\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], body.as_bytes());
+        let mut setup = model_setup(network, 1000, true);
+        let mut answer = setup.broker.model_complete(ask(10)).ok().unwrap();
+        assert!(matches!(answer.next(), Err(FetchError::Unavailable(_))));
+        assert_eq!(answer.next().unwrap(), None);
+    }
+
+    #[test]
+    fn a_model_request_after_the_runs_time_is_up_sends_nothing() {
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        let fixture = Fixture::new();
+        let mut broker = Broker::with_network(
+            Scripted::new(Answer::Allow(Lifetime::ThisRun)),
+            network.clone(),
+        )
+        .for_run(
+            &fixture.storage,
+            &Manifest::parse(MANIFEST).unwrap(),
+            &RunLimits {
+                memory_bytes: 1,
+                run_time: Duration::ZERO,
+                disk_bytes: 1,
+            },
+            RunId::parse(&"1".repeat(32)).unwrap(),
+        );
+        broker
+            .request_access(&Target::Model("default".to_string()), "please")
+            .unwrap();
+        assert_eq!(
+            broker.model_complete(ask(10)).err(),
+            Some(FetchError::TimedOut)
+        );
+        assert!(network.urls_sent().is_empty());
+    }
+
+    #[test]
+    fn a_grant_for_one_request_covers_one_model_request() {
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], MODEL_ANSWER.as_bytes());
+        let fixture = Fixture::new();
+        let root = TempDir::new().unwrap();
+        let vault = Vault::new(root.path(), FakeStore::default());
+        vault
+            .add(NewSecret {
+                name: SECRET_NAME,
+                hosts: &["api.anthropic.com".to_string()],
+                header: "x-api-key",
+                prefix: "",
+                value: SecretValue::new(SECRET.as_bytes().to_vec()),
+            })
+            .unwrap();
+        let mut broker = Broker::with_network(
+            Scripted::new(Answer::Allow(Lifetime::Once)),
+            network.clone(),
+        )
+        .with_vault(vault)
+        .for_run(
+            &fixture.storage,
+            &Manifest::parse(MANIFEST).unwrap(),
+            &RunLimits {
+                memory_bytes: 1,
+                run_time: Duration::from_secs(60),
+                disk_bytes: 1,
+            },
+            RunId::parse(&"1".repeat(32)).unwrap(),
+        );
+        broker
+            .request_access(&Target::Model("default".to_string()), "please")
+            .unwrap();
+        assert!(broker.model_complete(ask(10)).is_ok());
+        assert_eq!(
+            broker.model_complete(ask(10)).err(),
+            Some(FetchError::NotGranted)
+        );
+        assert_eq!(network.urls_sent().len(), 1);
+    }
+
+    #[test]
+    fn a_key_sent_back_by_the_provider_is_taken_out_even_if_its_split_up() {
+        let (first, second) = SECRET.split_at(5);
+        let body = format!(
+            "data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"a {SECRET} b {first}\"}}}}\n\n\
+data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{second} c é\"}}}}\n\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let network = FakeNetwork::default().page(PROVIDER, 200, &[], body.as_bytes());
+        let mut setup = model_setup(network, 1000, true);
+        let mut answer = setup.broker.model_complete(ask(10)).ok().unwrap();
+        assert_eq!(read_answer(&mut answer), "a [removed] b [removed] c é");
     }
 
     #[test]

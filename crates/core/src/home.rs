@@ -380,7 +380,7 @@ impl Home {
         if metadata.is_dir() {
             return Err(HomeError::NotAFile);
         }
-        if !metadata.is_file() {
+        if !metadata.is_file() || platform::has_other_names(&file)? {
             return Err(HomeError::Denied);
         }
         Ok((file, metadata))

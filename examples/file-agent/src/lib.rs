@@ -68,6 +68,7 @@ impl Guest for Agent {
             }
             "fetch" => fetch(first, rest),
             "ask-model-text" => ask_model_text(first, rest),
+            "hold-answers" => hold_answers(first),
             "pick-file" => pick_file(first, rest),
             "fetch-and-hold" => fetch_and_hold(first),
             "ask-model" => {
@@ -144,6 +145,27 @@ fn fetch_and_hold(count: &str) -> Result<(), String> {
     })
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+/// Keeps this many answers from a model open at once.
+fn hold_answers(count: &str) -> Result<(), String> {
+    use habitat_sdk::bindings::habitat::host::types::{ModelMessage, ModelRequest, ModelRole};
+
+    let count: usize = count.parse().map_err(|_| "bad count".to_string())?;
+    let mut held = Vec::new();
+    for _ in 0..count {
+        let answer = api::model_complete(&ModelRequest {
+            model: "default".to_string(),
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                text: "hello".to_string(),
+            }],
+            max_tokens: 1,
+        })
+        .map_err(|error| error.to_string())?;
+        held.push(answer);
+    }
+    Ok(())
 }
 
 /// Asks a model something, and checks the answer.

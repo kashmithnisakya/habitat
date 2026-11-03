@@ -13,12 +13,13 @@ use habitat_core::backend::{
     FetchError, FetchMethod, FetchRequest, ModelAnswer, ModelRequest, ModelRole, TokenUsage,
 };
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::audit::{AuditError, AuditEvent, AuditLog};
 use crate::gateway::{
     CheckedUrl, LimitedBody, MAX_RESPONSE_BYTES, Network, NetworkError, check_url,
 };
-use crate::vault::{Vault, VaultError};
+use crate::vault::{SecretHeader, Vault, VaultError};
 
 const PROVIDER_HOST: &str = "api.anthropic.com";
 const PROVIDER_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -198,9 +199,45 @@ pub(crate) fn start(
         shared,
         model: request.model.clone(),
         usage: TokenUsage::default(),
+        scrubber: Scrubber::new(&key),
+        ended: false,
         finished: false,
         logged: false,
     }))
+}
+
+/// Takes a key out of an answer, in case a provider sends it back. It could be split across pieces
+/// of text, so this always holds on to enough of the end to spot that.
+struct Scrubber {
+    secret: Zeroizing<String>,
+    held: String,
+}
+
+impl Scrubber {
+    fn new(key: &SecretHeader) -> Self {
+        Self {
+            secret: Zeroizing::new(String::from_utf8_lossy(key.bare.expose()).into_owned()),
+            held: String::new(),
+        }
+    }
+
+    /// Takes more text, and returns what's now safe to pass on.
+    fn add(&mut self, text: &str) -> String {
+        self.held.push_str(text);
+        self.held = self.held.replace(self.secret.as_str(), "[removed]");
+        let keep = self.secret.len().saturating_sub(1);
+        let mut split = self.held.len().saturating_sub(keep);
+        while !self.held.is_char_boundary(split) {
+            split -= 1;
+        }
+        let rest = self.held.split_off(split);
+        std::mem::replace(&mut self.held, rest)
+    }
+
+    /// Everything that's left, at the end.
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
 }
 
 /// One answer as it arrives. It stops at the end of the stream, or when it's dropped, and either way
@@ -210,6 +247,9 @@ struct Answer<R: Read + Send> {
     shared: RunShared,
     model: String,
     usage: TokenUsage,
+    scrubber: Scrubber,
+    /// The stream's over, and only what the scrubber is holding on to is left.
+    ended: bool,
     finished: bool,
     logged: bool,
 }
@@ -289,6 +329,12 @@ impl<R: Read + Send> ModelAnswer for Answer<R> {
             return Ok(None);
         }
         loop {
+            if self.ended {
+                self.finished = true;
+                self.log_usage();
+                let rest = self.scrubber.finish();
+                return Ok((!rest.is_empty()).then_some(rest));
+            }
             let line = match self.read_line() {
                 Ok(Some(line)) => line,
                 // The stream has to say that it's finished, or it was cut off.
@@ -317,9 +363,11 @@ impl<R: Read + Send> ModelAnswer for Answer<R> {
                 Some("content_block_delta") => {
                     if event.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
                         && let Some(text) = event.pointer("/delta/text").and_then(Value::as_str)
-                        && !text.is_empty()
                     {
-                        return Ok(Some(text.to_string()));
+                        let safe = self.scrubber.add(text);
+                        if !safe.is_empty() {
+                            return Ok(Some(safe));
+                        }
                     }
                 }
                 Some("message_delta") => {
@@ -335,11 +383,7 @@ impl<R: Read + Send> ModelAnswer for Answer<R> {
                         ));
                     }
                 }
-                Some("message_stop") => {
-                    self.finished = true;
-                    self.log_usage();
-                    return Ok(None);
-                }
+                Some("message_stop") => self.ended = true,
                 Some("error") => {
                     return self.fail(FetchError::Unavailable(
                         "the model provider failed, so try again later".to_string(),
