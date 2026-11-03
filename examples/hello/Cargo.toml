@@ -1,0 +1,15 @@
+[package]
+name = "habitat-hello"
+description = "A small agent that remembers who has visited, as a starting point for your own"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+habitat-sdk = { path = "../../crates/sdk" }
+serde = { version = "1.0.229", features = ["derive"] }

@@ -64,6 +64,7 @@ Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/ha
 - [Design decisions](docs/decisions/README.md)
 - [Android feasibility report (draft)](docs/feasibility-android.md)
 - [Agent API](docs/agent-api.md)
+- [Writing an agent](docs/writing-an-agent.md)
 
 ## Repository layout
 
@@ -99,7 +100,7 @@ cargo test --workspace
 
 ## Getting started
 
-This installs and runs [`file-agent`](examples/file-agent/src/lib.rs), a sample agent that does what each message tells it to with the files in its home. It only exists for testing, and a friendlier example is [on the way](https://github.com/kashmithnisakya/habitat/issues/13).
+This installs and runs [`hello`](examples/hello/src/lib.rs), a small agent that remembers who has visited. To write your own, see [Writing an agent](docs/writing-an-agent.md).
 
 As well as the things listed under [Build](#build), you need `wasm-tools` to turn the agent into a WebAssembly component:
 
@@ -114,33 +115,31 @@ cargo build --release -p habitat-cli
 ```
 
 ```bash
-cargo build --release -p habitat-file-agent --target wasm32-unknown-unknown
+cargo build --release -p habitat-hello --target wasm32-unknown-unknown
 ```
 
 ```bash
-wasm-tools component new target/wasm32-unknown-unknown/release/habitat_file_agent.wasm -o file-agent.wasm
+wasm-tools component new target/wasm32-unknown-unknown/release/habitat_hello.wasm -o hello.wasm
 ```
 
-Put the agent and its [manifest](examples/file-agent/agent.toml) into a package, and install it:
+Put the agent and its [manifest](examples/hello/agent.toml) into a package, and install it:
 
 ```bash
-target/release/habitat pack examples/file-agent/agent.toml file-agent.wasm -o file-agent.habitat
+target/release/habitat pack examples/hello/agent.toml hello.wasm -o hello.habitat
 ```
 
 ```bash
-target/release/habitat install file-agent.habitat
+target/release/habitat install hello.habitat
 ```
 
-Run it, and tell it to save a file:
+Run it twice, with the name of a visitor each time. Each run is a new start, and only the agent's files carry over:
 
 ```bash
-target/release/habitat run file-agent "write hello.txt hi there"
+target/release/habitat run hello "Ada"
 ```
 
-Each run is a new start, and only the agent's files carry over. This one fails unless the file is still there:
-
 ```bash
-target/release/habitat run file-agent "expect hello.txt hi there"
+target/release/habitat run hello "Grace"
 ```
 
 See what's installed, and how each agent's last run went:
@@ -152,7 +151,7 @@ target/release/habitat list
 Delete the agent and all its files. This asks you to confirm first:
 
 ```bash
-target/release/habitat remove file-agent
+target/release/habitat remove hello
 ```
 
 Agents are kept in `~/Library/Application Support/habitat` on a Mac, and `~/.local/share/habitat` on Linux. To use another folder, pass `--root` or set `HABITAT_HOME`.
