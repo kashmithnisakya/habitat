@@ -319,7 +319,7 @@ fn check_list(
 
 /// Requires a dot and a last label that isn't all digits. This rules out `localhost`, wildcards,
 /// and IP addresses in forms such as `127.0.0.1` and `0x7f000001`.
-fn is_host_name(host: &str) -> bool {
+pub fn is_host_name(host: &str) -> bool {
     let labels: Vec<&str> = host.split('.').collect();
     host.len() <= MAX_HOST_CHARS
         && labels.len() >= 2
@@ -339,7 +339,7 @@ fn is_host_label(label: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-fn is_model_name(name: &str) -> bool {
+pub fn is_model_name(name: &str) -> bool {
     name.len() <= MAX_NAME_CHARS
         && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
         && name
