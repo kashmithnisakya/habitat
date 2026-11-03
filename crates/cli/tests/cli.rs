@@ -58,6 +58,7 @@ impl Fixture {
             .env("HABITAT_HOME", self.root())
             // So that even a bug can't reach the real folder of whoever runs these tests.
             .env("HOME", self.path("no-such-home"))
+            .env("LOCALAPPDATA", self.path("no-such-home"))
             .env_remove("XDG_DATA_HOME")
             .stdin(Stdio::null());
         command
@@ -123,6 +124,7 @@ fn wait_for(path: &Path) {
 }
 
 /// Waits for the program to end, and fails rather than hangs if it doesn't.
+#[cfg(unix)]
 fn wait_for_exit(running: &mut Running) -> Option<i32> {
     let start = Instant::now();
     loop {
@@ -137,6 +139,7 @@ fn wait_for_exit(running: &mut Running) -> Option<i32> {
     }
 }
 
+#[cfg(unix)]
 fn send_signal(running: &Running, signal: &str) {
     let status = Command::new("kill")
         .args([signal, &running.0.id().to_string()])
@@ -226,6 +229,7 @@ fn text_from_a_hostile_agent_is_safe_to_print() {
     assert!(!stdout(&fixture.run(&["list"])).contains('\x1b'));
 }
 
+#[cfg(unix)]
 #[test]
 fn stopping_the_program_stops_the_agent_and_keeps_what_it_saved() {
     for signal in ["-INT", "-TERM"] {
@@ -254,6 +258,7 @@ fn stopping_the_program_stops_the_agent_and_keeps_what_it_saved() {
     }
 }
 
+#[cfg(unix)]
 /// A package that's within the limits on compiling, and takes far longer than the wait to stop.
 /// Arithmetic with no loops, as `docs/compile-costs.md` measures, at about 40 s or more on a Mac.
 fn slow_to_compile() -> Vec<u8> {
@@ -263,6 +268,7 @@ fn slow_to_compile() -> Vec<u8> {
     wat::parse_str(format!("(component (core module {functions}))")).unwrap()
 }
 
+#[cfg(unix)]
 #[test]
 fn stopping_the_program_during_a_compile_doesnt_wait_for_it_to_end() {
     let fixture = Fixture::new();
@@ -536,6 +542,7 @@ fn without_a_home_folder_it_says_what_to_do() {
         .command()
         .env_remove("HABITAT_HOME")
         .env_remove("HOME")
+        .env_remove("LOCALAPPDATA")
         .arg("list")
         .output()
         .unwrap();
@@ -549,13 +556,14 @@ fn an_empty_home_folder_counts_as_none() {
         .command()
         .env_remove("HABITAT_HOME")
         .env("HOME", "")
+        .env("LOCALAPPDATA", "")
         .arg("list")
         .output()
         .unwrap();
     fails_with(&output, 1, "--root");
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 #[test]
 fn the_default_folder_follows_xdg_data_home_if_its_absolute() {
     let fixture = Fixture::new();
@@ -592,11 +600,14 @@ fn the_default_folder_is_under_the_users_home() {
         .env_remove("HABITAT_HOME")
         .env_remove("XDG_DATA_HOME")
         .env("HOME", &home)
+        .env("LOCALAPPDATA", &home)
         .args(["install", "agent.habitat"])
         .output()
         .unwrap();
     succeeds(&output);
-    let expected = if cfg!(target_os = "macos") {
+    let expected = if cfg!(windows) {
+        "habitat/agents/file-agent"
+    } else if cfg!(target_os = "macos") {
         "Library/Application Support/habitat/agents/file-agent"
     } else {
         ".local/share/habitat/agents/file-agent"

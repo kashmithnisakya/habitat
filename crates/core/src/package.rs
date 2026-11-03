@@ -4,9 +4,8 @@
 //! `docs/packages.md`.
 
 use std::fmt;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -17,6 +16,7 @@ use tar::{Archive, Builder, Entries, EntryType, Header};
 
 use crate::home::AgentStorage;
 use crate::manifest::{MAX_MANIFEST_BYTES, Manifest, ManifestError};
+use crate::platform;
 
 /// The package format this version of Habitat reads and writes.
 pub const FORMAT_VERSION: u32 = 1;
@@ -280,20 +280,20 @@ impl Package {
 
         let folder = storage.package_path();
         fs::remove_dir_all(&folder)?;
-        DirBuilder::new().mode(0o700).create(&folder)?;
+        platform::create_private_dir(&folder)?;
         for (name, data) in self.files() {
-            write_synced(&folder.join(name), data, 0o400)?;
+            platform::write_new_file(&folder.join(name), data, true)?;
         }
-        sync_dir(&folder)?;
+        platform::sync_dir_path(&folder)?;
 
         let temp = record.with_extension("new");
         if temp.symlink_metadata().is_ok() {
             fs::remove_file(&temp)?;
         }
-        write_synced(&temp, format!("{}\n", self.hash).as_bytes(), 0o600)?;
+        platform::write_new_file(&temp, format!("{}\n", self.hash).as_bytes(), false)?;
         fs::rename(&temp, &record)?;
         if let Some(parent) = record.parent() {
-            sync_dir(parent)?;
+            platform::sync_dir_path(parent)?;
         }
         Ok(())
     }
@@ -411,36 +411,18 @@ fn hex_sha256(data: &[u8]) -> String {
     PackageHash(Sha256::digest(data).into()).to_string()
 }
 
-fn write_synced(path: &Path, data: &[u8], mode: u32) -> Result<(), PackageError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn sync_dir(path: &Path) -> Result<(), PackageError> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
 /// Reads a file from an agent's folder, refusing anything that isn't a regular file.
 fn read_installed(path: &Path, limit: u64) -> Result<Vec<u8>, PackageError> {
     const NOT_A_FILE: PackageError =
         PackageError::Malformed("an installed file isn't a regular file");
 
-    // Non-blocking, so that opening a named pipe can't hang the host.
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| match error.raw_os_error() {
-            Some(libc::ELOOP) => NOT_A_FILE,
-            _ => error.into(),
-        })?;
+    let file = platform::open_no_follow(path).map_err(|error| {
+        if platform::is_link_refused(&error) {
+            NOT_A_FILE
+        } else {
+            error.into()
+        }
+    })?;
     if !file.metadata()?.is_file() {
         return Err(NOT_A_FILE);
     }
@@ -454,16 +436,23 @@ fn read_installed(path: &Path, limit: u64) -> Result<Vec<u8>, PackageError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::ffi::CString;
     use std::io::Cursor;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::sync::mpsc;
+    #[cfg(unix)]
     use std::thread;
+    #[cfg(unix)]
     use std::time::Duration;
 
     use super::*;
     use crate::home::HomeError;
+    use crate::platform::test_support::symlink;
 
     const EXAMPLE: &str = include_str!("../../../examples/research-helper/agent.toml");
     const OTHER_AGENT: &str = "[agent]\nname = \"other-agent\"\nversion = \"1.0.0\"\n\n[limits]\nmemory_mb = 1\nrun_seconds = 1\ndisk_mb = 1\n";
@@ -562,7 +551,15 @@ mod tests {
         /// Makes the files writable, as anything tampering with them would.
         fn unlock(&self, name: &str) {
             let path = self.storage.package_path().join(name);
+            #[cfg(unix)]
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            #[cfg(windows)]
+            {
+                let mut permissions = fs::metadata(&path).unwrap().permissions();
+                #[allow(clippy::permissions_set_readonly_false, reason = "only for this test")]
+                permissions.set_readonly(false);
+                fs::set_permissions(path, permissions).unwrap();
+            }
         }
     }
 
@@ -1140,6 +1137,7 @@ mod tests {
         assert_eq!(home.read("agent.wasm"), Err(HomeError::NotFound));
     }
 
+    #[cfg(unix)]
     #[test]
     fn installed_files_are_private_and_read_only() {
         let fixture = Fixture::installed();
@@ -1269,6 +1267,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     #[cfg_attr(
         target_os = "android",
