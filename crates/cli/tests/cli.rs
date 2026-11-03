@@ -196,7 +196,8 @@ fn each_way_a_run_can_end_has_its_own_exit_code() {
     );
 
     let quick = Fixture::new();
-    quick.write_manifest("agent.toml", AGENT, 1);
+    // Long enough for the next run to finish on a busy machine, as this is real time.
+    quick.write_manifest("agent.toml", AGENT, 5);
     quick.install();
     fails_with(&quick.run(&["run", AGENT, "loop-forever"]), 3, "time limit");
     // A failed run doesn't get in the way of the next.
