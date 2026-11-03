@@ -465,8 +465,11 @@ impl Arena {
     /// its own runs are left out, as they change with each run, and so are locks.
     pub fn snapshot(&self) -> Snapshot {
         let mut files = BTreeMap::new();
+        let home = self.home();
         for (base, label) in [(self.root.path(), "root"), (self.outside.path(), "outside")] {
-            walk(base, base, label, &self.home(), &mut files);
+            let leave_out =
+                |path: &Path, relative: &Path| path == home || changes_every_run(relative);
+            walk(base, base, label, &leave_out, &mut files);
         }
         Snapshot(files)
     }
@@ -495,13 +498,7 @@ impl Arena {
         let mut seen = report.agent_visible();
         let mut home_files = BTreeMap::new();
         let home = self.home();
-        walk(
-            &home,
-            &home,
-            "home",
-            Path::new("/nothing/skipped"),
-            &mut home_files,
-        );
+        walk(&home, &home, "home", &|_, _| false, &mut home_files);
         for contents in home_files.values() {
             seen.push_str(&String::from_utf8_lossy(contents));
         }
@@ -536,16 +533,12 @@ impl Arena {
     }
 
     /// Checks that the planted secret isn't anywhere in the host's files, as it should only ever be
-    /// in the keystore.
+    /// in the keystore. That includes the log and the records of runs, which is where one would be
+    /// most likely to end up.
     pub fn check_secret_only_in_keystore(&self) -> Result<(), Breach> {
         let mut files = BTreeMap::new();
-        walk(
-            self.root.path(),
-            self.root.path(),
-            "root",
-            Path::new("/nothing/skipped"),
-            &mut files,
-        );
+        let root = self.root.path();
+        walk(root, root, "root", &|_, _| false, &mut files);
         for (path, contents) in files {
             if String::from_utf8_lossy(&contents).contains(PLANTED_SECRET) {
                 return Err(Breach(format!("the secret is in {path}")));
@@ -583,21 +576,29 @@ fn changes_every_run(relative: &Path) -> bool {
         || matches!(parts.last(), Some(&"audit.db" | &"audit.head"))
 }
 
-fn walk(base: &Path, dir: &Path, label: &str, skip: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+/// Takes down the files under a folder, apart from those that `leave_out` is given the full and
+/// relative paths of, and says yes to.
+fn walk(
+    base: &Path,
+    dir: &Path,
+    label: &str,
+    leave_out: &dyn Fn(&Path, &Path) -> bool,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         let relative = path.strip_prefix(base).unwrap_or(&path);
-        if path == skip || changes_every_run(relative) {
+        if leave_out(&path, relative) {
             continue;
         }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
         if metadata.is_dir() {
-            walk(base, &path, label, skip, files);
+            walk(base, &path, label, leave_out, files);
         } else if metadata.is_file() {
             files.insert(
                 format!("{label}/{}", relative.display()),
