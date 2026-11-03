@@ -9,6 +9,7 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use semver::Version;
@@ -20,6 +21,10 @@ use crate::home::{AgentStorage, HomeError};
 use crate::package::{Package, PackageError};
 use crate::platform;
 use crate::run_log::{RunEnding, RunHistory, RunId, RunLog, RunRecord};
+
+/// How many more times to try for a lock, and how long to wait in between.
+const LOCK_RETRIES: u32 = 10;
+const LOCK_RETRY_WAIT: Duration = Duration::from_millis(50);
 
 /// Why something the supervisor was asked to do didn't happen. Messages hold no host paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +79,10 @@ struct RunLock {
 }
 
 impl RunLock {
+    /// Takes the lock, or says that the agent is running. A lock can look taken for a moment after
+    /// it's been let go of, if another thread is starting a process, which briefly holds a copy of
+    /// every open file. Something else can also hold it for a moment to read the agent's records.
+    /// So this tries for a little while before refusing.
     fn try_acquire(storage: &AgentStorage) -> Result<Self, SupervisorError> {
         let file =
             platform::open_or_create_no_follow(&storage.run_lock_path()).map_err(not_recorded)?;
@@ -81,11 +90,17 @@ impl RunLock {
         if !file.metadata().map_err(not_recorded)?.is_file() {
             return Err(SupervisorError::NotRecorded(io::ErrorKind::InvalidInput));
         }
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(SupervisorError::AlreadyRunning),
-            Err(TryLockError::Error(error)) => Err(not_recorded(error)),
+        for attempt in 0..=LOCK_RETRIES {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(TryLockError::WouldBlock) if attempt < LOCK_RETRIES => {
+                    thread::sleep(LOCK_RETRY_WAIT);
+                }
+                Err(TryLockError::WouldBlock) => return Err(SupervisorError::AlreadyRunning),
+                Err(TryLockError::Error(error)) => return Err(not_recorded(error)),
+            }
         }
+        Err(SupervisorError::AlreadyRunning)
     }
 }
 
@@ -236,8 +251,8 @@ impl Supervisor {
     }
 
     /// An agent's recent runs. A run that's going has no ending yet, and one that was interrupted
-    /// is marked as that. This holds the agent's lock while it reads, so a run asked for at that
-    /// moment is refused with [`SupervisorError::AlreadyRunning`], and can be asked for again.
+    /// is marked as that. This holds the agent's lock while it reads, which a run asked for at that
+    /// moment waits for.
     pub fn history(&self, agent_name: &str) -> Result<RunHistory, SupervisorError> {
         let storage = open_existing(&self.root, agent_name)?;
         let log = RunLog::open(&storage).map_err(not_recorded)?;
@@ -356,7 +371,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
-    use std::thread;
 
     use tempfile::TempDir;
 
@@ -782,7 +796,13 @@ mod tests {
         let fixture = Fixture::new();
         let runs = fixture.agent_path().join("runs");
         let backend = FakeBackend::new(move |_, _, _, _| {
-            fs::remove_dir_all(&runs).unwrap();
+            // A folder where the run's next record would be written to first, so that it can't be.
+            let record = fs::read_dir(&runs).unwrap().next().unwrap().unwrap();
+            let name = record
+                .file_name()
+                .to_string_lossy()
+                .replace(".toml", ".new");
+            fs::create_dir(runs.join(name)).unwrap();
             RunOutcome::failed("how it went")
         });
         let supervisor = fixture.supervisor(backend);
@@ -793,6 +813,39 @@ mod tests {
         assert_eq!(
             ending(&record),
             &RunOutcome::Failed("how it went".to_string())
+        );
+    }
+
+    #[test]
+    fn a_run_waits_a_moment_for_a_lock_thats_about_to_be_let_go_of() {
+        let fixture = Fixture::new();
+        let storage = AgentStorage::open_existing(fixture.root.path(), NAME).unwrap();
+        let held = RunLock::try_acquire(&storage).unwrap();
+        let supervisor = fixture.supervisor(scripted());
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(LOCK_RETRY_WAIT * 2);
+                drop(held);
+            });
+            let record = supervisor.run(NAME, &message("x")).unwrap();
+            assert_eq!(ending(&record), &RunOutcome::Completed);
+        });
+    }
+
+    #[test]
+    fn a_lock_that_stays_taken_is_refused_soon() {
+        let fixture = Fixture::new();
+        let storage = AgentStorage::open_existing(fixture.root.path(), NAME).unwrap();
+        let _held = RunLock::try_acquire(&storage).unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            fixture.supervisor(scripted()).run(NAME, &message("x")),
+            Err(SupervisorError::AlreadyRunning)
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
         );
     }
 

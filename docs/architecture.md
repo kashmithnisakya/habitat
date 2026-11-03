@@ -88,7 +88,7 @@ The [supervisor](../crates/core/src/supervisor.rs) does this as follows:
 These have some limits:
 
 - **Saving isn't all or nothing.** "Saved state" means every write that finished. An agent that's stopped between writing two related files keeps the first, so the agent has to write in an order it can recover from. There's no way yet to save several files at once.
-- **Nothing retries.** A run that fails or is refused stays that way, and it's up to the shell to ask again. That includes a run refused because something else was using the agent's folder at that moment, such as `habitat list` reading its records.
+- **Nothing retries a run.** A run that fails or is refused stays that way, and it's up to the shell to ask again. A run does wait up to half a second for the agent's lock first, so something that only holds it for a moment, such as `habitat list` reading its records, doesn't get in the way.
 - **The shell has to call `shut_down`.** The CLI does this on Ctrl-C and `SIGTERM`, and gives a compile 5 seconds before exiting without it. Nothing handles Android's lifecycle events yet. Without that, stopping the host counts as being killed, which is safe but gives the agent no chance to stop first.
 - **Records aren't the audit log.** They say that a run happened and how it ended. They aren't protected against tampering by someone with access to the device, and old ones get removed. The audit log can use the run ID to link its entries to a run.
 - **The lock needs a local file system.** File locks may not work on a network drive, and Habitat doesn't check for that.

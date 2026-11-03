@@ -365,7 +365,17 @@ impl Home {
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         platform::dont_block(&mut options);
-        let file = dir.open_with(name, &options)?;
+        let file = dir.open_with(name, &options).map_err(|error| {
+            // Windows says access is denied when asked to open a directory as a file.
+            let is_dir = dir
+                .symlink_metadata(name)
+                .is_ok_and(|metadata| metadata.is_dir());
+            if is_dir {
+                HomeError::NotAFile
+            } else {
+                HomeError::from(error)
+            }
+        })?;
         let metadata = file.metadata()?;
         if metadata.is_dir() {
             return Err(HomeError::NotAFile);

@@ -117,8 +117,13 @@ pub(crate) fn is_link_refused(error: &io::Error) -> bool {
     }
     #[cfg(windows)]
     {
-        let _ = error;
-        false
+        use windows_sys::Win32::Foundation::{ERROR_STOPPED_ON_SYMLINK, ERROR_TOO_MANY_LINKS};
+
+        // The first is what `cap-std` reports when it refuses a link itself.
+        matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_TOO_MANY_LINKS | ERROR_STOPPED_ON_SYMLINK)
+        )
     }
 }
 
@@ -320,7 +325,14 @@ mod windows_tests {
         fs::create_dir(folder.join("child")).unwrap();
         for path in [folder.clone(), folder.join("file"), folder.join("child")] {
             let list = access_list(&path);
-            for other in ["Everyone", "Users", "Authenticated Users"] {
+            assert!(list.contains("OWNER RIGHTS"), "{list}");
+            // These hold a backslash, or the path itself could look like one, such as C:\Users.
+            for other in [
+                "Everyone",
+                "BUILTIN\\Users",
+                "Authenticated Users",
+                "BUILTIN\\Administrators",
+            ] {
                 assert!(!list.contains(other), "{other} in {list}");
             }
         }
