@@ -12,7 +12,7 @@ Please report security problems as described in [SECURITY.md](SECURITY.md), not 
 
 ## Development
 
-You need a recent stable [Rust toolchain](https://rustup.rs). Before opening a pull request, run:
+You need a recent stable [Rust toolchain](https://rustup.rs) and the WebAssembly target, which you can add with `rustup target add wasm32-unknown-unknown`. Before opening a pull request, run:
 
 ```bash
 cargo fmt --all --check

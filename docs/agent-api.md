@@ -2,7 +2,9 @@
 
 [`wit/agent-home.wit`](../wit/agent-home.wit) defines everything an agent can do. It's the only thing an agent can import, so it's also the edge of the sandbox. See [decision 0002](decisions/0002-broker-only-agent-api.md) for why it's a custom API.
 
-The bindings for both sides are generated from this file, and so far nothing behind the calls is implemented. CI builds a [test agent](../examples/api-check/src/lib.rs) that uses every call, and checks what it imports. Running that agent through the bindings, and the version rule below, have only been checked by hand on Wasmtime 50, until [#9](https://github.com/kashmithnisakya/habitat/issues/9) runs agents for real.
+The bindings for both sides are generated from this file. CI builds a [test agent](../examples/api-check/src/lib.rs) that uses every call, and checks what it imports.
+
+The file calls, `now-ms` and `random-bytes` work. Everything that needs the broker returns `denied` until the broker exists, and that includes `send-message`. `log` currently drops its messages. The version rule below has only been checked by hand, on Wasmtime 50.
 
 ## What agents can do
 
@@ -52,7 +54,7 @@ A hostile agent shouldn't be able to make the host use a lot of memory, and a no
 - `read-file` and `user-file.read` take an offset and a maximum, so a large file can be read in pieces.
 - `http-response.body` is a `byte-stream`, which is also read in pieces of a chosen size. Dropping it cancels the download.
 
-The host sets its own maximum for each call, and returns `limit-exceeded` above it. Those maximums will be chosen when the calls are implemented.
+The host caps each read and can return less than the agent asked for, so an agent has to keep reading until there's nothing left. `read-file` returns at most 1 MB per call, `list-dir` fails with `limit-exceeded` above 10,000 entries, and `random-bytes` fails above 1 KB. The other maximums will be chosen when those calls are implemented.
 
 `write-file` still replaces a whole file in one call, because that's what makes writes atomic. That means a file can't be larger than what the agent can hold in memory.
 

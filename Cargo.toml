@@ -6,6 +6,7 @@ members = [
     "crates/sdk",
     "crates/cli",
     "examples/api-check",
+    "examples/file-agent",
 ]
 resolver = "3"
 

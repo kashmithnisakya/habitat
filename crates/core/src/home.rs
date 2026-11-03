@@ -5,13 +5,13 @@
 //! directory for a symlink during an operation therefore can't lead outside the home.
 
 use std::fs::DirBuilder;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, Metadata, OpenOptions, OpenOptionsExt};
+use cap_std::fs::{Dir, File, Metadata, OpenOptions, OpenOptionsExt};
 
 use crate::manifest::is_agent_name;
 
@@ -27,6 +27,8 @@ const PACKAGE_HASH_FILE: &str = "package.sha256";
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_NAME_BYTES: usize = 255;
 const MAX_PATH_DEPTH: usize = 32;
+/// The most entries that one directory listing returns. It keeps a listing from using a lot of memory.
+const MAX_LIST_ENTRIES: usize = 10_000;
 /// Counted for every file and directory, so that empty files can't fill the disk.
 const ENTRY_COST: u64 = 4096;
 
@@ -44,6 +46,8 @@ pub enum HomeError {
     NotAFile,
     /// This would take the home over its disk limit.
     DiskLimit { needed: u64, limit: u64 },
+    /// A directory has more entries than can be listed at once.
+    TooManyEntries { limit: usize },
     /// The host's file system failed.
     Io(io::ErrorKind),
 }
@@ -57,6 +61,9 @@ impl std::fmt::Display for HomeError {
             Self::NotAFile => write!(f, "not a file"),
             Self::DiskLimit { needed, limit } => {
                 write!(f, "disk limit exceeded: needs {needed} bytes of {limit}")
+            }
+            Self::TooManyEntries { limit } => {
+                write!(f, "too many entries to list: the limit is {limit}")
             }
             Self::Io(kind) => write!(f, "file system error: {kind}"),
         }
@@ -136,6 +143,22 @@ impl AgentStorage {
     }
 }
 
+/// What kind of thing a [`HomeEntry`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Directory,
+}
+
+/// One item in a directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeEntry {
+    pub name: String,
+    pub kind: EntryKind,
+    /// The file's size in bytes, which is always 0 for a directory.
+    pub size: u64,
+}
+
 /// An agent's files. Agents can only name things inside the home.
 ///
 /// Only one `Home` should be open for an agent at a time, because each keeps its own count of the
@@ -172,23 +195,7 @@ impl Home {
 
     /// Reads a whole file.
     pub fn read(&self, path: &str) -> Result<Vec<u8>, HomeError> {
-        let (parents, name) = parse_path(path)?;
-        let dir = self.open_parents(&parents)?;
-
-        // Non-blocking, so that opening a named pipe can't hang the host.
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .follow(FollowSymlinks::No)
-            .custom_flags(libc::O_NONBLOCK);
-        let mut file = dir.open_with(name, &options)?;
-        let metadata = file.metadata()?;
-        if metadata.is_dir() {
-            return Err(HomeError::NotAFile);
-        }
-        if !metadata.is_file() {
-            return Err(HomeError::Denied);
-        }
+        let (mut file, metadata) = self.open_file(path)?;
         if metadata.len() > self.disk_limit {
             return Err(HomeError::DiskLimit {
                 needed: metadata.len(),
@@ -206,6 +213,78 @@ impl Home {
             });
         }
         Ok(data)
+    }
+
+    /// Reads up to `max_bytes` from `offset`. Returns nothing at or past the end of the file.
+    pub fn read_at(&self, path: &str, offset: u64, max_bytes: usize) -> Result<Vec<u8>, HomeError> {
+        let (mut file, metadata) = self.open_file(path)?;
+        if offset >= metadata.len() {
+            return Ok(Vec::new());
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut data = Vec::new();
+        Read::take(&mut file, max_bytes as u64).read_to_end(&mut data)?;
+        Ok(data)
+    }
+
+    fn open_file(&self, path: &str) -> Result<(File, Metadata), HomeError> {
+        let (parents, name) = parse_path(path)?;
+        let dir = self.open_parents(&parents)?;
+
+        // Non-blocking, so that opening a named pipe can't hang the host.
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .custom_flags(libc::O_NONBLOCK);
+        let file = dir.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            return Err(HomeError::NotAFile);
+        }
+        if !metadata.is_file() {
+            return Err(HomeError::Denied);
+        }
+        Ok((file, metadata))
+    }
+
+    /// Lists a directory, sorted by name. An empty path means the home itself. Anything that isn't
+    /// a regular file or directory is left out, since agents can't create those or use them.
+    pub fn list(&self, path: &str) -> Result<Vec<HomeEntry>, HomeError> {
+        let dir = if path.is_empty() {
+            self.root.try_clone()?
+        } else {
+            let (parents, name) = parse_path(path)?;
+            open_child(&self.open_parents(&parents)?, name)?
+        };
+
+        let mut entries = Vec::new();
+        for entry in dir.entries()? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let kind = if file_type.is_file() {
+                EntryKind::File
+            } else if file_type.is_dir() {
+                EntryKind::Directory
+            } else {
+                continue;
+            };
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if entries.len() == MAX_LIST_ENTRIES {
+                return Err(HomeError::TooManyEntries {
+                    limit: MAX_LIST_ENTRIES,
+                });
+            }
+            let size = match kind {
+                EntryKind::File => entry.metadata()?.len(),
+                EntryKind::Directory => 0,
+            };
+            entries.push(HomeEntry { name, kind, size });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
     }
 
     /// Replaces a whole file, creating it and its parent directories if needed. If the host
@@ -468,6 +547,115 @@ mod tests {
         fn temp_path(&self) -> PathBuf {
             self.storage.path.join(TEMP_DIR)
         }
+    }
+
+    #[test]
+    fn reading_part_of_a_file() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("dir/file", b"0123456789").unwrap();
+
+        assert_eq!(home.read_at("dir/file", 0, 4).unwrap(), b"0123");
+        assert_eq!(home.read_at("dir/file", 4, 4).unwrap(), b"4567");
+        assert_eq!(home.read_at("dir/file", 8, 4).unwrap(), b"89");
+        assert_eq!(home.read_at("dir/file", 0, 0).unwrap(), b"");
+        assert_eq!(home.read_at("dir/file", 9, 100).unwrap(), b"9");
+        for past_the_end in [10, 11, u64::MAX] {
+            assert_eq!(home.read_at("dir/file", past_the_end, 4).unwrap(), b"");
+        }
+    }
+
+    #[test]
+    fn reading_part_of_a_file_follows_the_same_rules() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("dir/file", b"x").unwrap();
+        symlink(
+            fixture.outside.join("secret"),
+            fixture.home_path().join("link"),
+        )
+        .unwrap();
+
+        assert_eq!(home.read_at("missing", 0, 4), Err(HomeError::NotFound));
+        assert_eq!(home.read_at("dir", 0, 4), Err(HomeError::NotAFile));
+        assert_eq!(home.read_at("link", 0, 4), Err(HomeError::Denied));
+        assert!(matches!(
+            home.read_at("../outside/secret", 0, 4),
+            Err(HomeError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn listing_directories() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        assert_eq!(home.list("").unwrap(), []);
+
+        home.write("b.txt", b"12345").unwrap();
+        home.write("a/nested/deep.txt", b"xy").unwrap();
+        home.write("a/top.txt", b"x").unwrap();
+
+        let file = |name: &str, size| HomeEntry {
+            name: name.to_string(),
+            kind: EntryKind::File,
+            size,
+        };
+        let directory = |name: &str| HomeEntry {
+            name: name.to_string(),
+            kind: EntryKind::Directory,
+            size: 0,
+        };
+        assert_eq!(home.list("").unwrap(), [directory("a"), file("b.txt", 5)]);
+        assert_eq!(
+            home.list("a").unwrap(),
+            [directory("nested"), file("top.txt", 1)]
+        );
+        assert_eq!(home.list("a/nested").unwrap(), [file("deep.txt", 2)]);
+    }
+
+    #[test]
+    fn listing_stays_inside_the_home() {
+        let fixture = Fixture::new();
+        let mut home = fixture.home();
+        home.write("file", b"x").unwrap();
+        symlink(&fixture.outside, fixture.home_path().join("link")).unwrap();
+        home.write("real/inner.txt", b"x").unwrap();
+        symlink("real", fixture.home_path().join("inside-link")).unwrap();
+
+        assert_eq!(home.list("inside-link"), Err(HomeError::Denied));
+        assert_eq!(home.list("missing"), Err(HomeError::NotFound));
+        assert_eq!(home.list("file"), Err(HomeError::NotAFile));
+        assert_eq!(home.list("link"), Err(HomeError::Denied));
+        assert_eq!(home.list("link/deeper"), Err(HomeError::Denied));
+        for path in ["..", "../outside", ".", "/", "/etc"] {
+            assert!(
+                matches!(home.list(path), Err(HomeError::InvalidPath(_))),
+                "{path}"
+            );
+        }
+
+        // A symlink doesn't appear in a listing, so it can't reveal what it points to.
+        let names: Vec<_> = home.list("").unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["file", "real"]);
+    }
+
+    #[test]
+    fn listing_stops_at_its_limit() {
+        let fixture = Fixture::new();
+        let home = fixture.home();
+        let path = fixture.home_path();
+        for number in 0..MAX_LIST_ENTRIES {
+            fs::write(path.join(number.to_string()), b"").unwrap();
+        }
+        assert_eq!(home.list("").unwrap().len(), MAX_LIST_ENTRIES);
+
+        fs::write(path.join("one-too-many"), b"").unwrap();
+        assert_eq!(
+            home.list(""),
+            Err(HomeError::TooManyEntries {
+                limit: MAX_LIST_ENTRIES
+            })
+        );
     }
 
     #[test]
