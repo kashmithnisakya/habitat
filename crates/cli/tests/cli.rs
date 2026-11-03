@@ -550,6 +550,89 @@ fn the_user_is_asked_and_only_yes_allows_it() {
 }
 
 #[test]
+fn a_model_is_asked_about_as_a_model() {
+    let fixture = Fixture::new();
+    let mut manifest = fs::read_to_string(fixture.path("agent.toml")).unwrap();
+    manifest = manifest.replace(
+        "disk_mb = 16\n",
+        "disk_mb = 16\nmodel_budget_tokens = 100\n",
+    );
+    manifest.push_str("\n[requests]\nmodels = [\"default\"]\n");
+    fs::write(fixture.path("agent.toml"), manifest).unwrap();
+    fixture.install();
+    let asked = run_answering(&fixture, "ask-model default to summarise", "a\n");
+    succeeds(&asked);
+    assert!(stderr(&asked).contains("is asking to use the AI model default."));
+    assert!(stdout(&fixture.run(&["grants", AGENT])).contains("model    default"));
+}
+
+#[test]
+fn every_request_ends_up_in_a_log_that_checks_out() {
+    let fixture = installed_asking_agent();
+    succeeds(&run_answering(
+        &fixture,
+        "ask-network allowed.example please",
+        "y\n",
+    ));
+    fails_with(
+        &run_answering(&fixture, "ask-network also.example please", "n\n"),
+        3,
+        "the user said no",
+    );
+    let _ = run_answering(&fixture, "ask-network evil.example sk-SECRET-KEY", "");
+
+    let log = fixture.run(&["log", AGENT]);
+    succeeds(&log);
+    let text = stdout(&log);
+    for expected in [
+        "asked for network host allowed.example",
+        "allowed network host allowed.example once",
+        "refused network host also.example",
+        "asked for network host evil.example",
+        "refused network host evil.example",
+        "run ended: completed",
+        "run ended: failed",
+    ] {
+        assert!(text.contains(expected), "{expected} in {text}");
+    }
+    assert!(!text.contains("SECRET"), "{text}");
+
+    let verified = fixture.run(&["log", AGENT, "--verify"]);
+    succeeds(&verified);
+    assert!(
+        stdout(&verified).contains("hasn't been changed"),
+        "{}",
+        stdout(&verified)
+    );
+}
+
+#[test]
+fn a_changed_log_is_reported_and_agents_cant_reach_outside() {
+    let fixture = installed_asking_agent();
+    succeeds(&run_answering(
+        &fixture,
+        "ask-network allowed.example please",
+        "y\n",
+    ));
+    let path = fixture.root().join("agents").join(AGENT).join("audit.db");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, text.replace("allowed.example", "harmless.example")).unwrap();
+    fails_with(
+        &fixture.run(&["log", AGENT, "--verify"]),
+        1,
+        "has been changed",
+    );
+    fails_with(&fixture.run(&["log", AGENT]), 1, "has been changed");
+    // A run that can't log can't get anything.
+    assert_eq!(
+        run_answering(&fixture, "ask-network allowed.example please", "y\n")
+            .status
+            .code(),
+        Some(3)
+    );
+}
+
+#[test]
 fn with_nobody_to_answer_it_means_no() {
     let fixture = installed_asking_agent();
     // `run` gives it no stdin at all.

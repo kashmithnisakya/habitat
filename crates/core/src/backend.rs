@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::home::{AgentStorage, Home};
 use crate::manifest::{Limits, Manifest, printable};
 use crate::package::Package;
+use crate::run_log::RunId;
 
 /// Why an agent ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,11 +88,21 @@ pub trait BrokerFactory: Send + Sync {
         storage: &AgentStorage,
         manifest: &Manifest,
         limits: &RunLimits,
+        run_id: RunId,
     ) -> Box<dyn RunBroker + Send>;
+
+    /// Called when a run has ended, however it ended, with a short description safe to store.
+    fn run_ended(&self, _storage: &AgentStorage, _run_id: RunId, _how: &str) {}
 }
 
 impl BrokerFactory for DenyEverything {
-    fn for_run(&self, _: &AgentStorage, _: &Manifest, _: &RunLimits) -> Box<dyn RunBroker + Send> {
+    fn for_run(
+        &self,
+        _: &AgentStorage,
+        _: &Manifest,
+        _: &RunLimits,
+        _: RunId,
+    ) -> Box<dyn RunBroker + Send> {
         Box::new(Self)
     }
 }

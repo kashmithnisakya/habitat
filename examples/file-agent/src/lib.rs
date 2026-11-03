@@ -62,6 +62,12 @@ impl Guest for Agent {
                     std::hint::black_box(api::now_ms());
                 }
             }
+            "ask-model" => {
+                let target = AccessTarget::Model(first.to_string());
+                api::request_access(&target, rest)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
             "ask-network" => {
                 let target = AccessTarget::NetworkHost(first.to_string());
                 api::request_access(&target, rest)

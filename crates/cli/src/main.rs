@@ -13,6 +13,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use habitat_backend_wasm::WasmBackend;
 use habitat_broker::approval::{Answer, Approver, Prompt};
+use habitat_broker::audit;
 use habitat_broker::broker::Broker;
 use habitat_broker::grants::{list_saved, revoke_saved};
 use habitat_broker::policy::Target;
@@ -99,6 +100,14 @@ enum Command {
         /// The AI model to remove
         #[arg(long, value_name = "NAME", group = "target")]
         model: Option<String>,
+    },
+    /// Shows everything an agent has asked for outside its home, after checking the log
+    Log {
+        /// The agent's name
+        agent: String,
+        /// Only says whether the log has been changed
+        #[arg(long)]
+        verify: bool,
     },
     /// Deletes an agent and all its files
     Remove {
@@ -188,6 +197,7 @@ fn run_command(cli: Cli) -> Result<(), Failure> {
             };
             revoke(&root, &agent, &target)
         }
+        Command::Log { agent, verify } => log(&root, &agent, verify),
         Command::Remove { agent, yes } => remove(&supervisor, &agent, yes),
     }
 }
@@ -477,6 +487,26 @@ fn revoke(root: &Path, agent: &str, target: &Target) -> Result<(), Failure> {
         )));
     }
     say("Revoked. This takes effect on the agent's next request.");
+    Ok(())
+}
+
+fn log(root: &Path, agent: &str, verify_only: bool) -> Result<(), Failure> {
+    let storage = existing_agent(root, agent)?;
+    let entries = audit::verify(&storage).map_err(|error| Failure::general(error.to_string()))?;
+    if verify_only {
+        say(format_args!(
+            "All {} entries check out, so the log hasn't been changed.",
+            entries.len()
+        ));
+        say("Someone who controls this device could still have replaced all of it.");
+        return Ok(());
+    }
+    if entries.is_empty() {
+        say(format_args!("{agent} hasn't asked for anything yet."));
+    }
+    for entry in &entries {
+        say(audit::describe(entry));
+    }
     Ok(())
 }
 
