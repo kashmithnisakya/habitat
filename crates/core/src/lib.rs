@@ -6,5 +6,6 @@ pub mod backend;
 pub mod home;
 pub mod manifest;
 pub mod package;
+mod platform;
 pub mod run_log;
 pub mod supervisor;

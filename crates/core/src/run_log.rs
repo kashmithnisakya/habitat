@@ -9,11 +9,12 @@ use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Event, RunOutcome};
-use crate::home::{AgentStorage, sync_dir};
+use crate::home::AgentStorage;
+use crate::platform;
 
 /// How many runs of each agent are remembered. The oldest are removed first, so that an agent that
 /// runs often can't fill the disk with records. Each one is a few KB at most.
@@ -241,8 +242,8 @@ impl RunLog {
             .write(true)
             .create(true)
             .truncate(true)
-            .follow(FollowSymlinks::No)
-            .mode(0o600);
+            .follow(FollowSymlinks::No);
+        platform::private_file(&mut options);
         let mut file = self.dir.open_with(&temp, &options)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
@@ -250,7 +251,7 @@ impl RunLog {
 
         self.dir
             .rename(&temp, &self.dir, format!("{}{RECORD_EXTENSION}", record.id))?;
-        sync_dir(&self.dir).map_err(|_| io::Error::from(io::ErrorKind::Other))
+        platform::sync_dir(&self.dir)
     }
 
     /// Marks a run that never recorded an ending as interrupted. Only the latest can need this,
@@ -309,10 +310,8 @@ impl RunLog {
     /// an agent from running.
     fn read(&self, id: RunId) -> Option<RunRecord> {
         let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .follow(FollowSymlinks::No)
-            .custom_flags(libc::O_NONBLOCK);
+        options.read(true).follow(FollowSymlinks::No);
+        platform::dont_block(&mut options);
         let file = self
             .dir
             .open_with(format!("{id}{RECORD_EXTENSION}"), &options)
@@ -343,11 +342,11 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::symlink;
 
     use tempfile::TempDir;
 
     use super::*;
+    use crate::platform::test_support::symlink;
 
     const HOSTILE: &str = "\"\n[evil]\nending = \"completed\"";
 

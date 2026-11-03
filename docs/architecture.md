@@ -110,12 +110,13 @@ agents/<agent-id>/
 ├── home/           # Agent's files
 ├── tmp/            # Files being written, which are moved into home/ when complete
 ├── runs/           # A record of each recent run, only the core can write to this
-├── run.lock        # Locked for as long as the agent is running
 ├── grants.db       # Permissions, only the core can write to this
 └── audit.db        # Tamper-evident log, only the core can write to this
 ```
 
 Only `home/` is visible to the agent. See [Agent packages](packages.md) for the package format.
+
+Next to `agents/`, `locks/<agent-id>.lock` is locked for as long as an agent is running. It's outside the agent's folder because Windows can't move a folder with an open file in it, and it stays after an agent is removed, so that the lock always means the same thing.
 
 Removing an agent deletes this whole folder, and is refused while the agent is running. The folder is first moved to a `removed/` folder next to `agents/`, so the agent is gone in one step. If the host dies part way through, a later install under the same name can't inherit what's left of the old agent's home.
 

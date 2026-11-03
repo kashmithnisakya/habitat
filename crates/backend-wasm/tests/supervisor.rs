@@ -321,7 +321,11 @@ fn an_agent_cant_reach_its_records_or_its_lock() {
     let record_file = agent_path(root.path(), &format!("runs/{}.toml", first.id));
     let before = fs::read(&record_file).unwrap();
 
-    for path in [record_path.as_str(), "../run.lock", "../runs/new.toml"] {
+    for path in [
+        record_path.as_str(),
+        "../../../locks/file-agent.lock",
+        "../runs/new.toml",
+    ] {
         assert_completes(&supervisor, &format!("expect-error {path} invalid-request"));
         let record = supervisor
             .run(NAME, &message(&format!("write {path} changed")))

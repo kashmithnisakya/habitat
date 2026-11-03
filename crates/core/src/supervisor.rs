@@ -4,9 +4,8 @@
 //! next run starts normally. See `docs/architecture.md`.
 
 use std::fmt;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -17,6 +16,7 @@ use semver::Version;
 use crate::backend::{Backend, Event, HostLimits, RunOutcome, StopSignal};
 use crate::home::{AgentStorage, HomeError};
 use crate::package::{Package, PackageError};
+use crate::platform;
 use crate::run_log::{RunEnding, RunHistory, RunLog, RunRecord};
 
 /// Why something the supervisor was asked to do didn't happen. Messages hold no host paths.
@@ -73,15 +73,12 @@ struct RunLock {
 
 impl RunLock {
     fn try_acquire(storage: &AgentStorage) -> Result<Self, SupervisorError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(storage.run_lock_path())
-            .map_err(not_recorded)?;
+        let file =
+            platform::open_or_create_no_follow(&storage.run_lock_path()).map_err(not_recorded)?;
+        // On Windows, a link is opened rather than refused.
+        if !file.metadata().map_err(not_recorded)?.is_file() {
+            return Err(SupervisorError::NotRecorded(io::ErrorKind::InvalidInput));
+        }
         match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
             Err(TryLockError::WouldBlock) => Err(SupervisorError::AlreadyRunning),
@@ -321,7 +318,8 @@ impl Drop for ActiveRun<'_> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
@@ -332,6 +330,7 @@ mod tests {
     use super::*;
     use crate::backend::{LoadError, LoadedAgent, RunLimits};
     use crate::home::Home;
+    use crate::platform::test_support::symlink;
     use crate::run_log::{EventKind, MAX_RECORDS, RunId};
 
     const NAME: &str = "agent";
@@ -1137,6 +1136,7 @@ mod tests {
         assert_eq!(supervisor.history(NAME).unwrap().runs, vec![record]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_agent_is_gone_in_one_step_even_if_deleting_its_files_fails() {
         let fixture = Fixture::new();
@@ -1187,6 +1187,19 @@ mod tests {
             release.send(()).unwrap();
             run.join().unwrap().unwrap();
         });
+    }
+
+    /// Windows can't move a folder with an open file in it, so this mustn't hold one open, including
+    /// its lock.
+    #[test]
+    fn an_agent_that_has_run_can_be_removed_and_installed_again() {
+        let fixture = Fixture::new();
+        let supervisor = fixture.supervisor(scripted());
+        supervisor.run(NAME, &message("write")).unwrap();
+        supervisor.history(NAME).unwrap();
+        supervisor.remove(NAME).unwrap();
+        supervisor.install(&package(MANIFEST)).unwrap();
+        supervisor.run(NAME, &message("x")).unwrap();
     }
 
     #[test]

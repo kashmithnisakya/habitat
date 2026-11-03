@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "env"] }
-signal-hook = "0.4.6"
+ctrlc = { version = "3", features = ["termination"] }
 habitat-backend-wasm = { version = "0.0.0", path = "../backend-wasm" }
 habitat-core = { version = "0.0.0", path = "../core" }
 
