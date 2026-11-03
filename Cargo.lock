@@ -1071,6 +1071,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "habitat-attacks"
+version = "0.0.0"
+dependencies = [
+ "habitat-backend-wasm",
+ "habitat-broker",
+ "habitat-core",
+ "tempfile",
+ "wat",
+ "wit-component 0.263.0",
+]
+
+[[package]]
 name = "habitat-backend-wasm"
 version = "0.0.0"
 dependencies = [
@@ -1144,6 +1156,13 @@ version = "0.0.0"
 dependencies = [
  "habitat-sdk",
  "serde",
+]
+
+[[package]]
+name = "habitat-hostile-agent"
+version = "0.0.0"
+dependencies = [
+ "habitat-sdk",
 ]
 
 [[package]]

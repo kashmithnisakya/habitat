@@ -1,0 +1,18 @@
+[package]
+name = "habitat-attacks"
+description = "Attack tests for Habitat, and the harness they use"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+habitat-backend-wasm = { version = "0.0.0", path = "../../crates/backend-wasm" }
+habitat-broker = { version = "0.0.0", path = "../../crates/broker" }
+habitat-core = { version = "0.0.0", path = "../../crates/core" }
+tempfile = "3.27.0"
+wit-component = "0.263.0"
+
+[dev-dependencies]
+wat = "1.263.0"
