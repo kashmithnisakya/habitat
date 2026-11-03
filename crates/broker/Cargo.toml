@@ -9,3 +9,8 @@ publish.workspace = true
 
 [dependencies]
 habitat-core = { version = "0.0.0", path = "../core" }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"

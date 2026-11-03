@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "env"] }
 ctrlc = { version = "3", features = ["termination"] }
+habitat-broker = { version = "0.0.0", path = "../broker" }
 habitat-backend-wasm = { version = "0.0.0", path = "../backend-wasm" }
 habitat-core = { version = "0.0.0", path = "../core" }
 

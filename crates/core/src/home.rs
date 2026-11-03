@@ -34,6 +34,8 @@ const MAX_NAME_BYTES: usize = 255;
 const MAX_PATH_DEPTH: usize = 32;
 /// The most entries that one directory listing returns. It keeps a listing from using a lot of memory.
 const MAX_LIST_ENTRIES: usize = 10_000;
+/// Far more than the most that a valid manifest's requests could need saving.
+const MAX_GRANTS_BYTES: u64 = 1024 * 1024;
 /// Counted for every file and directory, so that empty files can't fill the disk.
 const ENTRY_COST: u64 = 4096;
 
@@ -203,14 +205,66 @@ impl AgentStorage {
     /// The file that's locked for as long as the agent is running. It stays when the agent is
     /// removed, so that the lock means the same thing for a later agent with the same name.
     pub(crate) fn run_lock_path(&self) -> PathBuf {
+        self.locks_dir().join(format!("{}.lock", self.name))
+    }
+
+    fn locks_dir(&self) -> PathBuf {
         let agents = self.path.parent().unwrap_or(&self.path);
         let root = agents.parent().unwrap_or(agents);
-        root.join(LOCKS_DIR).join(format!("{}.lock", self.name))
+        root.join(LOCKS_DIR)
     }
 
     /// The agent's permissions, which only the core can write to.
     pub fn grants_path(&self) -> PathBuf {
         self.path.join(GRANTS_FILE)
+    }
+
+    /// Reads the agent's saved permissions, if there are any. A link is refused.
+    pub fn read_grants(&self) -> io::Result<Option<Vec<u8>>> {
+        let file = match platform::open_no_follow(&self.grants_path()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            other => other?,
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let mut data = Vec::new();
+        file.take(MAX_GRANTS_BYTES + 1).read_to_end(&mut data)?;
+        if data.len() as u64 > MAX_GRANTS_BYTES {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(Some(data))
+    }
+
+    /// Changes the agent's saved permissions, one change at a time, even across processes. `change`
+    /// gets what's saved, and returns what to save instead. A crash leaves one or the other.
+    pub fn update_grants<E: From<io::Error>>(
+        &self,
+        change: impl FnOnce(Option<Vec<u8>>) -> Result<Vec<u8>, E>,
+    ) -> Result<(), E> {
+        let lock = platform::open_or_create_no_follow(
+            &self.locks_dir().join(format!("{}.grants.lock", self.name)),
+        )?;
+        if !lock.metadata()?.is_file() {
+            return Err(io::Error::from(io::ErrorKind::InvalidData).into());
+        }
+        // Only ever held for a moment, and the system lets go of it if this process dies.
+        lock.lock()?;
+
+        let data = change(self.read_grants()?)?;
+        if data.len() as u64 > MAX_GRANTS_BYTES {
+            return Err(io::Error::from(io::ErrorKind::InvalidData).into());
+        }
+        let path = self.grants_path();
+        let temp = path.with_extension("new");
+        // Left by a crash, and it was never in use.
+        if temp.symlink_metadata().is_ok() {
+            fs::remove_file(&temp)?;
+        }
+        platform::write_new_file(&temp, &data, false)?;
+        fs::rename(&temp, &path)?;
+        platform::sync_dir_path(&self.path)?;
+        Ok(())
     }
 
     /// The agent's tamper-evident log, which only the core can write to.
