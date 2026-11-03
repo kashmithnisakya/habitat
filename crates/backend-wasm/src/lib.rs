@@ -9,7 +9,9 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use habitat_core::backend::{Backend, Event, LoadError, LoadedAgent, RunLimits, RunOutcome};
+use habitat_core::backend::{
+    Backend, Event, LoadError, LoadedAgent, RunLimits, RunOutcome, RunOutput,
+};
 use habitat_core::home::Home;
 use habitat_core::package::Package;
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -109,7 +111,7 @@ impl Ticker {
 }
 
 impl LoadedAgent for WasmAgent {
-    fn run(&self, event: &Event, home: Home, limits: &RunLimits) -> RunOutcome {
+    fn run(&self, event: &Event, home: Home, limits: &RunLimits) -> RunOutput {
         // A new store each time, so that nothing in memory carries over between runs, even after
         // a crash.
         let mut store = Store::new(&self.engine, HostState::new(home, limits.memory_bytes));
@@ -126,14 +128,17 @@ impl LoadedAgent for WasmAgent {
             }
         });
         let Ok(_ticker) = Ticker::start(self.engine.clone()) else {
-            return RunOutcome::Internal("the run couldn't be timed".to_string());
+            return RunOutput {
+                outcome: RunOutcome::Internal("the run couldn't be timed".to_string()),
+                messages: Vec::new(),
+            };
         };
 
         let result = self
             .agent
             .instantiate(&mut store)
             .and_then(|agent| agent.call_handle_event(&mut store, &to_api_event(event)));
-        match result {
+        let outcome = match result {
             Ok(Ok(())) => RunOutcome::Completed,
             Ok(Err(message)) => RunOutcome::failed(&message),
             Err(error) => {
@@ -152,6 +157,10 @@ impl LoadedAgent for WasmAgent {
                     ))
                 }
             }
+        };
+        RunOutput {
+            outcome,
+            messages: store.into_data().into_messages(),
         }
     }
 }

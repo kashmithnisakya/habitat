@@ -49,6 +49,13 @@ impl Guest for Agent {
             "call-host-forever" => loop {
                 std::hint::black_box(api::now_ms());
             },
+            "say" => api::send_message(rest).map_err(|error| error.to_string()),
+            "say-then-panic" => {
+                api::send_message(rest).map_err(|error| error.to_string())?;
+                panic!("told to")
+            }
+            "say-many" => say_many(first),
+            "say-big" => say_big(first),
             "fail" => Err(rest.to_string()),
             "panic" => panic!("told to"),
             other => Err(format!("unknown command: {other}")),
@@ -57,6 +64,19 @@ impl Guest for Agent {
 }
 
 static mut MEMORY: u32 = 0;
+
+fn say_many(count: &str) -> Result<(), String> {
+    let count: usize = count.parse().map_err(|_| "bad count".to_string())?;
+    for index in 0..count {
+        api::send_message(&index.to_string()).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn say_big(bytes: &str) -> Result<(), String> {
+    let bytes: usize = bytes.parse().map_err(|_| "bad size".to_string())?;
+    api::send_message(&"x".repeat(bytes)).map_err(|error| error.to_string())
+}
 
 /// Allocates and touches this many MB, and frees them again.
 fn allocate(megabytes: &str) -> Result<(), String> {
@@ -189,8 +209,7 @@ fn expect_denied_outside() -> Result<(), String> {
     )?;
     let file = api::pick_user_file("testing");
     denied(file.err().ok_or("pick-user-file worked")?, "pick-user-file")?;
-    let message = api::send_message("hello");
-    denied(message.err().ok_or("send-message worked")?, "send-message")
+    Ok(())
 }
 
 fn check_clock_and_random() -> Result<(), String> {

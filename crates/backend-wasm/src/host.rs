@@ -5,6 +5,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use habitat_core::backend::plain_text;
 use habitat_core::home::{EntryKind as HomeEntryKind, Home, HomeError as StoreError};
 use wasmtime::component::Resource;
 use wasmtime::{ResourceLimiter, Result};
@@ -20,6 +21,10 @@ use crate::bindings::habitat::host::types::{
 const MAX_READ_BYTES: u32 = 1024 * 1024;
 /// The most random bytes that one call returns.
 const MAX_RANDOM_BYTES: u32 = 1024;
+/// The most messages that one run can send. This stands in for the broker's rate limit until it exists.
+const MAX_MESSAGES: usize = 32;
+/// The longest message an agent can send, so that one run can't hold much of the host's memory.
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// How much one element of a table counts for, since tables use the host's memory too.
 const TABLE_ELEMENT_BYTES: u64 = 8;
@@ -90,6 +95,7 @@ impl ResourceLimiter for Limiter {
 pub(crate) struct HostState {
     home: Home,
     limiter: Limiter,
+    messages: Vec<String>,
 }
 
 impl HostState {
@@ -101,7 +107,13 @@ impl HostState {
                 used: 0,
                 hit_limit: false,
             },
+            messages: Vec::new(),
         }
+    }
+
+    /// What the agent asked to show the user during this run.
+    pub(crate) fn into_messages(self) -> Vec<String> {
+        self.messages
     }
 
     pub(crate) fn limiter(&mut self) -> &mut dyn ResourceLimiter {
@@ -184,8 +196,19 @@ impl agent_home::Host for HostState {
         Ok(bytes)
     }
 
-    fn send_message(&mut self, _text: String) -> Result<(), HomeError> {
-        needs_broker()
+    fn send_message(&mut self, text: String) -> Result<(), HomeError> {
+        if text.len() > MAX_MESSAGE_BYTES {
+            return Err(HomeError::LimitExceeded(format!(
+                "a message can be at most {MAX_MESSAGE_BYTES} bytes"
+            )));
+        }
+        if self.messages.len() >= MAX_MESSAGES {
+            return Err(HomeError::LimitExceeded(format!(
+                "a run can send at most {MAX_MESSAGES} messages"
+            )));
+        }
+        self.messages.push(plain_text(&text));
+        Ok(())
     }
 
     fn log(&mut self, _level: LogLevel, _message: String) {}
