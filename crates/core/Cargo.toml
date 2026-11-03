@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 cap-fs-ext = "4.0.3"
 cap-std = "4.0.3"
+getrandom = "0.4.3"
 libc = "0.2.191"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }

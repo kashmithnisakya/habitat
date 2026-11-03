@@ -23,6 +23,8 @@ const TEMP_DIR: &str = "tmp";
 const GRANTS_FILE: &str = "grants.db";
 const AUDIT_FILE: &str = "audit.db";
 const PACKAGE_HASH_FILE: &str = "package.sha256";
+const RUN_LOCK_FILE: &str = "run.lock";
+const RUNS_FILE: &str = "runs.log";
 
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_NAME_BYTES: usize = 255;
@@ -110,9 +112,44 @@ impl AgentStorage {
         })
     }
 
+    /// Opens an agent's folder only if it's already there, so that a mistyped name creates nothing.
+    pub fn open_existing(root: &Path, agent_name: &str) -> Result<Self, HomeError> {
+        if !is_agent_name(agent_name) {
+            return Err(HomeError::InvalidPath("not a valid agent name"));
+        }
+        let path = root.join(AGENTS_DIR).join(agent_name);
+        if !path.symlink_metadata()?.is_dir() {
+            return Err(HomeError::NotFound);
+        }
+        Ok(Self {
+            name: agent_name.to_string(),
+            path,
+        })
+    }
+
+    /// The folder that holds every agent's folder under `root`.
+    pub(crate) fn agents_dir(root: &Path) -> PathBuf {
+        root.join(AGENTS_DIR)
+    }
+
+    /// The agent's whole folder.
+    pub(crate) fn folder(&self) -> &Path {
+        &self.path
+    }
+
     /// The name of the agent this folder belongs to.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The file that's locked for as long as the agent is running.
+    pub fn run_lock_path(&self) -> PathBuf {
+        self.path.join(RUN_LOCK_FILE)
+    }
+
+    /// The record of the agent's runs, which only the core can write to.
+    pub fn runs_path(&self) -> PathBuf {
+        self.path.join(RUNS_FILE)
     }
 
     /// Opens the agent's home, with the given limit on the space it can use.

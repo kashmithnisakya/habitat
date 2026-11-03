@@ -81,6 +81,10 @@ Agents are event-based. Each run follows the same steps:
 
 This fits phones, which can pause or stop apps at any time. If a run crashes or hits a limit, the supervisor stops it, logs what happened and keeps the last saved state. Writes must be atomic, so a crash can't leave half-written state.
 
+Each agent has one run at a time. A run holds a lock on `run.lock`, which the system releases when the process dies, so a killed run can't block the next one. An agent can't be removed during a run.
+
+Each run gets an ID and is written to `runs.log` before it starts, and again when it ends. A run that started and never ended was interrupted by the host stopping. The log holds outcomes only, never what the user or the agent said. It stays a bounded size, and it's separate from the planned tamper-evident audit log.
+
 ## Backends
 
 The core talks to a backend through two small traits in [`crates/core/src/backend.rs`](../crates/core/src/backend.rs), so that a microVM backend could be added later. `Backend::load` checks a package's code and prepares it. `LoadedAgent::run` runs it for one event, and reports how the run ended.
@@ -97,6 +101,8 @@ agents/<agent-id>/
 ├── package.sha256  # Hash of the installed package, used to detect changes to it
 ├── home/           # Agent's files
 ├── tmp/            # Files being written, which are moved into home/ when complete
+├── run.lock        # Held for as long as the agent is in use
+├── runs.log        # Record of each run's outcome, only the core can write to this
 ├── grants.db       # Permissions, only the core can write to this
 └── audit.db        # Tamper-evident log, only the core can write to this
 ```
