@@ -417,6 +417,22 @@ mod tests {
     }
 
     #[test]
+    fn a_request_is_refused_if_logging_starts_failing_part_way_through_a_run() {
+        let fixture = Fixture::new();
+        let approver = Scripted::new(Answer::Allow(Lifetime::UntilRevoked));
+        let mut broker = fixture.run(approver.clone());
+        broker.request_access(&host("a.example"), "please").unwrap();
+        // A folder where the next write of the log's position goes, so that it can't happen.
+        let blocked = fixture.storage.audit_path().with_extension("head-new");
+        fs::create_dir(&blocked).unwrap();
+        assert_eq!(
+            broker.request_access(&host("b.example"), "please"),
+            Err(AccessRefused::Internal)
+        );
+        assert_eq!(approver.times_asked(), 1);
+    }
+
+    #[test]
     fn a_flood_of_requests_stops_at_the_limit() {
         let fixture = Fixture::new();
         let manifest = Manifest::parse(MANIFEST).unwrap();

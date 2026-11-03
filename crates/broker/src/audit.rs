@@ -475,6 +475,73 @@ mod tests {
         }
     }
 
+    /// Rewrites the whole log with a change, with all the hashes made to match, as someone who
+    /// knows how it works would. This leaves only what's inside the entries to catch it.
+    fn forge(fixture: &Fixture, change: impl Fn(&str, usize) -> String) {
+        let mut previous = FIRST_HASH.to_string();
+        let mut lines = Vec::new();
+        for (index, line) in fixture.lines().iter().enumerate() {
+            let (_, body) = line.split_once(' ').unwrap();
+            let mut entry: serde_json::Value = serde_json::from_str(body).unwrap();
+            entry["previous"] = serde_json::Value::String(previous.clone());
+            let body = change(&serde_json::to_string(&entry).unwrap(), index);
+            previous = hash_of(&body);
+            lines.push(format!("{previous} {body}"));
+        }
+        fixture.write_lines(&lines);
+        write_head(&fixture.storage.audit_path(), lines.len() as u64, &previous).unwrap();
+    }
+
+    #[test]
+    fn a_forged_log_with_nothing_changed_still_checks_out() {
+        let fixture = Fixture::new();
+        forge(&fixture, |body, _| body.to_string());
+        assert_eq!(verify(&fixture.storage).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn entries_that_dont_count_up_are_detected_even_with_matching_hashes() {
+        let fixture = Fixture::new();
+        forge(&fixture, |body, index| {
+            if index == 1 {
+                body.replace("\"number\":2", "\"number\":7")
+            } else {
+                body.to_string()
+            }
+        });
+        fixture.assert_tampered();
+    }
+
+    #[test]
+    fn unknown_fields_are_detected_even_with_matching_hashes() {
+        let fixture = Fixture::new();
+        forge(&fixture, |body, _| body.replacen('{', "{\"extra\":1,", 1));
+        fixture.assert_tampered();
+    }
+
+    #[test]
+    fn hostile_text_in_a_forged_log_is_still_cleaned_when_shown() {
+        let fixture = Fixture::new();
+        forge(&fixture, |body, _| {
+            body.replace(".example", "\\u001b[31m.example")
+        });
+        let entries = verify(&fixture.storage).unwrap();
+        for entry in &entries {
+            let text = describe(entry);
+            assert!(!text.contains('\x1b'), "{text:?}");
+            assert!(
+                text.is_ascii() && !text.chars().any(char::is_control),
+                "{text:?}"
+            );
+        }
+        // It really did get through to here with the escape in it.
+        assert!(
+            format!("{:?}", entries[0].event).contains("\\u{1b}"),
+            "{:?}",
+            entries[0]
+        );
+    }
+
     #[test]
     fn a_log_reads_back_what_was_added() {
         let fixture = Fixture::new();
