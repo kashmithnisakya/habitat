@@ -74,6 +74,74 @@ Network hosts must be lowercase and contain a dot. Schemes, ports, paths and wil
 | Read a user file outside the home | Always asks, and the user chooses one file for the current run |
 | Read a raw secret | Never allowed |
 
+The [policy engine](../crates/broker/src/policy.rs) makes these decisions, and it's tested against this table. It holds no I/O, and anything that the table doesn't cover is denied. A few more details:
+
+- **Malformed requests are denied first.** A target has to follow the same rules as the manifest, and it has to match a declared name exactly. For example, `API.GITHUB.COM` and `api.github.com.` aren't `api.github.com`.
+- **A grant only counts while it's declared.** If a package no longer lists something, an old grant for it stops working.
+- **There's no asking for something that can't happen.** A run that has used up its token budget is denied, instead of prompting the user.
+
+## Approval prompts
+
+An agent can't change what a prompt asks, only fill in two places: what it's asking for, which has to be a name that its manifest declares, and its reason, which is labelled as its own claim. Anything in these that a terminal would act on is replaced, and they're cut short. The shell draws the prompt, and [`approval.rs`](../crates/broker/src/approval.rs) doesn't depend on which shell it is.
+
+- **Only a clear yes counts.** No answer within 2 minutes, no shell to ask or an answer that isn't recognised all mean no.
+- **Refused means refused.** In one run, something the user said no to isn't asked about again.
+- **Each run can ask 5 times at most.** After that, requests are denied without asking, so a user can't be worn down.
+
+These have some limits:
+
+- **The limit is per run, so an agent can try again in its next run.** Nothing limits prompts across runs yet.
+- **A prompt can make a run overrun its time limit,** because the time limit can't stop a call that's waiting on the host. It's stopped as soon as the prompt is answered or times out.
+- **Text on a terminal can be misread.** An agent's reason can still say untrue things, so it's labelled as a claim.
+
+## User files
+
+An agent can ask the user to choose a file, if its manifest has `files = "ask"`. It gets a handle to that one file, with its name and what's in it, and never its folder or path. The handle lasts until the run ends. Choosing nothing means no. `habitat run` asks for a path to be typed in, and the Android app will use the system's file picker.
+
+A link is refused, because what it leads to may not be what the user meant. The audit log records that a file was given, but not its name, which can be private.
+
+## Data-leak rule
+
+An agent that's been tricked, such as by text in a web page, could send private data to somewhere it's already allowed to reach. So once a run has been given a user's file, anywhere it wants to reach from then on needs a fresh approval, even with a grant until revoked. The prompt says why. This applies to network hosts and AI models, and to each hop of a redirect. Somewhere approved after that can be used again in the same run. A new run starts fresh.
+
+**This reduces the risk, but doesn't remove it.** See the [threat model](threat-model.md#known-weak-spots).
+
+## Secrets
+
+API keys are kept in the operating system's keystore, which is the keychain on a Mac, Credential Manager on Windows and the Secret Service on Linux. Without one, there are no secrets, and nothing falls back to a file.
+
+```bash
+habitat secret add anthropic --host api.anthropic.com --header x-api-key
+```
+
+```bash
+habitat secret list
+```
+
+```bash
+habitat secret remove anthropic
+```
+
+- **An agent can never read one.** Nothing in the agent API returns a secret. The core adds it to requests that the core itself makes.
+- **Each is bound to exact hosts.** A secret can't be sent anywhere else, and the check is for an exact name.
+- **It can only go in a header meant for credentials,** which are `authorization`, `x-api-key` and `api-key`. It can't be set up to go in one that a server might echo back.
+- **A value is never on the command line,** where other programs could see it. It's asked for without being shown, or read from a pipe.
+- **A secret isn't replaced by adding it again.** Remove it first, so that a mistake can't change where a key goes.
+
+Secrets belong to the user, not to one agent. Anything that can run as the user can ask the keystore for them, and on a Mac, the first use asks the user to allow it.
+
+## AI models
+
+An agent asks for a model by name, and the core makes the request and adds the key itself, so the agent never holds it. It only gets the text as it arrives. `default` means the host's choice, which is `claude-opus-5-5` today. Any other name has to start with `claude-`, because only one provider is supported so far, and it has to be listed in the manifest as well.
+
+Add the key with `habitat secret add anthropic --host api.anthropic.com --header x-api-key`.
+
+- **The token budget is checked before each request,** and a request can't ask for more than is left. Actual usage comes from the provider, including input tokens, so the last request can go over. Nothing more goes out after that.
+- **Nothing an agent says to a model is logged,** only which model and how many tokens.
+- **Provider errors are clear, and hold nothing from the provider,** which could mention the key.
+- **A hosted model counts as somewhere that data goes,** so the data-leak rule applies.
+- **Fallbacks are on.** If a safety classifier declines a request, the provider can retry on another model, which can cost more. If it still declines, the agent gets `denied`.
+
 ## Grant lifetimes
 
 | Lifetime | Meaning |
@@ -81,3 +149,11 @@ Network hosts must be lowercase and contain a dot. Schemes, ports, paths and wil
 | Once | Covers a single request |
 | This run | Ends when the current run exits |
 | Until revoked | Lasts until the user removes it |
+
+The [grant store](../crates/broker/src/grants.rs) keeps these as follows:
+
+- **Once and this run are only ever in memory,** so no crash can make one outlive its run. A "once" grant is used up as soon as the request it covers is allowed.
+- **Until revoked is saved in `grants.db`,** which is outside the agent's home, and read again for every request. So revoking one takes effect on the next request, even from another process. If the file can't be read, nothing in it counts.
+- **A grant is for one exact name.** A grant for `api.github.com` doesn't cover `github.com` or `uploads.github.com`.
+- **`habitat grants <agent>` lists what's saved, and `habitat revoke <agent> --network <host>` or `--model <name>` removes it.** Once and this-run grants belong to a run in another process, so these commands can't see or revoke them. They end with the run anyway.
+- **Anyone who can write to the agent's folder can add a grant.** This keeps agents out, not other programs running as the same user.

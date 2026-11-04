@@ -45,7 +45,11 @@ A package is rejected if it:
 - has an invalid manifest
 - has an `agent.wasm` that doesn't start with the WebAssembly component header
 
-The component header check is only a quick one. The component is fully validated when it's compiled on the device, which isn't built yet ([#9](https://github.com/kashmithnisakya/habitat/issues/9)).
+The component header check is only a quick one. The component is fully validated when the backend loads it, which is also when it's checked against the [limits on compiling](compile-costs.md#the-limits). Those limits refuse a package that's too costly to compile, however small it is. In particular, a package can hold up to 128 MB in total but only 16 MB of code, and it can't contain nested components.
+
+## Making a package
+
+`habitat pack` makes a package from an `agent.toml` and a WebAssembly component, and applies the same checks as reading one. It won't overwrite a file that's already there. See [getting started](../README.md#getting-started) for an example.
 
 ## Installing
 

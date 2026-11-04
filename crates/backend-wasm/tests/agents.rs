@@ -1,21 +1,27 @@
 //! Runs real components through the backend. These need the `wasm32-unknown-unknown` target,
 //! because they build the sample agent in `examples/file-agent`.
 
-use std::env;
+mod support;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{OnceLock, mpsc};
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use habitat_backend_wasm::WasmBackend;
+use habitat_backend_wasm::code_shape::CodeShape;
+use habitat_backend_wasm::compile_limits::CompileLimits;
 use habitat_core::backend::{
-    Backend, Event, HostLimits, LoadError, LoadedAgent, RunLimits, RunOutcome,
+    AccessRefused, Backend, DenyEverything, Event, FetchError, FetchRequest, FetchResponse,
+    HostLimits, Lifetime, LoadError, LoadedAgent, ModelAnswer, ModelRequest, ModelRole, RunBroker,
+    RunLimits, RunOutcome, StopSignal, Target, TokenUsage,
 };
 use habitat_core::home::{AgentStorage, Home};
 use habitat_core::package::Package;
 use tempfile::TempDir;
+
+use support::file_agent_code;
 
 const MANIFEST: &str = "[agent]\nname = \"file-agent\"\nversion = \"0.1.0\"\n\n[limits]\nmemory_mb = 64\nrun_seconds = 10\ndisk_mb = 1\n";
 const MB: u64 = 1024 * 1024;
@@ -80,49 +86,6 @@ fn component_with_memory_pages(pages: u32) -> Vec<u8> {
     ))
 }
 
-fn file_agent_code() -> &'static [u8] {
-    static CODE: OnceLock<Vec<u8>> = OnceLock::new();
-    CODE.get_or_init(|| {
-        // For a test run on a device, where the agent was built beforehand.
-        if let Ok(path) = env::var("HABITAT_TEST_AGENT") {
-            return fs::read(path).unwrap();
-        }
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        // Its own folder, so that this can't wait on the build that's running these tests.
-        let target_dir: PathBuf = root.join("target/test-agents");
-        let output = Command::new(env::var("CARGO").unwrap_or("cargo".to_string()))
-            .current_dir(&root)
-            .args([
-                "build",
-                "-p",
-                "habitat-file-agent",
-                "--release",
-                "--target",
-                "wasm32-unknown-unknown",
-                "--target-dir",
-            ])
-            .arg(&target_dir)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "couldn't build the sample agent. If the target is missing, run \
-             `rustup target add wasm32-unknown-unknown`.\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let module =
-            fs::read(target_dir.join("wasm32-unknown-unknown/release/habitat_file_agent.wasm"))
-                .unwrap();
-        wit_component::ComponentEncoder::default()
-            .module(&module)
-            .unwrap()
-            .validate(true)
-            .encode()
-            .unwrap()
-    })
-}
-
 struct Fixture {
     _root: TempDir,
     storage: AgentStorage,
@@ -134,6 +97,27 @@ impl Fixture {
         let root = TempDir::new().unwrap();
         let storage = AgentStorage::open(root.path(), "file-agent").unwrap();
         let agent = load(code).unwrap();
+        Self {
+            _root: root,
+            storage,
+            agent,
+        }
+    }
+
+    /// For testing that the limits on a run hold even for a component that gets past the limits
+    /// on compiling, or that a host has chosen to allow.
+    fn past_the_compile_limits(code: Vec<u8>) -> Self {
+        let root = TempDir::new().unwrap();
+        let storage = AgentStorage::open(root.path(), "file-agent").unwrap();
+        let mut backend = WasmBackend::new().unwrap();
+        backend.set_compile_limits(CompileLimits {
+            memories: u64::MAX,
+            table_entries: u64::MAX,
+            ..CompileLimits::default()
+        });
+        let agent = backend
+            .load(&Package::new(MANIFEST, code).unwrap())
+            .unwrap();
         Self {
             _root: root,
             storage,
@@ -162,6 +146,8 @@ impl Fixture {
             &Event::UserMessage(message.to_string()),
             self.home(),
             limits,
+            &StopSignal::default(),
+            Box::new(DenyEverything),
         )
     }
 
@@ -181,6 +167,36 @@ fn load_error(code: Vec<u8>) -> LoadError {
         Ok(_) => panic!("the component loaded"),
         Err(error) => error,
     }
+}
+
+#[test]
+fn the_sample_agent_is_far_within_the_compile_limits() {
+    let limits = CompileLimits::default();
+    let shape = CodeShape::of(file_agent_code()).unwrap();
+    assert_eq!(limits.broken_by(&shape), None);
+
+    // None of its limits should be close, or a real agent would soon run into them.
+    let far_tighter = CompileLimits {
+        time: limits.time,
+        nested_components: 0,
+        modules: limits.modules / 4,
+        functions: limits.functions / 4,
+        code_bytes: limits.code_bytes / 4,
+        function_bytes: limits.function_bytes / 4,
+        work: limits.work / 4,
+        nested_loops: limits.nested_loops / 4,
+        function_loops: limits.function_loops / 4,
+        function_branch_points: limits.function_branch_points / 4,
+        function_block_values: limits.function_block_values / 4,
+        instance_imports: limits.instance_imports / 4,
+        memories: limits.memories / 4,
+        table_entries: limits.table_entries / 4,
+        canonical_functions: limits.canonical_functions / 4,
+        declarations: limits.declarations / 4,
+        declaration_bytes: limits.declaration_bytes / 4,
+        signature_values: limits.signature_values / 4,
+    };
+    assert_eq!(far_tighter.broken_by(&shape), None, "{shape:?}");
 }
 
 #[test]
@@ -217,7 +233,15 @@ fn files_persist_between_runs_but_memory_does_not() {
 #[test]
 fn the_agent_is_told_what_kind_of_event_it_is() {
     let fixture = Fixture::file_agent();
-    let run = |event: Event| fixture.agent.run(&event, fixture.home(), &roomy_limits());
+    let run = |event: Event| {
+        fixture.agent.run(
+            &event,
+            fixture.home(),
+            &roomy_limits(),
+            &StopSignal::default(),
+            Box::new(DenyEverything),
+        )
+    };
     let scheduled = |name: &str| Event::Scheduled(name.to_string());
     assert_eq!(run(scheduled("expect-scheduled")), RunOutcome::Completed);
     assert_ne!(run(scheduled("expect-user-message")), RunOutcome::Completed);
@@ -236,7 +260,10 @@ fn an_agent_cant_leave_its_home() {
     let fixture = Fixture::file_agent();
     let outside = fixture.home_path().with_file_name("grants.db");
     fs::write(&outside, "secret").unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, fixture.home_path().join("link")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&outside, fixture.home_path().join("link")).unwrap();
 
     fixture.ok("expect-error ../grants.db invalid-request");
     fixture.ok("expect-error ../../../../../etc/passwd invalid-request");
@@ -260,6 +287,8 @@ fn the_disk_limit_applies_to_agents() {
         &Event::UserMessage("write a.txt hello".to_string()),
         small_home,
         &roomy_limits(),
+        &StopSignal::default(),
+        Box::new(DenyEverything),
     );
     let RunOutcome::Failed(message) = outcome else {
         panic!("the write wasn't refused: {outcome:?}");
@@ -670,7 +699,7 @@ fn several_memories_share_one_limit() {
 fn large_tables_count_towards_the_limit() {
     // 5 million elements take 40 MB, because each counts for 8 bytes.
     let table = "(table 5000000 funcref)";
-    let fixture = Fixture::new(component_exporting("i32.const 0", table));
+    let fixture = Fixture::past_the_compile_limits(component_exporting("i32.const 0", table));
     assert_eq!(
         fixture.run_limited("x", &tiny_memory()),
         RunOutcome::MemoryLimit
@@ -708,8 +737,11 @@ fn component_with_instances(contents: &str, count: usize) -> Vec<u8> {
 
 /// Checks that a component runs when it's under a cap, and is refused when it's over.
 fn expect_cap(under: Vec<u8>, over: Vec<u8>) {
-    assert_eq!(Fixture::new(under).run("x"), RunOutcome::Completed);
-    let outcome = Fixture::new(over).run("x");
+    assert_eq!(
+        Fixture::past_the_compile_limits(under).run("x"),
+        RunOutcome::Completed
+    );
+    let outcome = Fixture::past_the_compile_limits(over).run("x");
     assert!(matches!(outcome, RunOutcome::Crashed(_)), "{outcome:?}");
 }
 
@@ -787,12 +819,198 @@ fn a_manifest_cant_raise_its_limits_above_the_hosts() {
 
         let small_home = fixture.storage.home(limits.disk_bytes).unwrap();
         let too_big = format!("expect-big big.bin {}", 2 * MB);
-        let outcome = fixture
-            .agent
-            .run(&Event::UserMessage(too_big), small_home, &limits);
+        let outcome = fixture.agent.run(
+            &Event::UserMessage(too_big),
+            small_home,
+            &limits,
+            &StopSignal::default(),
+            Box::new(DenyEverything),
+        );
         let RunOutcome::Failed(message) = outcome else {
             panic!("the disk limit wasn't applied: {outcome:?}");
         };
         assert!(message.contains("disk limit"), "{message}");
     });
+}
+
+/// Answers every fetch with a body of this size, and otherwise refuses in the given way.
+struct FakeFetcher {
+    body_size: usize,
+    refuses_with: Option<FetchError>,
+}
+
+impl RunBroker for FakeFetcher {
+    fn request_access(&mut self, _: &Target, _: &str) -> Result<Lifetime, AccessRefused> {
+        Err(AccessRefused::Internal)
+    }
+
+    fn http_fetch(&mut self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        if let Some(error) = self.refuses_with.take() {
+            return Err(error);
+        }
+        assert_eq!(request.url, "https://a.example/");
+        Ok(FetchResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Box::new(std::io::Cursor::new(vec![7; self.body_size])),
+        })
+    }
+}
+
+fn run_with_fetcher(message: &str, fetcher: FakeFetcher) -> RunOutcome {
+    let fixture = Fixture::file_agent();
+    fixture.agent.run(
+        &Event::UserMessage(message.to_string()),
+        fixture.home(),
+        &roomy_limits(),
+        &StopSignal::default(),
+        Box::new(fetcher),
+    )
+}
+
+#[test]
+fn an_agent_reads_a_response_in_pieces_to_the_end() {
+    for size in [0, 1, 999, 1000, 1001, 2_500_000] {
+        let outcome = run_with_fetcher(
+            &format!("fetch https://a.example/ 200:{size}"),
+            FakeFetcher {
+                body_size: size,
+                refuses_with: None,
+            },
+        );
+        assert_eq!(outcome, RunOutcome::Completed, "{size}");
+    }
+}
+
+#[test]
+fn an_agent_gets_the_reason_a_fetch_was_refused() {
+    for (refusal, expected) in [
+        (FetchError::NotGranted, "NotGranted"),
+        (FetchError::Denied("no way".to_string()), "Denied"),
+        (
+            FetchError::InvalidRequest("bad".to_string()),
+            "InvalidRequest",
+        ),
+        (
+            FetchError::LimitExceeded("much".to_string()),
+            "LimitExceeded",
+        ),
+        (FetchError::TimedOut, "TimedOut"),
+        (FetchError::Unavailable("down".to_string()), "Unavailable"),
+        (FetchError::Internal, "Internal"),
+    ] {
+        let outcome = run_with_fetcher(
+            "fetch https://a.example/ 200:0",
+            FakeFetcher {
+                body_size: 0,
+                refuses_with: Some(refusal),
+            },
+        );
+        let RunOutcome::Failed(message) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
+#[test]
+fn a_run_can_only_hold_so_many_responses_open() {
+    let fetcher = || FakeFetcher {
+        body_size: 0,
+        refuses_with: None,
+    };
+    assert_eq!(
+        run_with_fetcher("fetch-and-hold 16", fetcher()),
+        RunOutcome::Completed
+    );
+    let RunOutcome::Failed(message) = run_with_fetcher("fetch-and-hold 17", fetcher()) else {
+        panic!("this should have failed");
+    };
+    assert!(message.contains("LimitExceeded"), "{message}");
+}
+
+/// Answers with two pieces of text.
+struct FakeAnswer(Vec<String>, bool);
+
+impl ModelAnswer for FakeAnswer {
+    fn next(&mut self) -> Result<Option<String>, FetchError> {
+        if self.0.is_empty() {
+            self.1 = true;
+            return Ok(None);
+        }
+        Ok(Some(self.0.remove(0)))
+    }
+
+    fn usage(&self) -> Option<TokenUsage> {
+        self.1.then_some(TokenUsage {
+            input_tokens: 3,
+            output_tokens: 5,
+        })
+    }
+}
+
+struct FakeModel(Option<FetchError>);
+
+impl RunBroker for FakeModel {
+    fn request_access(&mut self, _: &Target, _: &str) -> Result<Lifetime, AccessRefused> {
+        Err(AccessRefused::Internal)
+    }
+
+    fn model_complete(
+        &mut self,
+        request: ModelRequest,
+    ) -> Result<Box<dyn ModelAnswer + Send>, FetchError> {
+        if let Some(error) = self.0.take() {
+            return Err(error);
+        }
+        assert_eq!(request.model, "default");
+        assert_eq!(request.messages[0].role, ModelRole::User);
+        assert_eq!(request.messages[0].text, "hello");
+        Ok(Box::new(FakeAnswer(
+            vec!["Hello".to_string(), " there".to_string()],
+            false,
+        )))
+    }
+}
+
+fn run_with_model(message: &str, model: FakeModel) -> RunOutcome {
+    let fixture = Fixture::file_agent();
+    fixture.agent.run(
+        &Event::UserMessage(message.to_string()),
+        fixture.home(),
+        &roomy_limits(),
+        &StopSignal::default(),
+        Box::new(model),
+    )
+}
+
+#[test]
+fn an_agent_reads_a_models_answer_as_it_arrives_and_gets_its_usage() {
+    assert_eq!(
+        run_with_model("ask-model-text default Hello there", FakeModel(None)),
+        RunOutcome::Completed
+    );
+}
+
+#[test]
+fn an_agent_gets_the_reason_a_model_refused() {
+    let RunOutcome::Failed(message) = run_with_model(
+        "ask-model-text default x",
+        FakeModel(Some(FetchError::LimitExceeded("over budget".to_string()))),
+    ) else {
+        panic!("this should have failed");
+    };
+    assert!(message.contains("LimitExceeded"), "{message}");
+}
+
+#[test]
+fn a_run_can_only_hold_so_many_model_answers_open() {
+    let RunOutcome::Failed(message) = run_with_model("hold-answers 5", FakeModel(None)) else {
+        panic!("this should have failed");
+    };
+    assert!(message.contains("LimitExceeded"), "{message}");
+    assert_eq!(
+        run_with_model("hold-answers 4", FakeModel(None)),
+        RunOutcome::Completed
+    );
 }

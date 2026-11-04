@@ -1,0 +1,3 @@
+# The same line endings on every system, because tests compare files and agents hash them.
+* text=auto eol=lf
+*.wasm binary

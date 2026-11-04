@@ -4,17 +4,223 @@
 //! backend could implement them later. See `docs/architecture.md`.
 
 use std::fmt;
+use std::io::{Read, Seek};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::home::Home;
-use crate::manifest::{Limits, printable};
+use crate::home::{AgentStorage, Home};
+use crate::manifest::{Limits, Manifest, printable};
 use crate::package::Package;
+use crate::run_log::RunId;
 
 /// Why an agent ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     UserMessage(String),
     Scheduled(String),
+}
+
+/// Tells running agents to stop, because the host is shutting down. Clones share the same signal.
+#[derive(Debug, Clone, Default)]
+pub struct StopSignal(Arc<AtomicBool>);
+
+impl StopSignal {
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Something outside an agent's home that it can be given access to. The text in here comes from
+/// the agent, so it's untrusted until the broker has checked it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Target {
+    NetworkHost(String),
+    Model(String),
+}
+
+/// How long access lasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lifetime {
+    /// Covers a single request.
+    Once,
+    /// Ends when the run does.
+    ThisRun,
+    /// Lasts until the user removes it.
+    UntilRevoked,
+}
+
+/// Why an agent wasn't given access. Text in here comes from the host, never from the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessRefused {
+    /// The user, or the rules, said no. Asking again won't help.
+    Denied(String),
+    /// Too many requests, or nobody's there to ask.
+    LimitExceeded(String),
+    /// The host failed.
+    Internal,
+}
+
+/// Who said something in a request to a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRole {
+    System,
+    User,
+    Assistant,
+}
+
+/// One message in a request to a model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelMessage {
+    pub role: ModelRole,
+    pub text: String,
+}
+
+/// A request to a model from an agent. All of this is untrusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRequest {
+    pub model: String,
+    pub messages: Vec<ModelMessage>,
+    pub max_tokens: u32,
+}
+
+/// How many tokens a request to a model used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+/// A model's answer as it's produced. Dropping it cancels the request.
+pub trait ModelAnswer {
+    /// The next piece of text, or nothing at the end.
+    fn next(&mut self) -> Result<Option<String>, FetchError>;
+    /// The tokens used, once the end has been reached.
+    fn usage(&self) -> Option<TokenUsage>;
+}
+
+/// Something that can be read from anywhere.
+pub trait ReadAnywhere: Read + Seek + Send {}
+
+impl<T: Read + Seek + Send> ReadAnywhere for T {}
+
+/// One file that the user chose. An agent gets its name and what's in it, but never where it is.
+pub struct PickedFile {
+    /// The name without its folder, made safe to show.
+    pub name: String,
+    pub size: u64,
+    pub file: Box<dyn ReadAnywhere>,
+}
+
+/// An HTTP method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchMethod {
+    Get,
+    Head,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+/// A network request from an agent. All of this is untrusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchRequest {
+    pub method: FetchMethod,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+/// A response on its way back to an agent. Reading its body fails, instead of ending early, if it
+/// goes over a limit or takes too long.
+pub struct FetchResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Box<dyn Read + Send>,
+}
+
+/// Why a network request didn't work. Text in here comes from the host, never from the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    /// This needs approval first, which the agent can ask for.
+    NotGranted,
+    Denied(String),
+    InvalidRequest(String),
+    LimitExceeded(String),
+    TimedOut,
+    Unavailable(String),
+    Internal,
+}
+
+/// What one run of an agent can ask of the world outside its home. A backend passes each request
+/// here, and never decides anything itself.
+pub trait RunBroker {
+    /// Asks for access to something. The reason is the agent's own claim, and it's untrusted.
+    fn request_access(&mut self, target: &Target, reason: &str) -> Result<Lifetime, AccessRefused>;
+
+    /// Makes a network request.
+    fn http_fetch(&mut self, _request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        Err(FetchError::Denied("this isn't available".to_string()))
+    }
+
+    /// Shows the user a message from the agent, which is untrusted.
+    fn send_message(&mut self, _text: &str) -> Result<(), AccessRefused> {
+        Err(AccessRefused::Denied("this isn't available".to_string()))
+    }
+
+    /// Starts asking an AI model something.
+    fn model_complete(
+        &mut self,
+        _request: ModelRequest,
+    ) -> Result<Box<dyn ModelAnswer + Send>, FetchError> {
+        Err(FetchError::Denied("this isn't available".to_string()))
+    }
+
+    /// Asks the user to choose a file. The reason is the agent's own claim, and it's untrusted.
+    fn pick_user_file(&mut self, _reason: &str) -> Result<PickedFile, AccessRefused> {
+        Err(AccessRefused::Denied("this isn't available".to_string()))
+    }
+}
+
+/// A broker that refuses everything, for a host that has nothing else.
+#[derive(Debug, Default)]
+pub struct DenyEverything;
+
+impl RunBroker for DenyEverything {
+    fn request_access(&mut self, _: &Target, _: &str) -> Result<Lifetime, AccessRefused> {
+        Err(AccessRefused::Denied("this isn't available".to_string()))
+    }
+}
+
+/// Makes a broker for each run.
+pub trait BrokerFactory: Send + Sync {
+    fn for_run(
+        &self,
+        storage: &AgentStorage,
+        manifest: &Manifest,
+        limits: &RunLimits,
+        run_id: RunId,
+    ) -> Box<dyn RunBroker + Send>;
+
+    /// Called when a run has ended, however it ended, with a short description safe to store.
+    fn run_ended(&self, _storage: &AgentStorage, _run_id: RunId, _how: &str) {}
+}
+
+impl BrokerFactory for DenyEverything {
+    fn for_run(
+        &self,
+        _: &AgentStorage,
+        _: &Manifest,
+        _: &RunLimits,
+        _: RunId,
+    ) -> Box<dyn RunBroker + Send> {
+        Box::new(Self)
+    }
 }
 
 /// The most this host lets any agent use, whatever its manifest asks for.
@@ -65,6 +271,12 @@ pub enum LoadError {
     ForbiddenImport(String),
     /// The agent was built for an API that this host doesn't provide.
     Incompatible(String),
+    /// Compiling the agent's code would cost the host more than it allows. The reason holds
+    /// nothing from the package.
+    TooCostly(String),
+    /// Another package is still being compiled, and it may be a hostile one. This one hasn't been
+    /// checked at all, so try again later.
+    Busy,
     /// The backend failed, through no fault of the agent.
     Internal(String),
 }
@@ -99,6 +311,10 @@ impl fmt::Display for LoadError {
             Self::Incompatible(message) => {
                 write!(f, "the agent doesn't match this host's API: {message}")
             }
+            Self::TooCostly(reason) => {
+                write!(f, "the agent's code is too costly to compile: {reason}")
+            }
+            Self::Busy => write!(f, "another agent's code is still being compiled"),
             Self::Internal(message) => write!(f, "the backend failed: {message}"),
         }
     }
@@ -117,6 +333,8 @@ pub enum RunOutcome {
     TimeLimit,
     /// The agent needed more memory than its limit allows, and crashed because of it.
     MemoryLimit,
+    /// The host told the agent to stop, because it's shutting down.
+    Stopped,
     /// The agent crashed.
     Crashed(String),
     /// The backend failed, through no fault of the agent.
@@ -131,15 +349,23 @@ impl RunOutcome {
 }
 
 /// Something that can run agents.
-pub trait Backend {
+pub trait Backend: Send + Sync {
     /// Checks a package's code and prepares it to run. This runs none of the agent's code.
     fn load(&self, package: &Package) -> Result<Box<dyn LoadedAgent>, LoadError>;
 }
 
 /// An agent that's ready to run.
 pub trait LoadedAgent {
-    /// Runs the agent for one event, starting from nothing but what's in its home.
-    fn run(&self, event: &Event, home: Home, limits: &RunLimits) -> RunOutcome;
+    /// Runs the agent for one event, starting from nothing but what's in its home. It has to stop
+    /// soon after `stop` is set, and report that as [`RunOutcome::Stopped`].
+    fn run(
+        &self,
+        event: &Event,
+        home: Home,
+        limits: &RunLimits,
+        stop: &StopSignal,
+        broker: Box<dyn RunBroker + Send>,
+    ) -> RunOutcome;
 }
 
 #[cfg(test)]
@@ -210,6 +436,18 @@ mod tests {
         let limits = host.limits_for(&requested(u32::MAX, u32::MAX, u32::MAX));
         assert_eq!(limits.memory_bytes, u64::from(u32::MAX) * MB);
         assert_eq!(limits.disk_bytes, u64::from(u32::MAX) * MB);
+    }
+
+    #[test]
+    fn refusals_to_compile_say_why() {
+        assert_eq!(
+            LoadError::TooCostly("modules: 2, over the limit of 1".to_string()).to_string(),
+            "the agent's code is too costly to compile: modules: 2, over the limit of 1"
+        );
+        assert_eq!(
+            LoadError::Busy.to_string(),
+            "another agent's code is still being compiled"
+        );
     }
 
     #[test]

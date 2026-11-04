@@ -229,7 +229,7 @@ fn invalid(field: &'static str, message: String) -> ManifestError {
 
 /// Makes text from a manifest safe to print, so it can't send terminal escape codes or reorder
 /// what the user sees.
-pub(crate) fn printable(text: &str) -> String {
+pub fn printable(text: &str) -> String {
     let mut output = String::new();
     for c in text.chars().take(MAX_MESSAGE_CHARS) {
         if c.is_ascii_graphic() || c == ' ' {
@@ -319,7 +319,7 @@ fn check_list(
 
 /// Requires a dot and a last label that isn't all digits. This rules out `localhost`, wildcards,
 /// and IP addresses in forms such as `127.0.0.1` and `0x7f000001`.
-fn is_host_name(host: &str) -> bool {
+pub fn is_host_name(host: &str) -> bool {
     let labels: Vec<&str> = host.split('.').collect();
     host.len() <= MAX_HOST_CHARS
         && labels.len() >= 2
@@ -339,7 +339,7 @@ fn is_host_label(label: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-fn is_model_name(name: &str) -> bool {
+pub fn is_model_name(name: &str) -> bool {
     name.len() <= MAX_NAME_CHARS
         && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
         && name
@@ -399,7 +399,7 @@ mod tests {
                 model_budget_tokens: 50_000,
             }
         );
-        assert_eq!(manifest.requested_hosts(), ["api.github.com"]);
+        assert_eq!(manifest.requested_hosts(), ["en.wikipedia.org"]);
         assert_eq!(manifest.requested_models(), ["default"]);
         assert_eq!(manifest.requested_files(), FileRequest::Ask);
     }

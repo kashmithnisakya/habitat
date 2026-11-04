@@ -5,19 +5,19 @@
 Habitat gives an agent its own persistent space to live in. The agent keeps its files, memory and tools there, but it can't touch your settings, personal data or other apps unless you allow it.
 
 > [!WARNING]
-> **Early development: nothing works yet, and this is not secure.** The repository currently holds the design and project skeleton. Do not use it to protect anything until the [attack tests](tests/attacks/README.md) exist and an outside security review has taken place.
+> **Early development: don't rely on this to protect anything yet.** You can install and run an agent on a Mac, Linux or Windows computer, with approvals, an audit log and API keys kept out of its reach, and [attack tests](tests/attacks/README.md) run on every change. But no outside security review has taken place, and passing our own tests isn't the same as being secure. See [what's known to be weak](docs/security-review.md#known-weaknesses).
 
 ## Why
 
 Agent sandboxes are well served on servers and desktops, but they don't focus on phones. Agents that run on phones today often rely on broad device permissions rather than an isolated space. Habitat aims to provide one security model and one agent package across both.
 
-## How it will work
+## How it works
 
 The agent runs inside WebAssembly and starts with no outside access. Every request to reach the network, your files, an AI model or a secret goes through one trusted component: the **broker**.
 
 ```text
 ┌──────────────────────────────────────────────┐
-│ Shell: CLI (Mac) or Flutter app (phones)     │
+│ Shell: CLI (desktop) or Flutter app (phones) │
 │ Shows approvals, activity log and controls   │
 └──────────────────────┬───────────────────────┘
                        │
@@ -32,13 +32,13 @@ The agent runs inside WebAssembly and starts with no outside access. Every reque
 └──────────────────────────────────────────────┘
 ```
 
-Planned guarantees:
+What it aims to guarantee, which [hasn't been reviewed from outside yet](docs/security-review.md):
 
 - **Nothing shared by default:** access outside the agent's home is denied unless granted.
 - **Approvals the agent can't fake:** the trusted core draws every permission prompt.
 - **Secrets stay outside:** API keys never enter the agent's space.
 - **A full record:** every action, approval and denial goes into a tamper-evident log.
-- **Same package everywhere:** one agent package runs on Mac, Android and iPhone.
+- **Same package everywhere:** one agent package runs on macOS, Windows, Linux and Android, and on iPhone and iPad if that [proves possible](docs/decisions/0007-supported-platforms.md).
 
 ## Project status
 
@@ -46,9 +46,10 @@ Planned guarantees:
 |---|---|
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
-| iPhone and Flutter feasibility test | Not started |
-| Mac core, broker and secrets | In progress: an agent can run through Wasmtime and use files in its home, within time and memory limits |
-| Attack tests | Not started |
+| iPhone and Flutter feasibility test | Not started: [we need to check that iPhone is possible](https://github.com/kashmithnisakya/habitat/issues/40) |
+| Core, broker and secrets on macOS, Linux and Windows | Working, from the command line. Using a real AI model needs your own API key, and hasn't been tried against the live service |
+| Attack tests and fuzzing | Running on every change. An outside review hasn't happened |
+| Windows | Runs, and every test runs on it in CI |
 | Phone app (Flutter) | Not started |
 
 Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41). The next step is to run the Android feasibility test on a real phone. See the [draft feasibility report](docs/feasibility-android.md).
@@ -63,6 +64,10 @@ Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/ha
 - [Design decisions](docs/decisions/README.md)
 - [Android feasibility report (draft)](docs/feasibility-android.md)
 - [Agent API](docs/agent-api.md)
+- [Security review package](docs/security-review.md)
+- [Python agents, and what stops them](docs/python-agents.md)
+- [Writing an agent](docs/writing-an-agent.md)
+- [The research helper, with approvals and the log](docs/research-helper.md)
 
 ## Repository layout
 
@@ -72,7 +77,7 @@ crates/
 ├── broker/          # Policy, vault, gateway and audit log
 ├── backend-wasm/    # Wasmtime backend
 ├── sdk/             # Rust library for agent authors
-└── cli/             # Mac and Linux command line
+└── cli/             # Command line for Mac, Linux and Windows
 wit/                 # The agent-home API
 app/                 # Flutter app for Android and iPhone
 android/             # Android feasibility test
@@ -96,6 +101,78 @@ cargo build --workspace
 ```bash
 cargo test --workspace
 ```
+
+## Getting started
+
+This installs and runs [`hello`](examples/hello/src/lib.rs), a small agent that remembers who has visited. To write your own, see [Writing an agent](docs/writing-an-agent.md).
+
+As well as the things listed under [Build](#build), you need `wasm-tools` to turn the agent into a WebAssembly component:
+
+```bash
+cargo install wasm-tools --locked
+```
+
+Build Habitat and the agent:
+
+```bash
+cargo build --release -p habitat-cli
+```
+
+```bash
+cargo build --release -p habitat-hello --target wasm32-unknown-unknown
+```
+
+```bash
+wasm-tools component new target/wasm32-unknown-unknown/release/habitat_hello.wasm -o hello.wasm
+```
+
+Put the agent and its [manifest](examples/hello/agent.toml) into a package, and install it:
+
+```bash
+target/release/habitat pack examples/hello/agent.toml hello.wasm -o hello.habitat
+```
+
+```bash
+target/release/habitat install hello.habitat
+```
+
+Run it twice, with the name of a visitor each time. Each run is a new start, and only the agent's files carry over:
+
+```bash
+target/release/habitat run hello "Ada"
+```
+
+```bash
+target/release/habitat run hello "Grace"
+```
+
+See what's installed, and how each agent's last run went:
+
+```bash
+target/release/habitat list
+```
+
+Delete the agent and all its files. This asks you to confirm first:
+
+```bash
+target/release/habitat remove hello
+```
+
+Agents are kept in `~/Library/Application Support/habitat` on a Mac, `~/.local/share/habitat` on Linux and `%LOCALAPPDATA%\\habitat` on Windows. To use another folder, pass `--root` or set `HABITAT_HOME`.
+
+On Windows, the program is `target\\release\\habitat.exe`, and the same steps apply otherwise.
+
+`habitat --help` lists every command, and these exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | It worked |
+| 1 | It failed, or was cancelled |
+| 2 | The command line was wrong |
+| 3 | The agent ran, and failed, crashed or hit a limit |
+| 4 | The agent's code never started |
+| 5 | The agent is already running |
+| 130 | The agent was stopped by Ctrl-C or a request to stop |
 
 ## Contributing
 

@@ -3,7 +3,7 @@
 
 use habitat_sdk::bindings::Guest;
 use habitat_sdk::bindings::habitat::host::agent_home as api;
-use habitat_sdk::bindings::habitat::host::types::{EntryKind, Event, HomeError};
+use habitat_sdk::bindings::habitat::host::types::{AccessTarget, EntryKind, Event, HomeError};
 
 struct Agent;
 
@@ -49,6 +49,40 @@ impl Guest for Agent {
             "call-host-forever" => loop {
                 std::hint::black_box(api::now_ms());
             },
+            // These save a file first, so that a test can tell when the agent is really running.
+            "write-then-loop" => {
+                api::write_file(first, rest.as_bytes()).map_err(|error| error.to_string())?;
+                loop {
+                    std::hint::black_box(0);
+                }
+            }
+            "write-then-call-host" => {
+                api::write_file(first, rest.as_bytes()).map_err(|error| error.to_string())?;
+                loop {
+                    std::hint::black_box(api::now_ms());
+                }
+            }
+            "say" => {
+                let message = text.strip_prefix("say ").unwrap_or_default();
+                api::send_message(message).map_err(|error| error.to_string())
+            }
+            "fetch" => fetch(first, rest),
+            "ask-model-text" => ask_model_text(first, rest),
+            "hold-answers" => hold_answers(first),
+            "pick-file" => pick_file(first, rest),
+            "fetch-and-hold" => fetch_and_hold(first),
+            "ask-model" => {
+                let target = AccessTarget::Model(first.to_string());
+                api::request_access(&target, rest)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            "ask-network" => {
+                let target = AccessTarget::NetworkHost(first.to_string());
+                api::request_access(&target, rest)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
             "fail" => Err(rest.to_string()),
             "panic" => panic!("told to"),
             other => Err(format!("unknown command: {other}")),
@@ -57,6 +91,141 @@ impl Guest for Agent {
 }
 
 static mut MEMORY: u32 = 0;
+
+/// Asks the user for a file, and checks its name and what's in it. It also has to read it a few
+/// ways. The name of the file has no spaces, and is everything up to the first space.
+fn pick_file(name: &str, contents: &str) -> Result<(), String> {
+    let file = api::pick_user_file("to read it").map_err(|error| error.to_string())?;
+    if file.name() != name {
+        return Err(format!("the name is {}", file.name()));
+    }
+    if file.size() != contents.len() as u64 {
+        return Err(format!("the size is {}", file.size()));
+    }
+    let all = file.read(0, u32::MAX).map_err(|error| error.to_string())?;
+    if all != contents.as_bytes() {
+        return Err("the contents are different".to_string());
+    }
+    let tail = file.read(1, 2).map_err(|error| error.to_string())?;
+    if tail != contents.as_bytes()[1..3.min(contents.len())] {
+        return Err("reading part of it went wrong".to_string());
+    }
+    let past = file
+        .read(contents.len() as u64 + 5, 10)
+        .map_err(|error| error.to_string())?;
+    if !past.is_empty() {
+        return Err("reading past the end returned something".to_string());
+    }
+    Ok(())
+}
+
+/// Opens this many responses at once, keeping them all open.
+fn fetch_and_hold(count: &str) -> Result<(), String> {
+    use habitat_sdk::bindings::habitat::host::types::{HttpMethod, HttpRequest};
+
+    let count: usize = count.parse().map_err(|_| "bad count".to_string())?;
+    let mut held = Vec::new();
+    for _ in 0..count {
+        let response = api::http_fetch(&HttpRequest {
+            method: HttpMethod::Get,
+            url: "https://a.example/".to_string(),
+            headers: Vec::new(),
+            body: None,
+        })
+        .map_err(|error| error.to_string())?;
+        held.push(response);
+    }
+    // Closing them all makes room for more.
+    held.clear();
+    api::http_fetch(&HttpRequest {
+        method: HttpMethod::Get,
+        url: "https://a.example/".to_string(),
+        headers: Vec::new(),
+        body: None,
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// Keeps this many answers from a model open at once.
+fn hold_answers(count: &str) -> Result<(), String> {
+    use habitat_sdk::bindings::habitat::host::types::{ModelMessage, ModelRequest, ModelRole};
+
+    let count: usize = count.parse().map_err(|_| "bad count".to_string())?;
+    let mut held = Vec::new();
+    for _ in 0..count {
+        let answer = api::model_complete(&ModelRequest {
+            model: "default".to_string(),
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                text: "hello".to_string(),
+            }],
+            max_tokens: 1,
+        })
+        .map_err(|error| error.to_string())?;
+        held.push(answer);
+    }
+    Ok(())
+}
+
+/// Asks a model something, and checks the answer.
+fn ask_model_text(model: &str, expected: &str) -> Result<(), String> {
+    use habitat_sdk::bindings::habitat::host::types::{ModelMessage, ModelRequest, ModelRole};
+
+    let answer = api::model_complete(&ModelRequest {
+        model: model.to_string(),
+        messages: vec![ModelMessage {
+            role: ModelRole::User,
+            text: "hello".to_string(),
+        }],
+        max_tokens: 100,
+    })
+    .map_err(|error| error.to_string())?;
+    if answer.usage().is_some() {
+        return Err("it has usage before the end".to_string());
+    }
+    let mut text = String::new();
+    while let Some(piece) = answer.next().map_err(|error| error.to_string())? {
+        text.push_str(&piece);
+    }
+    if text != expected {
+        return Err(format!("got {text}"));
+    }
+    match answer.usage() {
+        Some(usage) if usage.input_tokens == 3 && usage.output_tokens == 5 => Ok(()),
+        other => Err(format!("usage was {other:?}")),
+    }
+}
+
+/// Fetches a URL, reads all of it a little at a time, and checks how much there was, with the
+/// status at the start. For example, `fetch https://a.example/ 200:5`.
+fn fetch(url: &str, expected: &str) -> Result<(), String> {
+    use habitat_sdk::bindings::habitat::host::types::{HttpMethod, HttpRequest};
+
+    let response = api::http_fetch(&HttpRequest {
+        method: HttpMethod::Get,
+        url: url.to_string(),
+        headers: Vec::new(),
+        body: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let mut size = 0;
+    while let Some(piece) = response
+        .body
+        .read(1000)
+        .map_err(|error| error.to_string())?
+    {
+        if piece.len() > 1000 {
+            return Err("a read returned more than was asked for".to_string());
+        }
+        size += piece.len();
+    }
+    let got = format!("{}:{size}", response.status);
+    if got != expected {
+        return Err(format!("got {got}"));
+    }
+    Ok(())
+}
 
 /// Allocates and touches this many MB, and frees them again.
 fn allocate(megabytes: &str) -> Result<(), String> {
@@ -189,8 +358,7 @@ fn expect_denied_outside() -> Result<(), String> {
     )?;
     let file = api::pick_user_file("testing");
     denied(file.err().ok_or("pick-user-file worked")?, "pick-user-file")?;
-    let message = api::send_message("hello");
-    denied(message.err().ok_or("send-message worked")?, "send-message")
+    Ok(())
 }
 
 fn check_clock_and_random() -> Result<(), String> {
