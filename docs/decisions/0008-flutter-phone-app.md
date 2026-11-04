@@ -1,10 +1,10 @@
-# 0006: Use Flutter for the phone app
+# 0008: Use Flutter for the phone app
 
 **Status:** Proposed
 
 ## Context
 
-Habitat has to run on iPhone as well as Android. The plan was a Kotlin app on Android, with iPhone left for later, so supporting both that way would mean building every screen twice.
+Habitat has to run on iPhone as well as Android. The plan was a Kotlin app on Android, with iPhone left for later, so supporting both that way would mean building every screen twice. This replaces the part of [decision 0007](0007-supported-platforms.md) that has iPhone coming after the Android app. The rest of that decision stands, including that iPhone may not be possible.
 
 | Option | For | Against |
 |---|---|---|

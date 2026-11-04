@@ -53,7 +53,7 @@ See the [threat model](threat-model.md) for what this does and doesn't protect a
 
 ## Phone app
 
-The plan is one [Flutter app](decisions/0006-flutter-phone-app.md) for Android and iPhone. The Flutter UI talks to a small layer of Kotlin or Swift, which calls the core through UniFFI. That layer also holds what only the phone can do: the OS keystore, background work and the file picker. The core still makes every decision, and the UI only shows what the core sends and returns the user's answer.
+The plan is one [Flutter app](decisions/0008-flutter-phone-app.md) for Android and iPhone. The Flutter UI talks to a small layer of Kotlin or Swift, which calls the core through UniFFI. That layer also holds what only the phone can do: the OS keystore, background work and the file picker. The core still makes every decision, and the UI only shows what the core sends and returns the user's answer.
 
 ## Request flow
 

@@ -13,4 +13,4 @@ These records explain why major decisions were made. To change one, add a new re
 | [0007](0007-supported-platforms.md) | Support macOS, Windows, Linux, Android and iPhone. 0008 changes when iPhone comes | Proposed |
 | [0008](0008-flutter-phone-app.md) | Use Flutter for the phone app | Proposed |
 
-All of these stay **Proposed** until the Android feasibility test is complete. Record 0006 also needs tests on a real iPhone.
+All of these stay **Proposed** until the Android feasibility test is complete. Record 0008 also needs tests on a real iPhone.
