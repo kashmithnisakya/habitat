@@ -17,7 +17,7 @@ The agent runs inside WebAssembly and starts with no outside access. Every reque
 
 ```text
 ┌──────────────────────────────────────────────┐
-│ Shell: CLI (Mac) or Kotlin app (Android)     │
+│ Shell: CLI (desktop) or Flutter app (phones) │
 │ Shows approvals, activity log and controls   │
 └──────────────────────┬───────────────────────┘
                        │
@@ -46,11 +46,11 @@ What it aims to guarantee, which [hasn't been reviewed from outside yet](docs/se
 |---|---|
 | Design | Drafted, and open to feedback |
 | Android feasibility test | Passing on an emulator, and not yet tested on a real phone |
+| iPhone and Flutter feasibility test | Not started: [we need to check that iPhone is possible](https://github.com/kashmithnisakya/habitat/issues/40) |
 | Core, broker and secrets on macOS, Linux and Windows | Working, from the command line. Using a real AI model needs your own API key, and hasn't been tried against the live service |
 | Attack tests and fuzzing | Running on every change. An outside review hasn't happened |
 | Windows | Runs, and every test runs on it in CI |
-| Android app | Not started |
-| iPhone and iPad | Not started: [we need to check that it's possible](https://github.com/kashmithnisakya/habitat/issues/40) |
+| Phone app (Flutter) | Not started |
 
 Progress is tracked in the [roadmap issue](https://github.com/kashmithnisakya/habitat/issues/41). The next step is to run the Android feasibility test on a real phone. See the [draft feasibility report](docs/feasibility-android.md).
 
@@ -79,7 +79,8 @@ crates/
 ├── sdk/             # Rust library for agent authors
 └── cli/             # Command line for Mac, Linux and Windows
 wit/                 # The agent-home API
-android/             # Kotlin app and UniFFI bindings
+app/                 # Flutter app for Android and iPhone
+android/             # Android feasibility test
 examples/            # Sample agents
 tests/attacks/       # Attack tests
 docs/                # Design documents

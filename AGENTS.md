@@ -25,7 +25,8 @@ Read these before making design changes:
 | `crates/sdk` | Rust library for agent authors |
 | `crates/cli` | Command line |
 | `wit/` | The agent API |
-| `android/` | Kotlin app and UniFFI bindings |
+| `app/` | Flutter app for Android and iPhone, with its Kotlin and Swift layers |
+| `android/` | Android feasibility test |
 | `examples/` | Sample agents |
 | `tests/attacks/` | Attack tests |
 
